@@ -60,3 +60,16 @@ categories:
         values: ["lipo", "liion", "lifepo4", "nimh", "leadacid"]
         extract:
           - chemistry_regex
+
+  - id: relay
+    display: Relays
+    detect_keywords:
+      - relay
+      - relays
+    attributes:
+      - key: channels
+        display_name: Channels
+        type: integer
+        range: [1, 32]
+        extract:
+          - channels_regex

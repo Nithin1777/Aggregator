@@ -47,3 +47,13 @@ CREATE TABLE IF NOT EXISTS spec_extraction_warnings (
 
 CREATE INDEX IF NOT EXISTS idx_product_specs_key_value ON product_specs(key, value);
 CREATE INDEX IF NOT EXISTS idx_product_specs_key_value_num ON product_specs(key, value_num);
+
+CREATE TABLE IF NOT EXISTS spec_stats_global (
+    key TEXT PRIMARY KEY,
+    value_type TEXT,
+    applicable_count INTEGER,
+    value_counts TEXT,
+    value_min REAL,
+    value_max REAL,
+    updated_at TEXT
+);

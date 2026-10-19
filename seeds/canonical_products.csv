@@ -1,0 +1,49 @@
+key,type,product_id,title,mpn,vendor
+arduino,brand,4203,Arduino Uno R3 - Original,ARDUINO-UNO-R3,quartzcomponents
+esp32,brand,30,ESP32-S3-WROOM-1 Development Board,ESP32-S3-WROOM,makerbazar
+raspberry pi,brand,4468,Raspberry Pi 5 Model B - 4GB RAM,RASPBERRY-PI-5,quartzcomponents
+stm32,brand,10917,STM32F103C8T6 Development Board without ch340,STM32F103C8T6,robu
+rp2040,brand,7959,LuatOS USB C Raspberry PI PICO Development Board Based on RP2040 Microcontroller,RP2040,makerbazar
+esp8266,brand,10835,ESP8266 NodeMCU CP2102 Board,NODEMCU,robu
+teensy,brand,10834,Teensy 4.1 Development Board,,robu
+beaglebone,brand,9274,BeagleBone Black REV C,,makerbazar
+servo,category,18334,TowerPro SG90 Servo Motor (180° Rotation)-Good Quality,SG90,robu
+relay,category,13618,"SmartElex 5V, 10A  2-Channel Relay Module",,robu
+stepper,category,33029,Nema17 High torque Stepper Motor,NEMA17,robokits
+buck converter,category,6284,LM2596 3A DC DC Buck Converter Power Supply Module,LM2596,quartzcomponents
+sensor,category,10432,DHT11 Humidity & Temperature Sensor,DHT11,makerbazar
+oled,category,7218,0.96inch 128x64 OLED Display Module,,makerbazar
+dc motor,category,6142,L-Shape Geared DC Motor (BO Motor),,quartzcomponents
+lithium battery,category,38729,LG INR18650HE2 2500mAh Li-ion Battery 8C Power High Rate Lithium Battery Li-ion Rechargeable Battery Cell - RS4138,INR18650HE2,rees52
+bms,category,5628,3S 10A Battery Protection BMS Module,,quartzcomponents
+lm2596,mpn,10220,LM2596 DC DC Converter Step Down Module,LM2596,makerbazar
+dht11,mpn,10432,DHT11 Humidity & Temperature Sensor,DHT11,makerbazar
+bme280,mpn,26212,Waveshare BME280 Temp Humidity Pressure Sensor,BME280,robu
+sg90,mpn,18334,TowerPro SG90 Servo Motor (180° Rotation)-Good Quality,SG90,robu
+l298n,mpn,6047,L298N 2A Motor Driver Module,L298N,quartzcomponents
+tp4056,mpn,10388,TP4056 1A Charging Module for 3.7V Li-ion Battery,TP4056,makerbazar
+ch340,mpn,5696,CH340G USB to TTL Converter Module,CH340G,quartzcomponents
+cp2102,mpn,6286,USB to TTL Converter Adapter (CP2102),CP2102,quartzcomponents
+ft232rl,mpn,32936,FT232RL FTDI USB to TTL Serial Adapter Module,FT232RL,robokits
+ds3231,mpn,9542,DS3231 Real Time Clock RTC Module,DS3231,makerbazar
+ds1307,mpn,10290,Tiny RTC DS1307 Clock Module,DS1307,makerbazar
+hx711,mpn,5633,HX711 Load Cell Amplifier Module,HX711,quartzcomponents
+ads1115,mpn,34900,ADS1115 16-Bit ADC- 4 Channel with Programmable Gain Amplifier,ADS1115,robu
+pam8403,mpn,6380,PAM8403 Digital Audio Amplifier Module,PAM8403,quartzcomponents
+tpa3116,mpn,6677,TPA3116 2x100W Bluetooth Audio Amplifier Board,TPA3116,makerbazar
+hc-sr04,mpn,6404,Ultrasonic Sensor Module - HC-SR04,HC-SR04,quartzcomponents
+mpu6050,mpn,6399,MPU6050 3-Axis Gyroscope/Accelerometer Sensor Module,MPU-6050,quartzcomponents
+bmp280,mpn,6099,BMP280 Pressure and Temperature Sensor Module (Barometer),BMP280,quartzcomponents
+max485,mpn,35990,MAX485 Module TTL To RS485 5V,MAX485,robu
+mcp2515,mpn,5990,MCP2515 CAN Bus Module Board,MCP2515,quartzcomponents
+uln2003,mpn,5974,ULN2003 Stepper Motor Driver Module,ULN2003,quartzcomponents
+a4988,mpn,10264,A4988 driver Stepper Motor Driver,A4988,makerbazar
+drv8825,mpn,217,DRV8825PWPR TI Stepper Motor Driver IC - HTSSOP-28 Package,DRV8825PWPR,quartzcomponents
+xl4015,mpn,60064,DC-DC XL4015 5A 75W Adjustable Step-down Module,XL4015,robu
+mt3608,mpn,5994,MT3608 2A DC-DC Step Up (Boost) Power Module,MT3608,quartzcomponents
+vl53l0x,mpn,24557,TOF200C VL53L0X Laser Ranging Sensor Module,VL53L0X,robu
+ina219,mpn,25154,INA219 I2C Bi-Directional Current & Power Monitoring Module,INA219,robu
+ne555,mpn,27406,NE555DR SOIC-8 Timer,NE555DR,robu
+lm358,mpn,5943,LM358 Amplifier Module,LM358,quartzcomponents
+pc817,mpn,860,PC817 4 CH Optocoupler Isolation Module,PC817,robu
+74hc595,mpn,36864,SmartElex Shift Register Breakout - 74HC595,74HC595,robu

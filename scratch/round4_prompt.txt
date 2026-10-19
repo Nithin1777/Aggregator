@@ -1,0 +1,266 @@
+<USER_REQUEST>
+TASK: Round 4 — make the MCP server agent-first, focused on the DoD
+from the agent feedback. Do NOT implement all 10 sections as written —
+scope is defined below.
+
+DO NOT add: browse, facets, get_related, batch_lookup,
+coverage_report (as tool), top_unmet_queries (as tool), search_by_mpn,
+search_by_sku. These are deferred to round 5 or are operational
+scripts, not agent tools.
+
+═══════════════════════════════════════════════════════════════════
+FIX 1 — Wire-level bugs (do first, blocks everything else)
+═══════════════════════════════════════════════════════════════════
+
+1a. list_spec_keys currently returns 7 content blocks (one per key).
+    A client reading content[0] sees one spec. FIX: every tool returns
+    exactly ONE content block containing one JSON document. Verify by
+    inspecting the MCP response for list_spec_keys — should be one
+    text block containing an array of 7 objects, not 7 blocks.
+
+1b. Every tool declares an outputSchema; the returned structuredContent
+    must validate against it. content[0].text must be the same
+    document serialized as JSON. Clients shouldn't have to pick.
+
+1c. search_components default in_stock_only=false. Out-of-stock
+    listings are often the best spec match. Flag out-of-stock in
+    results rather than silently omitting them.
+
+═══════════════════════════════════════════════════════════════════
+FIX 2 — Response envelope (all tools, uniform)
+═══════════════════════════════════════════════════════════════════
+
+Every tool returns:
+
+    {
+      "ok": true,
+      "data": {...},                          # tool-specific payload
+      "total_matches": int,                   # total matching, pre-pagination
+      "returned": int,
+      "truncated": bool,
+      "next_cursor": str | null,
+      "filters_applied": {...},               # normalized echo
+      "coverage": {                            # per filter key used
+        "<key>": {"present": int, "of": int, "pct": float}
+      },
+      "warnings": [{"code": str, "message": str}],
+      "server_version": str,
+      "schema_version": str
+    }
+
+Errors use the same envelope with ok:false and no data:
+
+    {
+      "ok": false,
+      "error_code": "unknown_filter_key" | "invalid_filter_value" |
+                    "unsupported_operator" | "no_matches" |
+                    "spec_not_extracted" | "internal_error",
+      "message": str,
+      "valid_keys": [...] | null,
+      "suggestions": [{key, value} ...],      # nearest keys/enum members
+      "details": {...},
+      "server_version": str
+    }
+
+No bare ValueError. Every error is a structured response.
+
+═══════════════════════════════════════════════════════════════════
+FIX 3 — unknown ≠ absent ≠ null (the core principle)
+═══════════════════════════════════════════════════════════════════
+
+Every search result and count result distinguishes:
+  - filter_key_not_extracted: the key exists in catalog but has
+    near-zero coverage → return warning with coverage %, do NOT
+    return empty silently
+  - filter_value_not_present: key exists with good coverage but the
+    specific value matches nothing → return empty + suggestion list
+    from enum with counts
+  - filter_matched: normal results
+
+Every product row in results includes:
+  "specs": {
+    "voltage": "12",                        # present
+    "rpm": null,                            # not extracted
+    ...
+  }
+
+null (not extracted) is distinct from absent (never in catalog) is
+distinct from "0"/"" (extracted but empty). Never conflate.
+
+═══════════════════════════════════════════════════════════════════
+FIX 4 — Input normalization + operators
+═══════════════════════════════════════════════════════════════════
+
+Accept units and aliases on input, store/compare canonical:
+  "24V" / "24 v" / "24VDC"   → "24"
+  "2.5kg-cm" / "2.5 kgcm"     → 2.5 (canonical unit kgcm)
+  "5200 mAh" / "5.2Ah"        → 5200 (canonical unit mAh)
+  "4S" / "4 s" / "4s lipo"    → "4s"
+  "NEMA17" / "nema 17"        → "nema17"
+
+Explicit operators (replaces string overloading):
+  {"voltage": "12"}                              exact
+  {"voltage": {"in": ["12","24"]}}               set
+  {"rpm": {"gte": 150, "lte": 250}}              range
+  {"rpm": {"eq": 200, "tolerance": 0.1}}         ±10%
+  {"capacity_mah": {"gte": 5000, "lte": 5500}}   numeric range
+
+Reject the old "150-250" string form with a suggestion showing the
+operator form. Reject values with units in a form the normalizer
+cannot parse, with a "did you mean" example in the error.
+
+Validate `sort` against {relevance, price_asc, price_desc}; unknown
+sort → error, not silent default.
+
+═══════════════════════════════════════════════════════════════════
+FIX 5 — Add 4 new tools (DoD-aligned, nothing else)
+═══════════════════════════════════════════════════════════════════
+
+    @mcp.tool()
+    def describe_catalog() -> dict:
+        """
+        Return everything an agent needs to know before querying:
+        - total products, products by vendor, products by spec_category
+        - spec_keys: [{key, type, unit, coverage_pct, count,
+                       values (enum) | range (numeric)}, ...]
+        - currency: "INR"
+        - schema_version, server_version
+        - freshness: {oldest_crawl, newest_crawl, per_vendor}
+        Single call, replaces the sqlite3-by-hand discovery loop.
+        """
+
+    @mcp.tool()
+    def describe_spec(key: str) -> dict:
+        """
+        Detail for one spec key. Explicitly distinguishes:
+        - key_not_in_taxonomy: this attribute is not extracted at all
+        - key_extracted_low_coverage: extracted but < N% coverage
+        - key_healthy: normal
+        Returns: type, unit, enum values with counts, min/max,
+        coverage_pct, coverage_count, sample_raw_strings, warnings.
+        """
+
+    @mcp.tool()
+    def count_components(
+        filters: dict | None = None,
+        query: str | None = None,
+        price_max: float | None = None,
+        in_stock_only: bool = False,
+    ) -> dict:
+        """
+        Return {count, filters_applied, coverage, warnings}. No rows.
+        Use before search_components to size a query. Distinguishes
+        0 from "0 because filter key not extracted."
+        """
+
+    @mcp.tool()
+    def get_product(product_id: int) -> dict:
+        """
+        Full record for one product:
+        - all extracted specs (with confidence where applicable)
+        - all vendor offers (price, stock, url, vendor_sku, mpn)
+        - title, description, image_url, datasheet_url (if any)
+        - crawl timestamps (when_scraped, when_specs_extracted)
+        - spec_extraction_method: {key: 'regex'|'llm'|'manual'}
+        Returns error envelope with error_code='product_not_found'
+        if id doesn't exist.
+        """
+
+CURSOR-BASED PAGINATION on search_components:
+  - Add `cursor: str | None` parameter.
+  - Response includes `next_cursor` when truncated=true.
+  - Cursor is opaque (base64-encoded offset+filter_hash).
+  - Never silently cap at 100 with no signal.
+
+RETIRE list_spec_keys? No — keep it for backward compat, but have it
+return only the keys array (same shape as describe_catalog.spec_keys)
+in the standard envelope. Agents will prefer describe_catalog.
+
+═══════════════════════════════════════════════════════════════════
+FIX 6 — Tool descriptions as API docs
+═══════════════════════════════════════════════════════════════════
+
+Every tool's `description` field must include, in this order:
+  1. One-sentence purpose
+  2. Recommended call order (e.g. "discover via describe_catalog →
+     count_components → search_components → get_product")
+  3. Parameter syntax (units accepted, operator form, defaults)
+  4. Example invocation (real values, not placeholders)
+  5. Behavior when no matches ("returns ok:true with total_matches:0
+     and a suggestions array — never an error")
+
+The JSON Schema must be self-describing: `enum` on sort, explicit
+`default` and `examples` on every optional param, `minimum`/`maximum`
+on limit, `description` on every property.
+
+═══════════════════════════════════════════════════════════════════
+DELIVERABLES
+═══════════════════════════════════════════════════════════════════
+
+Code:
+  - 6 tools total: describe_catalog, describe_spec, count_components,
+    get_product, search_components, list_spec_keys (kept for compat)
+  - Uniform response envelope with ok/data/total_matches/truncated/
+    next_cursor/filters_applied/coverage/warnings
+  - Uniform error envelope with error_code/valid_keys/suggestions
+  - Input normalizer for units and aliases
+  - Operator syntax for filters
+  - Cursor pagination
+  - in_stock_only default false
+  - Single content block per tool call
+  - outputSchema declared per tool, structuredContent validates
+
+Tests:
+  - ONE integration test: for 5 sample filters,
+    count_components(f) == len(search_components(f)) up to pagination
+  - ONE wire-shape test: list_spec_keys returns exactly 1 content block
+  - ONE error-envelope test: search with unknown key returns
+    ok:false, error_code='unknown_filter_key', suggestions non-empty
+  - ONE unknown≠absent test: search on low-coverage key returns
+    warning with coverage %, does not silently return empty
+  Do NOT add exhaustive injection tests this round.
+
+Report:
+  - Line count of server.py before/after
+  - Tool list with one-line descriptions (should be exactly 6)
+  - Sample envelope from each tool (paste raw JSON response)
+  - Coverage numbers from describe_catalog (this replaces the
+    sqlite3-by-hand discovery)
+  - One full call chain: describe_catalog → count_components →
+    search_components → get_product for the query "12v 200rpm motor"
+  - Test results
+
+HARD RULES
+- 6 tools, not 15.
+- No mutating tools.
+- No browse/facets/get_related/batch_lookup/coverage_report/
+  top_unmet_queries/search_by_mpn/search_by_sku this round.
+- No raw-attribute persistence this round (schema change deferred).
+- No property tests, no exhaustive injection tests — 4 targeted tests
+  only.
+- No changes to extraction pipeline, backfill, or spec_stats_global.
+- No changes to classifier code (dormant, leave it).
+- If a requested behavior requires a schema change, note it in the
+  report as "deferred: needs schema change" rather than implementing.
+
+REPORT (short)
+1. Wire-fix confirmation: 1 content block per call, structuredContent
+   validates
+2. Envelope: paste raw JSON for one successful search and one error
+3. unknown/absent/null: paste three examples (matched, not-extracted,
+   invalid-value)
+4. Normalization: show 3 input forms each normalizing to same canonical
+   value
+5. New tools: describe_catalog output (paste), describe_spec output for
+   one key, get_product output for one id
+6. Call chain: describe → count → search → get_product for one query
+7. Test results (4 tests, pass/fail)
+8. Line count before/after
+9. "Deferred to round 5" list — anything you judged out of scope with
+   reasoning
+
+STOP after the report.
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-10-19T22:07:37+05:30.
+</ADDITIONAL_METADATA>

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime logs and telemetry (large and regenerable; see logs/)
+logs/
+*.log
+
+# SQLite sidecar files. The database itself (data/components.db) IS tracked,
+# via Git LFS — see .gitattributes.
+*.db-wal
+*.db-shm
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

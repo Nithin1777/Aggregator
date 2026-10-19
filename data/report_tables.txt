@@ -1,0 +1,151 @@
+### MOTOR PRECISION SAMPLE (40 Rows)
+
+| # | ID | Product Title | Extracted Specs | Human Label [Correct / Incorrect] |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | 40370 | RF-310T-11400 5.9V Mini DC Motor with 10mm Shaft 310 Brushed Motor for DIY Projects & Robotics - RS6891 | *(none)* | [Pending Human Review] |
+| 2 | 11092 | High Torque N20 12V 25RPM Micro DC Metal Gear Reduction Motor | `rpm: 25`, `voltage: 12` | [Pending Human Review] |
+| 3 | 4431 | RS-775 DC Motor with Ball Bearing - 12V to 24V - High Torque (Round Shaft) | `voltage: 12` | [Pending Human Review] |
+| 4 | 50944 | RS-37 30 RPM High Torque Side Shaft DC Geared Motor | `rpm: 30` | [Pending Human Review] |
+| 5 | 18589 | A5984 Stepper Motor Driver Carrier, Adjustable Current, Blue Edition | *(none)* | [Pending Human Review] |
+| 6 | 18221 | Yalu 24V 250W 360RPM MY1016Z2 EBIKE Brush Motor | `rpm: 360`, `voltage: 24` | [Pending Human Review] |
+| 7 | 17846 | RS-37 10 RPM High Torque Side Shaft DC Geared Motor | `rpm: 10` | [Pending Human Review] |
+| 8 | 11207 | Rocket 2948 brushless rc boat motor 4POLE  ￠3.175mm  Black (4800 KV) | *(none)* | [Pending Human Review] |
+| 9 | 49190 | Cytron 10 A Switch Control Potentiometer DC Motor Driver (MD10POT) | `current_a: 10.0` | [Pending Human Review] |
+| 10 | 11055 | EasyMech ID-6mm Motor Coupling Hub (Big) | *(none)* | [Pending Human Review] |
+| 11 | 42355 | MX1919 Motor Driver Module MX1919 Motor Drive Shield Board 2.5A Dual-Circuit Motor Drive Module for Arduino - RS2899 | `current_a: 2.5` | [Pending Human Review] |
+| 12 | 50772 | Cytron SmartDriveDuo-10 MDDS10 DC MOTOR DRIVER | *(none)* | [Pending Human Review] |
+| 13 | 33554 | T-Motor MN605-S KV320 + Alpha 60A LV + MF2211 + Mount(30mm tube) Combo | `current_a: 60.0` | [Pending Human Review] |
+| 14 | 10145 | 45 MM Propeller for Micro Quadcopters/ Coreless Motor - (2 Pcs)(CW & CCW) | *(none)* | [Pending Human Review] |
+| 15 | 36543 | MakerBase MKS A4988 Stepper Motor Driver With Heatsink Reliable Cooling For Arduino, CNC & 3D Printer Projects | *(none)* | [Pending Human Review] |
+| 16 | 32233 | Mecanum Wheel 80mm For TT Motor (1x Left, 1x Right) | *(none)* | [Pending Human Review] |
+| 17 | 5707 | MX1508 Dual H Bridge DC Stepper Motor Driver Module with PWM Control | *(none)* | [Pending Human Review] |
+| 18 | 5398 | PWM DC Motor Speed Regulator 6V 12V 24V 28V 3A Speed Control Switch 1203B | `current_a: 3.0`, `voltage: 6` | [Pending Human Review] |
+| 19 | 10521 | Generic: Single Side Shaft BO Motor | *(none)* | [Pending Human Review] |
+| 20 | 17787 | Pro-Range 121.7 N-cm 96RPM 12V Planetary Gear DC Motor PG36M555-50.9K | `rpm: 96`, `voltage: 12` | [Pending Human Review] |
+| 21 | 17916 | N20-3V-500 RPM Micro Metal Gear-box DC Motor | `rpm: 500` | [Pending Human Review] |
+| 22 | 33102 | Nema23 PLANETARY GEARED STEPPER MOTOR 60KGCM | *(none)* | [Pending Human Review] |
+| 23 | 37544 | JX Servo PDI-HV9050MG 50kg Digital Servo 50kg High-Voltage Coreless Motor with Full Metal Gear for High-Speed Robotics | *(none)* | [Pending Human Review] |
+| 24 | 4525 | Robot Car Wheel 100mm x 20mm for BO Motors | *(none)* | [Pending Human Review] |
+| 25 | 33643 | T-Motor Propeller MF1806 | *(none)* | [Pending Human Review] |
+| 26 | 16280 | N20 3V 150RPM Micro Metal Gear DC Motor With Encoder | `rpm: 150` | [Pending Human Review] |
+| 27 | 44445 | Make a Line Follower Robot Car Using L293d Motor Driver IC And BO Motor Dual Shaft - KT858 | *(none)* | [Pending Human Review] |
+| 28 | 41052 | Tarot TL2955 4008MT Brushless Motor TL2955 4008 330KV Martin RC Brushless Motor RC Quadcopter Motor for 17-19 inch Propellers for DIY Quadcopter Multicopter Drone - RS5672 | *(none)* | [Pending Human Review] |
+| 29 | 43681 | DC PWM Motor Speed Controller 12V 24V 36V 15A Over-current Protector Over-load Locked-rotor Protector CCMCP- RS953 | `current_a: 15.0`, `voltage: 12` | [Pending Human Review] |
+| 30 | 33553 | T-Motor MN601-S KV170 + Alpha 60A HV + MF2009 + Mount(30mm tube) Combo | `current_a: 60.0` | [Pending Human Review] |
+| 31 | 32151 | Hobbywing Xrotor X8 CW / CCW 100KV Motor with ESC and 3090 propeller Combo Original MOQ 2 PCS | *(none)* | [Pending Human Review] |
+| 32 | 17798 | 500RPM 12V Low Noise Dc Motor With Metal Gears - Grade A | `rpm: 500`, `voltage: 12` | [Pending Human Review] |
+| 33 | 32712 | NEMA23 Servo Motor 22kgcm w/t 200W Drive Modbus RS-485 Step/Dir | *(none)* | [Pending Human Review] |
+| 34 | 36498 | Cytron HAT-MDD10 10A Dual Motor Driver HAT – Raspberry Pi Compatible 6V–24V Robotics & Automation Board | `current_a: 10.0`, `voltage: 6` | [Pending Human Review] |
+| 35 | 18605 | BIGTREETECH BTT TMC2209 V1.3 Stepper Motor Driver | *(none)* | [Pending Human Review] |
+| 36 | 77356 | A2217 1100KV RC Brushless Outrunner Motor Welded Banana Connector (Male) | *(none)* | [Pending Human Review] |
+| 37 | 225343 | DRV8871DDA-Texas Instruments-SO-8-EP Stepper Motor Driver ROHS | *(none)* | [Pending Human Review] |
+| 38 | 644 | 4pcs Mini 1220 Silent Motor with 2-Blade Propellor Fan for DIY Science Projects | *(none)* | [Pending Human Review] |
+| 39 | 55193 | RakWireless WisBlock Motor | *(none)* | [Pending Human Review] |
+| 40 | 75196 | ERM Coin Vibration Motor, 7 mm Dia., 2 mm Thickness | *(none)* | [Pending Human Review] |
+
+### BATTERY PRECISION SAMPLE (40 Rows)
+
+| # | ID | Product Title | Extracted Specs | Human Label [Correct / Incorrect] |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | 5669 | 2 Section 32650/32700 Lithium Battery Support Bracket | *(none)* | [Pending Human Review] |
+| 2 | 51389 | Pro-Range Battery Charger 10S Li-Ion - 42V 5A with DC 5.5mm * 2.5mm Male Plug | `cells: 10s`, `chemistry: liion` | [Pending Human Review] |
+| 3 | 19278 | SkyRC Temperature Control Sensor Cable For B6 / B6ac Lipo Battery Charger | `chemistry: lipo` | [Pending Human Review] |
+| 4 | 14496 | Pro-Range INR P42A 22.2V 8400mAh 11C 6S2P 7" FPV & E-VTOL Drone Compact Li-ion Battery Pack with XT-60 | `capacity_mah: 8400`, `cells: 6s`, `chemistry: liion` | [Pending Human Review] |
+| 5 | 11354 | 18650 3A 12V Micro Lithium Battery Charger Module with Battery box | `chemistry: liion` | [Pending Human Review] |
+| 6 | 5512 | Single Cell 18650 Li-ion Battery Holder | `chemistry: liion` | [Pending Human Review] |
+| 7 | 8763 | USB Charging Cable including Charging Protection BMS with L6.2-2P Plug for Ni-CD/Ni-MH Battery RC Car/ DIY | `chemistry: nimh` | [Pending Human Review] |
+| 8 | 68306 | SAMSUNG INR21700 50G 5000mAh (2c) LI-ION BATTERY | `capacity_mah: 5000`, `chemistry: liion` | [Pending Human Review] |
+| 9 | 13899 | Amass XT120(2+4)+ Gold Plated Battery Connector Pair with Housing Cap - XT120(2+4)-F.G.Y+ & XT120(2+4)-M.G.Y+ | *(none)* | [Pending Human Review] |
+| 10 | 4947 | 3.7V 1500mAH Li-Po Rechargeable Battery (KP 683040) | `capacity_mah: 1500`, `chemistry: lipo` | [Pending Human Review] |
+| 11 | 4694 | DALY 7S 24V 40A Waterproof BMS for Li-ion NMC Cell | `cells: 7s`, `chemistry: liion` | [Pending Human Review] |
+| 12 | 19030 | Pro-Range 22.2V 8000mAh 25C 6S Lithium Polymer Battery Pack | `capacity_mah: 8000`, `cells: 6s`, `chemistry: lipo` | [Pending Human Review] |
+| 13 | 4725 | WATTNINE 9V Lithium Battery with 6000mAh Capacity - LiFePo4 cells with warranty | `capacity_mah: 6000`, `chemistry: lifepo4` | [Pending Human Review] |
+| 14 | 18941 | Pro-Range 14.8V 1500mAh 100C 4S Graphene Lithium Polymer Battery Pack | `capacity_mah: 1500`, `cells: 4s`, `chemistry: lipo` | [Pending Human Review] |
+| 15 | 215624 | MCP73812T-420I/OT-Microchip-Battery Charger for 1 Cell of Li-Ion, Li-Pol battery, 6V input, 4.2V / 500mA charge, SOT-23-5 | `chemistry: liion` | [Pending Human Review] |
+| 16 | 14702 | SunFounder PiDog AI Robot Dog Kit (without Battery) | *(none)* | [Pending Human Review] |
+| 17 | 39440 | SafeConnect HXT4mm ESC Connector Pigtail 10cm 14AWG Silicon Wire ESC Connector For RC Lipo Batteries, ESC, And Motor Connections - RS4403 | `chemistry: lipo` | [Pending Human Review] |
+| 18 | 11299 | BX100 1-8S Lipo Battery Voltage Tester / Low Voltage Buzzer Alarm / Battery Voltage Checker with Dual Speakers | `cells: 8s`, `chemistry: lipo` | [Pending Human Review] |
+| 19 | 97182 | CHAM CMINR14500F2 3.6V 850mAh 2C AA Size Li-ion Battery | `capacity_mah: 850`, `chemistry: liion` | [Pending Human Review] |
+| 20 | 3053 | Insulation Ring Paper Stickers for 18650 Battery Cells 3P | `chemistry: liion` | [Pending Human Review] |
+| 21 | 58226 | Plastic Lithium Battery Enclosure Box for 12V 200Ah & 24V 100Ah | *(none)* | [Pending Human Review] |
+| 22 | 26849 | amiciSense 10-100V Lcd Lead Acid Lithium Battery Capacity Indicator Voltmeter Monitor Display With Built-In Temperature Sensor And Buzzer Alarm (10-100 V) | `chemistry: leadacid` | [Pending Human Review] |
+| 23 | 32562 | GenX Pro+ Solid State High Energy Density 22.2V 6S 40000mah 7C Premium Li-ion Battery 350Wh/kg | `capacity_mah: 40000`, `cells: 6s`, `chemistry: liion` | [Pending Human Review] |
+| 24 | 5187 | 3.7V 4500mAh Li-Po Rechargeable Battery (KP 357090) | `capacity_mah: 4500`, `chemistry: lipo` | [Pending Human Review] |
+| 25 | 19024 | Pro-Range 22.2V 1000mAh 35C 6S Lithium Polymer Battery Pack | `capacity_mah: 1000`, `cells: 6s`, `chemistry: lipo` | [Pending Human Review] |
+| 26 | 4023 | DMEGC INR21700 Li-ion 3.7V 4500mAh Rechargable Battery - Original | `capacity_mah: 4500`, `chemistry: liion` | [Pending Human Review] |
+| 27 | 34524 | 4 in 1 Soil PH Meter Soil Tester PH Moisture Meter Temperature Sunlight Measurement Analysis Acidity Alkali（Without Battery） | *(none)* | [Pending Human Review] |
+| 28 | 11416 | 2 x AA Battery Holder Box with Alligator Clips with Switch and Cover | *(none)* | [Pending Human Review] |
+| 29 | 155019 | Pro-Range A Grade IFR 32650 12.8V 48000mAh 3C 4S8P LiFePO4 Battery Pack | `capacity_mah: 48000`, `cells: 4s`, `chemistry: lifepo4` | [Pending Human Review] |
+| 30 | 41359 | 6S 12A BMS Board 18650 Lithium Battery Protection Board 6S 12A 22.2V 25.2V BMS Battery Management System PCM PCB for 6 Cells in Series Lithium LicoO2 Limn2O4 18650 Battery - RS4803 | `cells: 6s`, `chemistry: liion` | [Pending Human Review] |
+| 31 | 40593 | DALY 4S 12V 20A BMS Board LifePo4 BMS Battery Protection Board Battery Management System - RS6667 | `cells: 4s`, `chemistry: lifepo4` | [Pending Human Review] |
+| 32 | 18953 | Pro-Range 3.8V 550mAh 90C 1S HV Mini FPV Quad Lithium Polymer Battery Pack | `capacity_mah: 550`, `cells: 1s`, `chemistry: lipo` | [Pending Human Review] |
+| 33 | 37943 | UltraPower UP1200AC PLUS Battery Charger 15A Smart Balance Charger For 6–12S Battery UAV Drone Charger | `cells: 12s` | [Pending Human Review] |
+| 34 | 7574 | Nylon Strap Belt for RC Lipo Battery | `chemistry: lipo` | [Pending Human Review] |
+| 35 | 53289 | Samsung INR 30Q 14.8V 36000mAh 5C 4S12P ROV Underwater Drone Cylindrical Li-ion Battery Pack with XT-90AS | `capacity_mah: 36000`, `cells: 4s`, `chemistry: liion` | [Pending Human Review] |
+| 36 | 3729 | 3.7V 30C 400mAh Lithium-Polymer Rechargeable Battery (YY702030) for Drones | `capacity_mah: 400`, `chemistry: lipo` | [Pending Human Review] |
+| 37 | 3172 | WILD SCORPION 11.1V 5500mAh 3S 35C Lithium-Polymer Rechargeable Battery | `capacity_mah: 5500`, `cells: 3s`, `chemistry: lipo` | [Pending Human Review] |
+| 38 | 44016 | Make a battery level indicator using basic components -KT727 | *(none)* | [Pending Human Review] |
+| 39 | 9471 | Envie: Infinite ERB-9V-MU 9volt 500mAh USB Rechargeable Li-ion Battery | `capacity_mah: 500`, `chemistry: liion` | [Pending Human Review] |
+| 40 | 71310 | BAK NMC N18650CL-29 3.6V 2900mAh 3C Li-ion Battery | `capacity_mah: 2900`, `chemistry: liion` | [Pending Human Review] |
+
+### RECALL SAMPLE (Top 30 Unclassified LIKE Titles)
+
+| # | ID | Product Title | Real Miss? | Agent Analysis / Reason Unclassified |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | 694 | 101-Pcs Miracle Motorized Spinning Rotating Gear Blocks | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 2 | 2038 | DIY Windmill Kit with Mini DC Motor 9V, Fan Blade, 9V Battery, Switch and Connector | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 3 | 4094 | MC34184 Low Power High Slew Rate Wide Bandwidth JFET Input Op-Amp IC (Motorola) - SOP-14 SMD Package | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 4 | 6586 | Motorcycle Chain Link Removal Tool 420-530 | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 5 | 7400 | Tire Repair Rubber Nail Screw Tool for Cars and Motorcycles | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 6 | 9085 | Arducam 8MP IMX219 Motorized Focus Camera Module for NVIDIA Jetson Nano (NoIR) | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 7 | 9658 | Cycle Motorbike Chain Cleaning Tool | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 8 | 11917 | ZEBRONICS MAX LINK Wireless Gamepad, Dual motors Haptic feedback, Built-in rechargeable battery | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 9 | 12881 | Pro-Range 290 PCS 2.8mm 2 3 4 6 9 Pin Way Automotive Motorcycle Electrical Male Female Wire Connector Plug Socket Kit With Brass Terminals (Plastic Box) | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 10 | 13310 | MC74HC4051D-Motorola Semiconductor- 
+1 Circuit IC Switch 8:1 100Ohm 16-SOIC | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 11 | 13779 | New 480PCS 2.8mm 2 3 4 6 Pin way Automotive Motorcycle Electrical Male Female Wire Connector Plug Socket Kit With Brass Terminals (Plastic Box) | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 12 | 13881 | QS10P-S Anti Spark Connector 210A energy storage connector Female large current Plug For electric motorcycle electric bicycle | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 13 | 13882 | QS10P-U Anti Spark Connector 210A energy storage connector Male large current Plug For electric motorcycle electric bicycle | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 14 | 13895 | Amass MT30 3 Pole/Pin for Motor/ESC Gold Plated Battery Connector Pair with Housing Cap - MT30-F.G.Y & MT30-M.G.Y | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 15 | 14029 | Arducam 5MP OV5647 NoIR Motorized IRcut filter M12 Mount LS-1820 Lens Camera for Raspberry Pi | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 16 | 14031 | Arducam Auto Focus Camera, Autofocus for Raspberry Pi Camera Module, Motorized Focus Lens, OV5647 5MP 1080P, Compatible with Pi 4/3B+/3 | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 17 | 14038 | Arducam 5MP OV5647 NoIR Motorized IRcut Filter M12 Mount LS-30188 Lens Camera for Raspberry Pi | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 18 | 14053 | Arducam 8MP IMX219 Motorized Focus Camera Module for NVIDIA Jetson Nano (NoIR) | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 19 | 14133 | Arducam NOIR 8MP Sony IMX219 camera module with Motorized IR cut filter M12 mount LS1820 Lens for Raspberry Pi 4/3B+/3 | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 20 | 14202 | Arducam EK030 108MP Camera Evaluation Kit, Motorized Focus | Yes | Real motor miss (e.g. boundary or non-standard tokenization) |
+| 21 | 14471 | QS10H Single lock Anti spark Black Female Connector For Electric bicycle electric motor car Energy storage battery UAV Drone airplane | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 22 | 14472 | QS10H Single lock Anti spark Black Male Connector For Electric bicycle electric motor car Energy storage battery UAV Drone airplane | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 23 | 14473 | QS10H Single lock Anti spark Red Female Connector For Electric bicycle electric motor car Energy storage battery UAV Drone airplane | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 24 | 14474 | QS10H Single lock Anti spark Red Male Connector For Electric bicycle electric motor car Energy storage battery UAV Drone airplane | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 25 | 14475 | QS12H Single lock Anti spark Black Female Connector For Electric bicycle electric motor car Energy storage battery UAV Drone airplane | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 26 | 14476 | QS12H Single lock Anti spark Black Male Connector For Electric bicycle electric motor car Energy storage battery UAV Drone airplane | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 27 | 14477 | QS12H Single lock Anti spark Red Female Connector For Electric bicycle electric motor car Energy storage battery UAV Drone airplane | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 28 | 14478 | QS12H Single lock Anti spark Red Male Connector For Electric bicycle electric motor car Energy storage battery UAV Drone airplane | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 29 | 14481 | QS6H Single lock Anti spark Black Female Connector For Electric bicycle electric motor car Energy storage battery UAV Drone airplane | No | Tie between motor and battery keywords (classified as NULL by design) |
+| 30 | 14482 | QS6H Single lock Anti spark Black Male Connector For Electric bicycle electric motor car Energy storage battery UAV Drone airplane | No | Tie between motor and battery keywords (classified as NULL by design) |
+
+### CURRENT_A PRECISION SAMPLE (20 Rows)
+
+| # | ID | Product Title | Extracted Current (A) | Evidence | Human Label [Correct / False Positive] |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | 38116 | Kamoer 24V Diaphragm Pump 600ml/min Mini Diaphragm Liquid Pump 0.15A DC Motor For Fluid Transfer - RS4134 | `0.15 A` | `0.15A` | [Pending Human Review] |
+| 2 | 33186 | Kamoer 24V 0.2A first level deceleration 45ml/min BTP Tube brush motor liquid peristaltic pump | `0.2 A` | `0.2A` | [Pending Human Review] |
+| 3 | 33198 | Kamoer 12V 0.35A first level deceleration 116ml/min silicon Tube brushless motor liquid peristaltic pump | `0.35 A` | `0.35A` | [Pending Human Review] |
+| 4 | 11063 | STEPPERONLINE Nema 17 Bipolar Stepper Motor 1.8deg 26Ncm 0.4A 42x42x34mm 4 Wires-17HS13-0404S1 | `0.4 A` | `0.4A` | [Pending Human Review] |
+| 5 | 11164 | STEPPERONLINE Nema 14 Bipolar Stepper Motor 0.9deg 11Ncm 0.4A 35x35x28.2mm 4 Wires-14HM11-0404S | `0.4 A` | `0.4A` | [Pending Human Review] |
+| 6 | 11080 | STEPPERONLINE Nema 14 Bipolar Stepper Motor 1.8deg 23Ncm 0.5A 35x35x42mm 4 Wires-14HS17-0504S | `0.5 A` | `0.5A` | [Pending Human Review] |
+| 7 | 42966 | 2 Phase 5mm Diameter 1000RPM Drive Shaft JQF39F34-01 Model Stepper Stepping Motor 0.6A - RS006 | `0.6 A` | `0.6A` | [Pending Human Review] |
+| 8 | 11067 | STEPPERONLINE Nema 11 Bipolar Stepper Motor 1.8deg 10Ncm  0.67A 28x28x45mm 4 Wires-11HS18-0674S | `0.67 A` | `0.67A` | [Pending Human Review] |
+| 9 | 43214 | 4mm Shaft Gear Motor Dia DC 6V 500RPM 0.7A 25GA Electric Geared Motor Electric Lightweight Speed Reduction Motor - RS1563 | `0.7 A` | `0.7A` | [Pending Human Review] |
+| 10 | 32727 | L9110S H-bridge Stepper Dual DC 2.5-12V 0.8A Motor Driver Board | `0.8 A` | `0.8A` | [Pending Human Review] |
+| 11 | 69976 | Creality Motor 0.8A D3- K1/K1 Max/K1C/Ender-3 V3/Ender-3 V3 Plus/K1 SE | `0.8 A` | `0.8A` | [Pending Human Review] |
+| 12 | 212139 | Creality 42-34 Stepper Motor 0.8A- Ender-3V3 SE | `0.8 A` | `0.8A` | [Pending Human Review] |
+| 13 | 212138 | Creality 42-26 Stepper Motor 0.84A- Ender-3 V3 SE/Ender-3 V3 KE | `0.84 A` | `0.84A` | [Pending Human Review] |
+| 14 | 11133 | STEPPERONLINE Nema 23 Bipolar Stepper Motor 1.8deg 0.6Nm 0.88A 57x57mm 4 Wires-23HS16-0884S | `0.88 A` | `0.88A` | [Pending Human Review] |
+| 15 | 11147 | STEPPERONLINE 24V 3000RPM 0.04Nm 13W 1.00A Φ42x43mm Brushless DC Motor-42BYA43-24-01 | `1.0 A` | `1.00A` | [Pending Human Review] |
+| 16 | 12252 | L293B-Stmicroelectronics-Motor Driver/Controller, Push Pull, TTL Logic, 4 Outputs, 4.5 V to 36 V Supply, 1 A Out, DIP-16 | `1.0 A` | `1 A` | [Pending Human Review] |
+| 17 | 16090 | DRV8837CDSGR-Texas Instruments-12V 1A H-bridge Motor Driver 8-WSON | `1.0 A` | `1A` | [Pending Human Review] |
+| 18 | 16234 | BRD1260C-TL-Power Integrations-Motor Driver/Controller, BLDC, PMSM, Half Bridge, 1A/1 Output, InSOP-24C-24 | `1.0 A` | `1A` | [Pending Human Review] |
+| 19 | 32758 | Microstepping Motor Driver A4988 8-35V DC 1A with Heatsink -Good | `1.0 A` | `1A` | [Pending Human Review] |
+| 20 | 39763 | XWST XW-4860-36 60V to 36V Waterproof Buck Converter Step-Down Voltage Regulator  Solar Motor Power Supply High Power DC-DC Converter With 1A-25A Output For Solar Motor Systems | `1.0 A` | `1A` | [Pending Human Review] |
+

@@ -1,0 +1,270 @@
+{
+  "summary": {
+    "total_queries": 54,
+    "total_groups": 861,
+    "total_merged_cards": 86,
+    "false_positives_count": 8,
+    "suspicious_merges_count": 7,
+    "potential_false_negatives_count": 2,
+    "ranking_anomalies_count": 0
+  },
+  "category_summary": {
+    "Motor Drivers & Controllers": {
+      "queries": 5,
+      "groups": 31,
+      "merged": 10,
+      "fp": 0,
+      "fn": 0
+    },
+    "ESC & BLDC / Drone Parts": {
+      "queries": 6,
+      "groups": 64,
+      "merged": 2,
+      "fp": 0,
+      "fn": 1
+    },
+    "Batteries & Power": {
+      "queries": 4,
+      "groups": 64,
+      "merged": 9,
+      "fp": 3,
+      "fn": 0
+    },
+    "BMS & Protection": {
+      "queries": 3,
+      "groups": 15,
+      "merged": 2,
+      "fp": 1,
+      "fn": 0
+    },
+    "Wheels & Robotics Mechanics": {
+      "queries": 6,
+      "groups": 105,
+      "merged": 4,
+      "fp": 0,
+      "fn": 0
+    },
+    "Encoders & Feedback": {
+      "queries": 3,
+      "groups": 2,
+      "merged": 2,
+      "fp": 0,
+      "fn": 0
+    },
+    "Passives & Discretes": {
+      "queries": 4,
+      "groups": 146,
+      "merged": 3,
+      "fp": 0,
+      "fn": 0
+    },
+    "Kits & Starter Packs": {
+      "queries": 4,
+      "groups": 79,
+      "merged": 0,
+      "fp": 0,
+      "fn": 0
+    },
+    "Sensors": {
+      "queries": 5,
+      "groups": 31,
+      "merged": 10,
+      "fp": 0,
+      "fn": 0
+    },
+    "Microcontrollers & SBCs": {
+      "queries": 7,
+      "groups": 228,
+      "merged": 32,
+      "fp": 1,
+      "fn": 0
+    },
+    "Displays": {
+      "queries": 3,
+      "groups": 34,
+      "merged": 6,
+      "fp": 0,
+      "fn": 0
+    },
+    "Relays & Switches": {
+      "queries": 4,
+      "groups": 62,
+      "merged": 6,
+      "fp": 3,
+      "fn": 1
+    }
+  },
+  "false_positives": [
+    {
+      "query": "18650 3.7v battery",
+      "category": "Batteries & Power",
+      "canonical_name": "3.7V BMS 1S 2A 18650 Lithium Battery Protection Board",
+      "merge_reason": "v2_matcher:Tier B: Similarity 0.818 >= 0.58",
+      "source": "v2_fallback",
+      "conflicts": [
+        "current: '1a' vs '2a'"
+      ],
+      "item_a": "[makerbazar] 3.7V BMS 1S 1A 18650 Lithium Battery Protection Board (\u20b925.0)",
+      "item_b": "[robu] 1S 3.7V 2A 1MOS BMS Li-ion 18650 Battery Protection Board (\u20b929.0)"
+    },
+    {
+      "query": "cr2032 battery",
+      "category": "Batteries & Power",
+      "canonical_name": "Panasonic CR2032 3V Lithium Coin Battery-2Pcs.",
+      "merge_reason": "v2_matcher:Tier A: Canonical MPN match 'CR2032'",
+      "source": "v2_fallback",
+      "conflicts": [
+        "voltage: '3v' vs '3.0v'"
+      ],
+      "item_a": "[rees52] Duracell Specialty CR2032 3V Lithium Coin Battery Premium Power Solution For Watches, Key Fobs, and Small Electronic - RS9718 (\u20b932.0)",
+      "item_b": "[quartzcomponents] CR2032 3.0V 19E Coin Cell Battery with 3 pin Connector (\u20b936.0)"
+    },
+    {
+      "query": "cr2032 battery",
+      "category": "Batteries & Power",
+      "canonical_name": "Panasonic CR2032 3V Lithium Coin Battery-2Pcs.",
+      "merge_reason": "v2_matcher:Tier A: Canonical MPN match 'CR2032'",
+      "source": "v2_fallback",
+      "conflicts": [
+        "voltage: '3.0v' vs '3v'"
+      ],
+      "item_a": "[quartzcomponents] CR2032 3.0V 19E Coin Cell Battery with 3 pin Connector (\u20b936.0)",
+      "item_b": "[robu] Maxell CR2032 3V Lithium Coin Battery (5 Pieces) (\u20b9219.0)"
+    },
+    {
+      "query": "bms 1s 3.7v",
+      "category": "BMS & Protection",
+      "canonical_name": "3.7V BMS 1S 2A 18650 Lithium Battery Protection Board",
+      "merge_reason": "v2_matcher:Tier B: Similarity 0.818 >= 0.58",
+      "source": "v2_fallback",
+      "conflicts": [
+        "current: '1a' vs '2a'"
+      ],
+      "item_a": "[makerbazar] 3.7V BMS 1S 1A 18650 Lithium Battery Protection Board (\u20b925.0)",
+      "item_b": "[robu] 1S 3.7V 2A 1MOS BMS Li-ion 18650 Battery Protection Board (\u20b929.0)"
+    },
+    {
+      "query": "raspberry pi 4",
+      "category": "Microcontrollers & SBCs",
+      "canonical_name": "RPI4 | Raspberry Pi 4 Model-B",
+      "merge_reason": "v2_matcher:Tier A: Canonical MPN match 'RASPBERRY-PI-4'",
+      "source": "v2_fallback",
+      "conflicts": [
+        "ram: '3gb' vs '4gb'"
+      ],
+      "item_a": "[robu] Raspberry Pi 4 Model B with 3GB RAM (\u20b99599.0)",
+      "item_b": "[quartzcomponents] Raspberry Pi 4 Model B - 4GB RAM (\u20b99695.0)"
+    },
+    {
+      "query": "single channel relay",
+      "category": "Relays & Switches",
+      "canonical_name": "DC7-80/5V Power Supply ESP8266 WIFI Single Channel 30A Relay Module ESP-12F",
+      "merge_reason": "v2_matcher:Tier A: Canonical MPN match 'ESP8266'",
+      "source": "v2_fallback",
+      "conflicts": [
+        "voltage: '80v' vs '5v'"
+      ],
+      "item_a": "[rees52] ESP8266 DC7-80V/5V WiFi Relay Module Wireless Remote Control Relay Module Power Supply Single Channel High Power 30A Relay With ESP-12F For Home Automation and Industrial Applications - RS6935 (\u20b9699.0)",
+      "item_b": "[robu] DC7-80/5V Power Supply ESP8266 WIFI Single Channel 30A Relay Module ESP-12F (\u20b91069.0)"
+    },
+    {
+      "query": "relay module 4 channel",
+      "category": "Relays & Switches",
+      "canonical_name": "7-24V Modbus RTU 4, Channels Relay Module, RS485/TTL Anti-Reverse, Connection",
+      "merge_reason": "v2_matcher:Tier A: Canonical MPN match 'RS485'",
+      "source": "v2_fallback",
+      "conflicts": [
+        "voltage: '5v' vs '12v'"
+      ],
+      "item_a": "[robu] 5V Modbus RTU 4, Channels Relay Module, Input Optocoupler, Isolation RS485 MCU for, Arduino (\u20b9450.0)",
+      "item_b": "[rees52] 12V Modbus RTU 4 Channels Relay Module Optocoupler RS485 MCU for ARDUIN0 -RS3581 (\u20b9685.0)"
+    },
+    {
+      "query": "relay module 4 channel",
+      "category": "Relays & Switches",
+      "canonical_name": "ESP8266 ESP-01 5V 4-Channels WiFi Relay Module for Home Remote Control Switch",
+      "merge_reason": "v2_matcher:Tier A: Canonical MPN match 'ESP8266'",
+      "source": "v2_fallback",
+      "conflicts": [
+        "voltage: '12v' vs '5v'"
+      ],
+      "item_a": "[rees52] ESP8266 ESP-01 12V 4 Channels WiFi Relay, Module Things Smart, Home Remote Control, Switch - RS4057 (\u20b9669.0)",
+      "item_b": "[robu] ESP8266 ESP-01 5V 4-Channels WiFi Relay Module for Home Remote Control Switch (\u20b9839.0)"
+    }
+  ],
+  "suspicious_merges": [
+    {
+      "query": "tb6612fng",
+      "category": "Motor Drivers & Controllers",
+      "canonical_name": "TB6612FNG Dual Motor Driver Module",
+      "ratio": 3.73,
+      "item_a": "[quartzcomponents] TB6612FNG Dual DC Motor Driver Module (\u20b9131.0)",
+      "item_b": "[robu] DFRobot Fermion: TB6612FNG 2x1.2A DC Motor Driver (Breakout) (\u20b9489.0)"
+    },
+    {
+      "query": "tb6612fng",
+      "category": "Motor Drivers & Controllers",
+      "canonical_name": "TB6612FNG Dual Motor Driver Module",
+      "ratio": 3.28,
+      "item_a": "[makerbazar] TB6612FNG Dual Motor Driver Module (\u20b9149.0)",
+      "item_b": "[robu] DFRobot Fermion: TB6612FNG 2x1.2A DC Motor Driver (Breakout) (\u20b9489.0)"
+    },
+    {
+      "query": "a4988 stepper driver",
+      "category": "Motor Drivers & Controllers",
+      "canonical_name": "A4988 driver Stepper Motor Driver",
+      "ratio": 3.37,
+      "item_a": "[quartzcomponents] A4988 Stepper Motor Driver Controller Board (\u20b960.0)",
+      "item_b": "[robu] SmartElex A4988 Stepper Motor Driver (\u20b9202.0)"
+    },
+    {
+      "query": "a4988 stepper driver",
+      "category": "Motor Drivers & Controllers",
+      "canonical_name": "A4988 driver Stepper Motor Driver",
+      "ratio": 4.3,
+      "item_a": "[quartzcomponents] A4988 Stepper Motor Driver Controller Board (\u20b960.0)",
+      "item_b": "[rees52] GY-4988 A4988 3D Printer Machine Driver Stepper Motor Drive Module - RS1034 (\u20b9258.0)"
+    },
+    {
+      "query": "18650 3.7v battery",
+      "category": "Batteries & Power",
+      "canonical_name": "[Type 2] 3.7V 18650 Dual Battery Charger Li-ion Cells",
+      "ratio": 4.37,
+      "item_a": "[makerbazar] Universal Single Battery Charger Li-ion 3.7V 18650 16340 14500 Cells (\u20b989.0)",
+      "item_b": "[quartzcomponents] 3.7V Lithium Battery Charger for 18650 Cells 4.2V 1200mA - 4 Cells (\u20b9389.0)"
+    },
+    {
+      "query": "cr2032 battery",
+      "category": "Batteries & Power",
+      "canonical_name": "Panasonic CR2032 3V Lithium Coin Battery-2Pcs.",
+      "ratio": 6.84,
+      "item_a": "[rees52] Duracell Specialty CR2032 3V Lithium Coin Battery Premium Power Solution For Watches, Key Fobs, and Small Electronic - RS9718 (\u20b932.0)",
+      "item_b": "[robu] Maxell CR2032 3V Lithium Coin Battery (5 Pieces) (\u20b9219.0)"
+    },
+    {
+      "query": "rp2040",
+      "category": "Microcontrollers & SBCs",
+      "canonical_name": "Raspberry Pi Pico RP2040 UNO Development Board",
+      "ratio": 3.53,
+      "item_a": "[rees52] Raspberry Pi Pico Microcontroller Board RP2040 Chip Development Board - RS2650/RS4911 (\u20b9294.0)",
+      "item_b": "[robu] Raspberry Pi Pico RP2040 UNO Development Board (\u20b91039.0)"
+    }
+  ],
+  "potential_false_negatives": [
+    {
+      "query": "simonk 30a esc",
+      "category": "ESC & BLDC / Drone Parts",
+      "similarity": 0.92,
+      "item_a": "[rees52] SimonK 30A Brushless ESC 30A Brushless Speed Controller ESC Multicopter Helicopter Airplane - Good Quality - RS3328 (\u20b9439.0)",
+      "item_b": "[robu] SimonK 30A Brushless Speed Controller ESC Multicopter Helicopter Airplane - Good Quality (\u20b9641.0)"
+    },
+    {
+      "query": "endstop limit switch",
+      "category": "Relays & Switches",
+      "similarity": 0.86,
+      "item_a": "[robu] Optical Endstop Light Control Limit Optical Switch (\u20b969.0)",
+      "item_b": "[rees52] Optical Endstop Light Control Limit Optical Switch - RS3677 (\u20b983.0)"
+    }
+  ],
+  "ranking_anomalies": []
+}

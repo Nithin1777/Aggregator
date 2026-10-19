@@ -1,0 +1,130 @@
+{"row_id": "A_001", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "DC gear motor with 12V operating voltage and 200 RPM correctly specified in title."}
+{"row_id": "A_002", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Motor protective cover is a mechanical accessory, not a motor."}
+{"row_id": "A_003", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "RS-775 DC motor with 12V operating voltage correctly extracted from the 12V to 24V range."}
+{"row_id": "A_004", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Side shaft DC geared motor with 60 RPM correctly extracted."}
+{"row_id": "A_005", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "NEMA17 stepper motor with no voltage, RPM, or current specs stated in the title."}
+{"row_id": "A_006", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "E-bike DC motor with 24V voltage correctly extracted."}
+{"row_id": "A_007", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Johnson geared motor with 60 RPM correctly extracted."}
+{"row_id": "A_008", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Brushless RC boat motor with KV rating but no voltage, RPM, or current specs in title."}
+{"row_id": "A_009", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "DC gear motor with 12V and 30 RPM correctly extracted."}
+{"row_id": "A_010", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Brushless drone motor with KV rating and no voltage, RPM, or current in title."}
+{"row_id": "A_011", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Motor speed controller and reversing regulator module, not a motor."}
+{"row_id": "A_012", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Side shaft DC geared motor with 300 RPM correctly extracted."}
+{"row_id": "A_013", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "E-bike geared DC motor bundled with companion controller; main product is motor with 24V and 300 RPM correctly extracted."}
+{"row_id": "A_014", "task": "classify_motor", "label": "yes", "spec_check": "missed", "confidence": "high", "reason": "775 DC motor clearly states 12VDC in title, but voltage was missed."}
+{"row_id": "A_015", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Brushless drone motor with KV rating and no voltage, RPM, or current in title."}
+{"row_id": "A_016", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Metal gear standard servo motor with torque rating and no voltage, RPM, or current in title."}
+{"row_id": "A_017", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Dual H-bridge DC and stepper motor driver module, not a motor."}
+{"row_id": "A_018", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "PWM motor speed regulator and control switch, not a motor."}
+{"row_id": "A_019", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Stepper motor driver breakout board, not a motor."}
+{"row_id": "A_020", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Micro gear motor with torque and diameter specified, no voltage, RPM, or current in title."}
+{"row_id": "A_021", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "DC gear motor with 12V and 16 RPM correctly extracted."}
+{"row_id": "A_022", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Planetary geared NEMA17 stepper motor with torque rating and no voltage, RPM, or current in title."}
+{"row_id": "A_023", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Adjustable mounting bracket for motor and camera, not a motor."}
+{"row_id": "A_024", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Robot car wheel designed for BO motors, not a motor."}
+{"row_id": "A_025", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Geared encoder servo motor with 12V and 60 RPM correctly extracted."}
+{"row_id": "A_026", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Micro metal gear motor with encoder having 6V and 30 RPM correctly extracted."}
+{"row_id": "A_027", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Brushless multicopter motor with KV rating and no voltage, RPM, or current in title."}
+{"row_id": "A_028", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Fan blade propeller accessory for toy motors, not a motor."}
+{"row_id": "A_029", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "SCR AC voltage regulator and motor speed controller, not a motor."}
+{"row_id": "A_030", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "E-bike geared DC motor bundled with controller; main product is motor with 24V and 530 RPM correctly extracted."}
+{"row_id": "A_031", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Brushless drone motor with integrated ESC; qualifies as an ESC-driven motor."}
+{"row_id": "A_032", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "DC gear motor with 12V and 200 RPM correctly extracted."}
+{"row_id": "A_033", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Hybrid servo motor sold bundled with Leadshine drive; main product is the servo motor."}
+{"row_id": "A_034", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "TMC2160 stepper motor driver board, not a motor."}
+{"row_id": "A_035", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "TMC2225 stepper motor driver with heatsink, not a motor."}
+{"row_id": "A_036", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Wiring terminal block for motor connections, not a motor."}
+{"row_id": "A_037", "task": "classify_motor", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "DRV8886 integrated circuit stepper motor driver, not a motor."}
+{"row_id": "A_038", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Mini 1220 DC motor bundled with propeller fan; main product is motor with no voltage, RPM, or current in title."}
+{"row_id": "A_039", "task": "classify_motor", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "NEMA17 stepper motor with no voltage, RPM, or current specs in title."}
+{"row_id": "A_040", "task": "classify_motor", "label": "yes", "spec_check": "wrong_spec", "confidence": "high", "reason": "Vibration motor specifies 14000±3000 rpm, but tolerance 3000 was extracted instead of nominal 14000 RPM."}
+{"row_id": "B_001", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Support bracket for cylindrical cells, not a battery."}
+{"row_id": "B_002", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Battery Management System (BMS) protection circuit board, not a battery."}
+{"row_id": "B_003", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Universal cylindrical battery charger, not a battery."}
+{"row_id": "B_004", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "4S 4200mAh Li-ion battery pack with cells, capacity, and chemistry correctly extracted."}
+{"row_id": "B_005", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Lithium battery charger module with battery box, not a battery."}
+{"row_id": "B_006", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "18650 single-cell battery holder, not a battery."}
+{"row_id": "B_007", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "USB charging cable with integrated protection circuit, not a battery."}
+{"row_id": "B_008", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Battery power display meter indicator, not a battery."}
+{"row_id": "B_009", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Handheld thermal imaging camera mentioning battery life in features, not a battery."}
+{"row_id": "B_010", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "Li-Po rechargeable battery with 1500mAh capacity and lipo chemistry correctly extracted."}
+{"row_id": "B_011", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "DALY BMS protection board for battery cells, not a battery."}
+{"row_id": "B_012", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "6S 1100mAh LiPo battery pack with cells, capacity, and chemistry correctly extracted."}
+{"row_id": "B_013", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "9V LiFePO4 battery with 6000mAh capacity and lifepo4 chemistry correctly extracted."}
+{"row_id": "B_014", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "4S 550mAh LiPo battery pack with cells, capacity, and chemistry correctly extracted."}
+{"row_id": "B_015", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Fireproof protective safety storage bag for lithium batteries, not a battery."}
+{"row_id": "B_016", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "ESP32-S3 development board sold explicitly without battery, not a battery."}
+{"row_id": "B_017", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Buck-boost voltage regulator module for battery charging, not a battery."}
+{"row_id": "B_018", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "LiPo battery voltage tester and low-voltage buzzer alarm, not a battery."}
+{"row_id": "B_019", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Mars rover educational robotics kit sold without battery, not a battery."}
+{"row_id": "B_020", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Insulation ring paper terminal stickers for 18650 cells, not a battery."}
+{"row_id": "B_021", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "3S 4500mAh Li-ion battery pack with cells, capacity, and chemistry correctly extracted."}
+{"row_id": "B_022", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Real time clock electronic module supplied with backup coin cell; main product is RTC board."}
+{"row_id": "B_023", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "8S 29000mAh solid-state Li-ion battery with cells, capacity, and chemistry correctly extracted."}
+{"row_id": "B_024", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "3.7V 4500mAh Li-Po rechargeable battery with capacity and chemistry correctly extracted."}
+{"row_id": "B_025", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "4S 1300mAh LiPo battery pack with cells, capacity, and chemistry correctly extracted."}
+{"row_id": "B_026", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "21700 cylindrical Li-ion rechargeable battery cell with 4500mAh capacity correctly extracted."}
+{"row_id": "B_027", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Battery capacity tester instrument, not a battery."}
+{"row_id": "B_028", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "AA battery holder enclosure with switch and clips, not a battery."}
+{"row_id": "B_029", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "1S 5000mAh Li-ion battery pack with cells, capacity, and chemistry correctly extracted."}
+{"row_id": "B_030", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Spot welder machine for battery pack assembly, not a battery."}
+{"row_id": "B_031", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "XT60 to T-connector adapter cable for RC batteries, not a battery."}
+{"row_id": "B_032", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "2S 4800mAh hardcase LiPo battery pack with cells, capacity, and chemistry correctly extracted."}
+{"row_id": "B_033", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Dual-channel balance charger for LiPo/LiHV batteries, not a battery."}
+{"row_id": "B_034", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "Nylon fastener strap belt for securing RC LiPo batteries, not a battery."}
+{"row_id": "B_035", "task": "classify_battery", "label": "no", "spec_check": "not_applicable", "confidence": "high", "reason": "1S BMS battery protection circuit board, not a battery."}
+{"row_id": "B_036", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "3.7V 400mAh Li-Po rechargeable battery with capacity and chemistry correctly extracted."}
+{"row_id": "B_037", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "3S 5500mAh LiPo rechargeable battery with cells, capacity, and chemistry correctly extracted."}
+{"row_id": "B_038", "task": "classify_battery", "label": "yes", "spec_check": "missed", "confidence": "high", "reason": "18650 battery pack specifies 3Cell configuration in title, but cells was missed."}
+{"row_id": "B_039", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "9V 500mAh rechargeable Li-ion battery with capacity and chemistry correctly extracted."}
+{"row_id": "B_040", "task": "classify_battery", "label": "yes", "spec_check": "ok", "confidence": "high", "reason": "18650 Li-ion rechargeable battery cell with 2850mAh capacity correctly extracted."}
+{"row_id": "C_001", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Toy motorized rotating gear blocks building set, not a motor component."}
+{"row_id": "C_002", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "DIY educational windmill kit containing components rather than being sold primarily as a motor or battery."}
+{"row_id": "C_003", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Operational amplifier IC where Motorola is manufacturer brand name noise."}
+{"row_id": "C_004", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Motorcycle chain link removal mechanical hand tool, not an electric motor or battery."}
+{"row_id": "C_005", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Tire repair rubber screw accessory for vehicles, neither a motor nor a battery."}
+{"row_id": "C_006", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "RF relay receiver and remote control switch for garage doors, not a motor."}
+{"row_id": "C_007", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Camera module with motorized autofocus lens, not a standalone motor."}
+{"row_id": "C_008", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Motorbike chain cleaning tool, neither a motor nor a battery."}
+{"row_id": "C_009", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Wireless relay module remote control switch sold explicitly without battery."}
+{"row_id": "C_010", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Wireless relay module remote control switch sold without battery."}
+{"row_id": "C_011", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Wireless relay module remote control switch sold without battery."}
+{"row_id": "C_012", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Wireless gamepad controller with internal haptic motors and battery, not a standalone motor or battery component."}
+{"row_id": "C_013", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Wireless relay module remote control switch sold without battery."}
+{"row_id": "C_014", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Wireless relay module remote control switch sold without battery."}
+{"row_id": "C_015", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Forward/reverse timing delay motor controller module, not a motor."}
+{"row_id": "C_016", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Automotive motorcycle electrical wire connector plug socket kit, not a motor or battery."}
+{"row_id": "C_017", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Analog multiplexer switch IC where Motorola is manufacturer brand noise."}
+{"row_id": "C_018", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Automotive motorcycle electrical wire connector kit, not a motor or battery."}
+{"row_id": "C_019", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Anti-spark high current connector plug for electric vehicles, not a motor or battery."}
+{"row_id": "C_020", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Anti-spark high current connector plug for electric vehicles, not a motor or battery."}
+{"row_id": "C_021", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Amass MT30 electrical connector pair for motor and ESC connections, not a motor or battery."}
+{"row_id": "C_022", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Camera module with motorized IR-cut filter mechanism, not a motor."}
+{"row_id": "C_023", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Autofocus camera module with motorized lens for Raspberry Pi, not a motor."}
+{"row_id": "C_024", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Camera module with motorized IR-cut filter, not a standalone motor."}
+{"row_id": "C_025", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Camera module with motorized focus lens for Jetson Nano, not a motor."}
+{"row_id": "C_026", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Sony IMX219 camera module with motorized IR-cut filter, not a motor."}
+{"row_id": "C_027", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Camera evaluation kit featuring motorized focus, not a motor."}
+{"row_id": "C_028", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Anti-spark high power connector plug for batteries and motors, not a motor or battery."}
+{"row_id": "C_029", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Anti-spark high power connector plug for batteries and motors, not a motor or battery."}
+{"row_id": "C_030", "task": "check_recall", "label": "correctly_unclassified", "confidence": "high", "reason": "Anti-spark high power connector plug for batteries and motors, not a motor or battery."}
+{"row_id": "D_001", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.15A as the operating current for the DC motor driving the diaphragm pump."}
+{"row_id": "D_002", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.2A as the current rating for the brushed motor peristaltic pump."}
+{"row_id": "D_003", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.35A as the current rating for the brushless motor peristaltic pump."}
+{"row_id": "D_004", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.4A as the rated phase current for the Nema 17 stepper motor."}
+{"row_id": "D_005", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.4A as the rated phase current for the Nema 14 stepper motor."}
+{"row_id": "D_006", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.5A as the rated phase current for the Nema 14 stepper motor."}
+{"row_id": "D_007", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.6A as the operating current for the 2-phase stepper motor."}
+{"row_id": "D_008", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.67A as the rated phase current for the Nema 11 stepper motor."}
+{"row_id": "D_009", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.7A as the operating current for the 6V DC geared motor."}
+{"row_id": "D_010", "task": "check_current", "label": "wrong", "confidence": "high", "reason": "The 0.8A value is the output current rating of the L9110S motor driver board, not a motor specification."}
+{"row_id": "D_011", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.8A as the rated operating current of the Creality stepper motor."}
+{"row_id": "D_012", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.8A as the rated current for the Creality 42-34 stepper motor."}
+{"row_id": "D_013", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.84A as the rated current for the Creality 42-26 stepper motor."}
+{"row_id": "D_014", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 0.88A as the rated phase current for the Nema 23 stepper motor."}
+{"row_id": "D_015", "task": "check_current", "label": "correct", "confidence": "high", "reason": "The title specifies 1.00A as the rated operating current for the brushless DC motor."}
+{"row_id": "D_016", "task": "check_current", "label": "wrong", "confidence": "high", "reason": "The 1 A value is the output current capacity of the L293B motor driver IC, not a motor specification."}
+{"row_id": "D_017", "task": "check_current", "label": "wrong", "confidence": "high", "reason": "The 1A value is the output current rating of the DRV8837C motor driver IC, not a motor specification."}
+{"row_id": "D_018", "task": "check_current", "label": "wrong", "confidence": "high", "reason": "The 1A value is the output current rating of the BRD1260C motor driver IC, not a motor specification."}
+{"row_id": "D_019", "task": "check_current", "label": "wrong", "confidence": "high", "reason": "The 1A value is the current limit rating of the A4988 stepper motor driver board, not a motor specification."}
+{"row_id": "D_020", "task": "check_current", "label": "wrong", "confidence": "high", "reason": "The 1A value is the lower bound of the output current range (1A-25A) for a buck converter power supply, not a motor specification."}

@@ -232,6 +232,66 @@ def recompute_spec_stats(conn: sqlite3.Connection, taxonomy) -> None:
     conn.commit()
     logger.info("spec_stats recomputation complete.")
 
+def recompute_spec_stats_global(conn: sqlite3.Connection) -> None:
+    """Populates spec_stats_global from product_specs directly without category join."""
+    logger.info("Step 5: Populating spec_stats_global from product_specs...")
+    cur = conn.cursor()
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    # Ensure spec_stats_global exists
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS spec_stats_global (
+            key TEXT PRIMARY KEY,
+            value_type TEXT,
+            applicable_count INTEGER,
+            value_counts TEXT,
+            value_min REAL,
+            value_max REAL,
+            updated_at TEXT
+        );
+    """)
+
+    # Group by key and value_type
+    cur.execute("""
+        SELECT key, value_type, COUNT(1) as cnt
+        FROM product_specs
+        GROUP BY key, value_type;
+    """)
+    key_rows = cur.fetchall()
+
+    cur.execute("DELETE FROM spec_stats_global;")
+
+    for key, value_type, count in key_rows:
+        # Top 50 value counts
+        cur.execute("""
+            SELECT value, COUNT(1) as cnt
+            FROM product_specs
+            WHERE key = ?
+            GROUP BY value
+            ORDER BY cnt DESC
+            LIMIT 50;
+        """, (key,))
+        val_counts = {row[0]: row[1] for row in cur.fetchall()}
+
+        # Min and Max for numeric values
+        cur.execute("""
+            SELECT MIN(value_num), MAX(value_num)
+            FROM product_specs
+            WHERE key = ? AND value_num IS NOT NULL;
+        """, (key,))
+        min_max = cur.fetchone()
+        val_min = min_max[0] if min_max and min_max[0] is not None else None
+        val_max = min_max[1] if min_max and min_max[1] is not None else None
+
+        cur.execute("""
+            INSERT INTO spec_stats_global (
+                key, value_type, applicable_count, value_counts, value_min, value_max, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?);
+        """, (key, value_type, count, json.dumps(val_counts), val_min, val_max, now_str))
+
+    conn.commit()
+    logger.info(f"spec_stats_global population complete: {len(key_rows)} keys populated.")
+
 def run_backfill() -> None:
     """Executes the full idempotent backfill process."""
     start_time = time.time()
@@ -254,8 +314,11 @@ def run_backfill() -> None:
         # Step 3: Extract specs
         extract_and_store_specs(conn, taxonomy, extractors)
 
-        # Step 4: Recompute stats
+        # Step 4: Recompute stats per category
         recompute_spec_stats(conn, taxonomy)
+
+        # Step 5: Recompute global spec stats
+        recompute_spec_stats_global(conn)
 
         elapsed = time.time() - start_time
         logger.info(f"Backfill finished successfully in {elapsed:.2f}s!")

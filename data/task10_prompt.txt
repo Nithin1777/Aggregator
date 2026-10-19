@@ -1,0 +1,390 @@
+<USER_REQUEST>
+TASK: Wire the full classification pipeline with LLM escalation.
+Production work, not evaluation. Ship end-to-end.
+
+LLM ACCESS MODEL (critical — read first):
+  There is NO LLM API key available. LLM classification is done by an
+  EXTERNAL AGENT HARNESS (Claude Code, Cursor, local agent, etc.) that
+  the user points at a JSON file. The pipeline's job is:
+    1. Extract unclassified gray pairs → data/not_sure.jsonl
+    2. Write a self-contained prompt → data/NOT_SURE_PROMPT.md
+    3. Read the harness's output file → validate → persist
+  The pipeline NEVER makes LLM API calls. No SDK. No API key. No batching.
+  The harness is the runtime; the pipeline is only I/O + validation.
+
+ARCHITECTURE
+  Stage 1: V2 matcher → bucket (confident_merge / confident_reject / gray)
+  Stage 2: Gray pairs → data/gray_pairs.jsonl (disjoint from seed)
+  Stage 3: Resolver --extract → data/not_sure.jsonl + NOT_SURE_PROMPT.md
+  Stage 3b: User runs external harness → data/not_sure_classified.jsonl
+  Stage 3c: Resolver --collect → validate → data/resolver_output.jsonl
+  Stage 4: Seed validation (hash-based reuse if prompt unchanged)
+  Stage 5: Merge labels → llm_labels table
+  Stage 6: Live search reads llm_labels, falls back to V2
+
+Live request path NEVER calls LLM. The harness runs out-of-band.
+
+═══════════════════════════════════════════════════════════════════
+STEP 1 — Bucketing logic
+═══════════════════════════════════════════════════════════════════
+
+Create src/llm/bucketing.py:
+
+    def bucket_pair(title_a, title_b, price_a, price_b,
+                    mpn_a=None, mpn_b=None):
+        """
+        Return (bucket, merged, score, reason).
+        bucket ∈ {confident_merge, confident_reject, gray}
+        STRICT PRECEDENCE — do not reorder.
+        """
+        merged, score, reason = match_components_v2(
+            title_a, title_b, price_a, price_b)
+
+        # 1. MPN rescue: same MPN but matcher said no — escalate
+        if mpn_a and mpn_b and mpn_a == mpn_b and not merged and score >= 0.5:
+            return "gray", merged, score, reason
+
+        # 2. Confident merge
+        if merged and score >= 0.85 and "hard veto" not in reason.lower():
+            return "confident_merge", merged, score, reason
+
+        # 3. Confident reject
+        if not merged and score < 0.55:
+            return "confident_reject", merged, score, reason
+
+        # 4. Everything else is gray
+        return "gray", merged, score, reason
+
+Report bucket fractions on the current candidate set.
+Do NOT tune thresholds. If gray < 20% or > 60%, report and wait.
+
+═══════════════════════════════════════════════════════════════════
+STEP 2 — Gray-pair extraction
+═══════════════════════════════════════════════════════════════════
+
+Create scripts/extract_gray_pairs.py:
+
+  1. Candidate pairs from products table:
+     - Same category OR overlapping high-frequency tokens
+     - Different vendors
+     - NOT already in llm_labels
+     - NOT in the 40 seed pairs (titles match data/judge_seed.jsonl)
+  2. Run bucket_pair on each candidate
+  3. For GRAY pairs, write to data/gray_pairs.jsonl, schema:
+        {pair_id, title_a, specs_a, title_b, specs_b, mpn_a, mpn_b}
+     pair_id = sha1(sorted(lower(title_a), lower(title_b)))[:16]
+     No prefix. Content-addressable. Same scheme everywhere.
+  4. For confident decisions, write to matcher_decisions table:
+        CREATE TABLE IF NOT EXISTS matcher_decisions (
+          pair_id TEXT PRIMARY KEY,
+          decision TEXT NOT NULL,   -- confident_merge | confident_reject
+          score REAL,
+          reason TEXT,
+          created_at TEXT
+        );
+  5. Report:
+     - total candidates
+     - confident_merge count / confident_reject count / gray count
+     - gray rows written to data/gray_pairs.jsonl
+
+If gray count > 20000: report and STOP for cost review before any
+harness run.
+
+═══════════════════════════════════════════════════════════════════
+STEP 3 — Resolver (extract / collect for external harness)
+═══════════════════════════════════════════════════════════════════
+
+Rewrite src/llm/resolver.py as a two-subcommand tool:
+
+    python src/llm/resolver.py --extract   # write files for harness
+    python src/llm/resolver.py --collect   # read harness output
+
+Both idempotent. Re-running skips already-processed pairs.
+
+─── EXTRACT ─────────────────────────────────────────────────────
+
+  Input:  data/gray_pairs.jsonl
+  Skip:   pair_ids already in data/resolver_output.jsonl
+  Select: all pending gray pairs. Optional flags:
+            --limit N       cap to N pairs
+            --start N --end M  range slice
+            --force         reprocess even cached pairs (used by Step 4)
+  Write TWO files:
+
+  data/not_sure.jsonl
+    One JSON object per line, schema:
+      {pair_id, title_a, specs_a, title_b, specs_b}
+    pair_id = sha1(sorted(lower(title_a), lower(title_b)))[:16]
+
+  data/NOT_SURE_PROMPT.md
+    Self-contained instructions for the external harness. Contents:
+
+      # Classification task
+
+      You will classify pairs of electronics product listings from
+      Indian vendors (Robu, QuartzComponents, MakerBazar, Robokits,
+      REES52) as SAME, DIFFERENT, or UNSURE. Evaluate on functional
+      drop-in substitutability.
+
+      [INSERT FULL RUBRIC — SAME / DIFFERENT / UNSURE definitions,
+       verbatim from the labeling round that produced the 95%-validated
+       judge prompt]
+
+      ## Input
+
+      Read data/not_sure.jsonl. Each line is:
+        {pair_id, title_a, specs_a, title_b, specs_b}
+      specs_a/specs_b may be object, string, or empty.
+
+      ## Output
+
+      Write data/not_sure_classified.jsonl. Exactly one JSON line per
+      input pair, same order, same count. Schema:
+
+        {"pair_id": "<id>",
+         "label": "same|different|unsure",
+         "confidence": "high|medium|low",
+         "deciding_spec": "<the trait that decided it>",
+         "reason": "<one sentence>"}
+
+      No preamble. No markdown fences. No commentary. Do not skip lines.
+      Do not merge lines.
+
+      ## Calibration examples (from the human-labeled seed)
+
+      [INSERT 4 examples — one same, one different, one unsure, one
+       tricky-but-clear — with their validated labels and reasons]
+
+  Store sha256 of the rubric block in data/not_sure_prompt_hash.txt.
+  Print:
+    "Wrote N pairs to data/not_sure.jsonl"
+    "Wrote instructions to data/NOT_SURE_PROMPT.md"
+    "Rubric hash: <sha256>"
+    "NEXT: point your agent harness at data/ and say:
+     'Read NOT_SURE_PROMPT.md, classify not_sure.jsonl, write
+      not_sure_classified.jsonl'"
+    "Then run: python src/llm/resolver.py --collect"
+
+  EXIT. Do not attempt to call anything. Do not simulate output.
+
+─── COLLECT ─────────────────────────────────────────────────────
+
+  Read:  data/not_sure.jsonl            (expected pairs)
+  Read:  data/not_sure_classified.jsonl (harness output)
+
+  Validation (fail fast on first issue, no partial collect):
+    - File exists
+    - Strip markdown fences (```json / ```) if harness added them
+    - Skip blank lines
+    - Every line parses as JSON
+    - Row count == expected count
+    - pair_id order matches not_sure.jsonl exactly
+    - Every label ∈ {same, different, unsure}
+    - Every confidence ∈ {high, medium, low}
+
+  If ALL pass:
+    - Append rows to data/resolver_output.jsonl (dedup by pair_id)
+    - Archive:
+        mv data/not_sure.jsonl            → data/resolver_archive/extract_<ts>.jsonl
+        mv data/not_sure_classified.jsonl → data/resolver_archive/classified_<ts>.jsonl
+        mv data/NOT_SURE_PROMPT.md        → data/resolver_archive/prompt_<ts>.md
+    - Print: "Collected N pairs → data/resolver_output.jsonl"
+
+  If ANY check fails:
+    - Do NOT partially collect
+    - Print the specific failure:
+        "Line 17: pair_id mismatch. Expected gz-<hash>, got <id>"
+        "Line 23: invalid label 'variant' — must be same|different|unsure"
+        "Row count mismatch: expected 200, got 198"
+    - Exit non-zero
+    - User fixes data/not_sure_classified.jsonl and re-runs --collect
+
+─── NO API MODE IN THIS TASK ────────────────────────────────────
+
+  Do not implement an API mode. If the user later obtains an LLM API
+  key, a future task can add --api-extract / --api-collect as a
+  parallel path. Out of scope now.
+
+═══════════════════════════════════════════════════════════════════
+STEP 4 — Seed validation
+═══════════════════════════════════════════════════════════════════
+
+Compare data/not_sure_prompt_hash.txt against the hash of the rubric
+that produced data/judge_output.jsonl (95% validated, 38/40 agree
+with human labels). Store that judge rubric hash in
+data/judge_prompt_hash.txt — write it once now from the archived
+rubric text; if the archive is missing, reconstruct from the seed
+labels + existing prompt copy in this codebase.
+
+IF hashes match:
+  Print: "Prompt unchanged from judge round — reusing 95.00% (38/40)
+          validation. GATE PASSED."
+  Spot-check: print 3 random resolver_output rows alongside their
+              seed human_label counterparts (for eyeball consistency).
+  Proceed to Step 5.
+
+IF hashes differ:
+  Run seed validation via the same extract/collect flow, scoped to the
+  seed file:
+
+    python src/llm/resolver.py --extract \
+      --input data/judge_seed.jsonl \
+      --output data/seed_validation/ \
+      --force --limit 0
+
+  → writes data/seed_validation/not_sure.jsonl (40 pairs)
+     + data/seed_validation/NOT_SURE_PROMPT.md
+
+  User: point harness at data/seed_validation/, save output as
+        data/seed_validation/not_sure_classified.jsonl
+
+    python src/llm/resolver.py --collect \
+      --input data/judge_seed.jsonl \
+      --output data/seed_validation/
+
+    python scripts/validate_judge_offline.py \
+      --input data/seed_validation/resolver_output.jsonl \
+      --seed data/judge_seed.jsonl
+
+GATE: agreement < 85% → STOP, do not wire into live search.
+      agreement >= 85% → proceed.
+
+Note on join: validate_judge_offline.py must join resolver output to
+the seed by sorted lowercased (title_a, title_b), NOT by pair_id,
+because seed uses legacy gz_XXXXX ids and resolver output uses sha1
+hashes. Update the script if it currently joins on pair_id.
+
+═══════════════════════════════════════════════════════════════════
+STEP 5 — Merge labels into DB
+═══════════════════════════════════════════════════════════════════
+
+Create scripts/merge_llm_labels.py:
+
+  1. Read data/resolver_output.jsonl
+  2. Upsert into llm_labels:
+        CREATE TABLE IF NOT EXISTS llm_labels (
+          pair_id TEXT PRIMARY KEY,
+          title_a TEXT,
+          title_b TEXT,
+          label TEXT NOT NULL,        -- same | different | unsure
+          confidence TEXT,            -- high | medium | low
+          reason TEXT,
+          resolved_at TEXT,
+          human_verified INTEGER DEFAULT 0
+        );
+  3. Rows that also exist in the 40-pair seed set get
+     human_verified = 1.
+  4. Report:
+     - Total rows inserted
+     - Label distribution
+     - Count of unsure (conservative no-merge in live search)
+     - Count of low-confidence (flag for review)
+
+═══════════════════════════════════════════════════════════════════
+STEP 6 — Wire live search
+═══════════════════════════════════════════════════════════════════
+
+In search_service.py, in the merging path (group_and_compare or
+equivalent):
+
+  1. For each candidate pair, compute pair_id using the same sha1
+     scheme: sha1(sorted(lower(title_a), lower(title_b)))[:16]
+  2. Look up llm_labels by pair_id
+  3. If found:
+       same      → merge
+       different → reject (no merge)
+       unsure    → leave unmerged (conservative)
+  4. If not found: fall back to match_components_v2
+  5. NO LLM calls at request time. Ever.
+  6. Add per-card field `source` = "llm_label" | "v2_fallback" in the
+     API response (visible in JSON, may or may not surface in UI yet).
+  7. Add config flag MATCHER_MODE=v2_only|hybrid to allow A/B testing.
+
+Log line for hybrid mode: for every merge/reject decision, emit
+"pair=<pair_id> source=<llm_label|v2_fallback> label=<label|->".
+Do not log title text or vendor names to stdout (privacy-adjacent
+noise). Log to file if available.
+
+═══════════════════════════════════════════════════════════════════
+STEP 7 — End-to-end verification
+═══════════════════════════════════════════════════════════════════
+
+For queries: arduino, esp32, lm2596, dht11, servo, relay, bme280,
+raspberry pi, rp2040, stm32:
+
+  - Run live search (MATCHER_MODE=hybrid)
+  - For each merged card: report source (llm_label or v2_fallback)
+  - Confirm zero LLM calls in request path (log assertion)
+  - Latency < 1s warm for all 10
+  - No 500s
+
+Also run:
+  - pytest -v → 55+ tests pass
+  - MATCHER_MODE=v2_only → results identical to pre-pipeline (sanity)
+
+═══════════════════════════════════════════════════════════════════
+DELIVERABLES
+═══════════════════════════════════════════════════════════════════
+- src/llm/bucketing.py
+- scripts/extract_gray_pairs.py
+- src/llm/resolver.py  (--extract / --collect, --limit/--start/--end/
+                         --force, prompt hash output)
+- src/llm/prompt_template.py (rubric + calibration examples as Python
+  string; imported by resolver; single source of truth so hash is
+  stable)
+- data/NOT_SURE_PROMPT.md generation logic
+- data/judge_prompt_hash.txt (write once from judge round)
+- scripts/validate_judge_offline.py (update join to titles, not pair_id)
+- scripts/merge_llm_labels.py
+- search_service.py wiring (llm_labels first, v2 fallback, source field)
+- llm_labels table migration
+- data/resolver_archive/ directory (created on first --collect)
+
+═══════════════════════════════════════════════════════════════════
+HARD RULES
+═══════════════════════════════════════════════════════════════════
+- No LLM API calls. No SDK import. No API key. The harness is external.
+- No batch directories, no STATUS.json, no per-batch meta files. One
+  extract file, one response file, one collect call.
+- No modification to match_components_v2, can_merge, spec
+  discriminators, guard rules, canonical logic, search ranking.
+- No modification to data/judge_seed.jsonl or the 40 human labels.
+- Resumable: --extract skips cached; --collect idempotent.
+- pair_id = sha1(sorted(lower(title_a), lower(title_b)))[:16], no
+  prefix, used everywhere (extract, collect, live search lookup, DB).
+- Seed join is by titles, not pair_id.
+- LLM "unsure" → leave unmerged in live search.
+- Resolver-vs-human < 85% → STOP, do not wire live.
+- Prompt rubric block MUST be byte-identical across:
+    * judge round (source of 95% validation)
+    * resolver template (src/llm/prompt_template.py)
+    * NOT_SURE_PROMPT.md at extract time
+  The hash check in Step 4 enforces this. If you change the rubric
+  text, hash changes, and fresh seed validation is required.
+- Do NOT touch scrapers, canonical ranking logic, or Python version.
+- Do NOT ask clarifying questions. On ambiguous calls, choose the
+  conservative option (leave unmerged, flag for review) and note it
+  in the report.
+
+═══════════════════════════════════════════════════════════════════
+REPORT (short)
+═══════════════════════════════════════════════════════════════════
+1. Bucketing distribution: confident_merge / confident_reject / gray
+2. Gray count → data/gray_pairs.jsonl row count
+3. --extract output: pairs written, prompt hash
+4. STOP and hand back to user for harness run
+   (report: "READY FOR HARNESS — feed data/NOT_SURE_PROMPT.md and
+    data/not_sure.jsonl to your agent, save output as
+    data/not_sure_classified.jsonl, then re-run this task with
+    --collect")
+5. [after user returns] --collect: N collected, X pending, Y failed
+6. Seed validation: reused-judge 95% OR fresh-run X% (state which)
+7. llm_labels: rows, distribution, human_verified count
+8. Live search: 10 queries, source mix (llm vs v2), latency, log
+   assertions
+9. pytest count
+10. Blocking issues (if any)
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-10-19T14:40:22+05:30.
+</ADDITIONAL_METADATA>

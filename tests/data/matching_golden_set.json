@@ -1,0 +1,413 @@
+[
+  {
+    "id": "syn_01",
+    "split": "dev",
+    "category": "synonym_expansion",
+    "title_a": "ESP32 Development Board WiFi Bluetooth 30 Pin",
+    "title_b": "ESP32 DevKit WLAN BT 30P IoT Module",
+    "should_match": true,
+    "description": "Synonyms: WiFi/WLAN, BT/Bluetooth, DevKit/Development Board, 30P/30 Pin"
+  },
+  {
+    "id": "syn_02",
+    "split": "dev",
+    "category": "synonym_expansion",
+    "title_a": "NodeMCU V3 Lua ESP8266 ESP-12E CH340 Wireless Module",
+    "title_b": "NodeMCU ESP8266 WiFi Development Board CH340G",
+    "should_match": true,
+    "description": "CH340/CH340G, Wireless/WiFi, Lua NodeMCU"
+  },
+  {
+    "id": "syn_03",
+    "split": "dev",
+    "category": "synonym_expansion",
+    "title_a": "OLED Display 0.96 inch I2C 128x64 Blue Screen Module",
+    "title_b": "0.96\" IIC OLED Screen Module 12864 Blue Display",
+    "should_match": true,
+    "description": "I2C/IIC, 0.96 inch/0.96\", 128x64/12864, Screen/Display"
+  },
+  {
+    "id": "syn_04",
+    "split": "dev",
+    "category": "synonym_expansion",
+    "title_a": "LM2596 DC-DC Buck Converter Step-Down Power Supply Module",
+    "title_b": "LM2596S Step Down Voltage Regulator Adjustable Power Module",
+    "should_match": true,
+    "description": "Buck Converter/Step-Down Voltage Regulator, LM2596/LM2596S"
+  },
+  {
+    "id": "syn_05",
+    "split": "dev",
+    "category": "synonym_expansion",
+    "title_a": "MPU-6050 3-Axis Gyroscope and Accelerometer 6DOF Sensor Module",
+    "title_b": "MPU6050 6 Axis Gyro Accel Sensor Module I2C",
+    "should_match": true,
+    "description": "MPU-6050/MPU6050, 3-Axis Gyro and Accel / 6 Axis Gyro Accel"
+  },
+  {
+    "id": "syn_06",
+    "split": "held_out",
+    "category": "synonym_expansion",
+    "title_a": "SG90 9g Micro Servo Motor with Horns for RC Drone Plane",
+    "title_b": "TowerPro SG-90 9 Gram Micro Mini Servo Motor",
+    "should_match": true,
+    "description": "SG90/SG-90, 9g/9 Gram, Micro/Mini Servo"
+  },
+  {
+    "id": "syn_07",
+    "split": "held_out",
+    "category": "synonym_expansion",
+    "title_a": "HC-SR04 Ultrasonic Distance Sensor Transducer Module",
+    "title_b": "HCSR04 Ultrasonic Range Finder Distance Measuring Sensor",
+    "should_match": true,
+    "description": "HC-SR04/HCSR04, Distance Sensor/Range Finder"
+  },
+  {
+    "id": "syn_08",
+    "split": "held_out",
+    "category": "synonym_expansion",
+    "title_a": "TP4056 1A Lithium Battery Charging Board with Protection Type-C",
+    "title_b": "TP4056 1S Li-Ion Battery Charger Module with Dual Protection USB-C",
+    "should_match": true,
+    "description": "Lithium/Li-Ion, Charging Board/Charger Module, Type-C/USB-C"
+  },
+
+  {
+    "id": "mpn_veto_01",
+    "split": "dev",
+    "category": "hard_negative_mpn_conflict",
+    "title_a": "LM2596 DC-DC Step Down Converter Power Supply Module",
+    "title_b": "AMS1117 Step Down Voltage Regulator Power Supply Module",
+    "should_match": false,
+    "description": "LM2596 (switching regulator) vs AMS1117 (linear LDO regulator) must not merge despite shared power words"
+  },
+  {
+    "id": "mpn_veto_02",
+    "split": "dev",
+    "category": "hard_negative_mpn_conflict",
+    "title_a": "CH340 USB to TTL UART Serial Converter Adapter Module",
+    "title_b": "CP2102 USB to TTL UART Serial Converter Adapter Module",
+    "should_match": false,
+    "description": "CH340 vs CP2102 chip difference must not merge despite identical adapter descriptions"
+  },
+  {
+    "id": "mpn_veto_03",
+    "split": "dev",
+    "category": "hard_negative_mpn_conflict",
+    "title_a": "BMP280 Barometric Pressure and Temperature Sensor Module I2C",
+    "title_b": "BME280 Atmospheric Temperature Humidity Pressure Sensor Module I2C",
+    "should_match": false,
+    "description": "BMP280 (no humidity) vs BME280 (has humidity)"
+  },
+  {
+    "id": "mpn_veto_04",
+    "split": "dev",
+    "category": "hard_negative_mpn_conflict",
+    "title_a": "DHT11 Digital Temperature and Humidity Sensor Module",
+    "title_b": "DHT22 High Precision Temperature and Humidity Sensor Module",
+    "should_match": false,
+    "description": "DHT11 vs DHT22 different sensor accuracy and protocol timings"
+  },
+  {
+    "id": "mpn_veto_05",
+    "split": "dev",
+    "category": "hard_negative_mpn_conflict",
+    "title_a": "L298N Dual H-Bridge Motor Driver Module for Smart Robot",
+    "title_b": "L293D Motor Driver Shield Board for Smart Robot",
+    "should_match": false,
+    "description": "L298N vs L293D distinct motor driver ICs"
+  },
+  {
+    "id": "mpn_veto_06",
+    "split": "held_out",
+    "category": "hard_negative_mpn_conflict",
+    "title_a": "ESP32 WiFi Bluetooth IoT Development Board 30 Pin",
+    "title_b": "ESP8266 NodeMCU Lua WiFi IoT Development Board 30 Pin",
+    "should_match": false,
+    "description": "ESP32 dual-core vs ESP8266 single-core"
+  },
+  {
+    "id": "mpn_veto_07",
+    "split": "held_out",
+    "category": "hard_negative_mpn_conflict",
+    "title_a": "A4988 Stepper Motor Driver Module with Heat Sink",
+    "title_b": "DRV8825 Stepper Motor Driver Module with Heat Sink",
+    "should_match": false,
+    "description": "A4988 (1/16 microstepping) vs DRV8825 (1/32 microstepping)"
+  },
+  {
+    "id": "mpn_veto_08",
+    "split": "held_out",
+    "category": "hard_negative_mpn_conflict",
+    "title_a": "XL4015 5A DC-DC Step Down Adjustable Power Supply Module",
+    "title_b": "LM2596 3A DC-DC Step Down Adjustable Power Supply Module",
+    "should_match": false,
+    "description": "XL4015 (5A) vs LM2596 (3A)"
+  },
+
+  {
+    "id": "variant_01",
+    "split": "dev",
+    "category": "submodule_variant_conflict",
+    "title_a": "ESP32-WROOM-32 30 Pin Development Board",
+    "title_b": "ESP32-WROVER 30 Pin Development Board with PSRAM",
+    "should_match": false,
+    "description": "WROOM vs WROVER (WROVER contains 4MB/8MB SPI PSRAM, distinct silicon module)"
+  },
+  {
+    "id": "variant_02",
+    "split": "dev",
+    "category": "submodule_variant_conflict",
+    "title_a": "ESP32-WROOM-32D WiFi Bluetooth Module PCB Antenna",
+    "title_b": "ESP32-WROOM-32U WiFi Bluetooth Module IPEX U.FL Connector",
+    "should_match": false,
+    "description": "32D (onboard trace antenna) vs 32U (external antenna socket only)"
+  },
+  {
+    "id": "variant_03",
+    "split": "dev",
+    "category": "submodule_variant_conflict",
+    "title_a": "ESP32-S3 DevKitC-1 N8R8 Dual Core Microcontroller Board",
+    "title_b": "ESP32-C3 SuperMini Development Board WiFi Bluetooth RISC-V",
+    "should_match": false,
+    "description": "ESP32-S3 (Xtensa dual-core with AI vector) vs ESP32-C3 (single-core RISC-V)"
+  },
+  {
+    "id": "variant_04",
+    "split": "dev",
+    "category": "submodule_variant_conflict",
+    "title_a": "Arduino Uno R3 DIP ATmega328P Development Board",
+    "title_b": "Arduino Uno R4 Minima 32-bit Renesas RA4M1 Microcontroller Board",
+    "should_match": false,
+    "description": "Uno R3 (8-bit AVR) vs Uno R4 (32-bit ARM Cortex-M4)"
+  },
+  {
+    "id": "variant_05",
+    "split": "held_out",
+    "category": "submodule_variant_conflict",
+    "title_a": "Raspberry Pi 4 Model B - 4GB RAM",
+    "title_b": "Raspberry Pi 4 Model B - 8GB RAM",
+    "should_match": false,
+    "description": "4GB RAM vs 8GB RAM capacity variance"
+  },
+  {
+    "id": "variant_06",
+    "split": "held_out",
+    "category": "submodule_variant_conflict",
+    "title_a": "Raspberry Pi Pico RP2040 Microcontroller Board",
+    "title_b": "Raspberry Pi Pico W RP2040 Microcontroller Board with WiFi",
+    "should_match": false,
+    "description": "Pico (no wireless) vs Pico W (Infineon CYW43439 WiFi)"
+  },
+
+  {
+    "id": "dir_01",
+    "split": "dev",
+    "category": "directional_inversion",
+    "title_a": "3.3V to 5V 4-Channel Logic Level Converter Shifter Module",
+    "title_b": "5V to 3.3V 4-Channel Step Down Power Converter Module",
+    "should_match": false,
+    "description": "3.3V to 5V level shifter vs 5V to 3.3V step down regulator"
+  },
+  {
+    "id": "dir_02",
+    "split": "dev",
+    "category": "directional_inversion",
+    "title_a": "DC-DC Step-Up Boost Converter Module 2A",
+    "title_b": "DC-DC Step-Down Buck Converter Module 2A",
+    "should_match": false,
+    "description": "Step-Up (boost) vs Step-Down (buck)"
+  },
+  {
+    "id": "dir_03",
+    "split": "held_out",
+    "category": "directional_inversion",
+    "title_a": "AC 220V to DC 12V 2A Isolated Switching Power Supply Board",
+    "title_b": "DC 12V to AC 220V 150W Inverter Boost Board",
+    "should_match": false,
+    "description": "AC-to-DC rectifier supply vs DC-to-AC inverter"
+  },
+
+  {
+    "id": "spec_01",
+    "split": "dev",
+    "category": "spec_mismatch",
+    "title_a": "ESP32 NodeMCU WiFi Development Board 30 Pins",
+    "title_b": "ESP32 NodeMCU WiFi Development Board 38 Pins",
+    "should_match": false,
+    "description": "30 pin vs 38 pin form factor mismatch (incompatible breadboard pinouts)"
+  },
+  {
+    "id": "spec_02",
+    "split": "dev",
+    "category": "spec_mismatch",
+    "title_a": "N20 Micro Metal Gear Motor 12V 300 RPM",
+    "title_b": "N20 Micro Metal Gear Motor 12V 1000 RPM",
+    "should_match": false,
+    "description": "300 RPM vs 1000 RPM gear ratio difference"
+  },
+  {
+    "id": "spec_03",
+    "split": "dev",
+    "category": "spec_mismatch",
+    "title_a": "Heavy Duty Swivel Caster Wheel 50mm",
+    "title_b": "Heavy Duty Swivel Caster Wheel 75mm",
+    "should_match": false,
+    "description": "50mm vs 75mm physical dimension mismatch"
+  },
+  {
+    "id": "spec_04",
+    "split": "dev",
+    "category": "spec_mismatch",
+    "title_a": "NEMA 17 Bipolar Stepper Motor 42BYGH 1.5A 40mm",
+    "title_b": "NEMA 23 Bipolar Stepper Motor 57BYGH 2.8A 56mm",
+    "should_match": false,
+    "description": "NEMA 17 (42mm frame) vs NEMA 23 (57mm frame)"
+  },
+  {
+    "id": "spec_05",
+    "split": "held_out",
+    "category": "spec_mismatch",
+    "title_a": "Electrolytic Capacitor 100uF 16V Radial",
+    "title_b": "Electrolytic Capacitor 100uF 50V Radial",
+    "should_match": false,
+    "description": "16V voltage rating vs 50V voltage rating"
+  },
+  {
+    "id": "spec_06",
+    "split": "held_out",
+    "category": "spec_mismatch",
+    "title_a": "OLED Display Module 0.96 inch I2C 128x64",
+    "title_b": "OLED Display Module 1.3 inch I2C 128x64",
+    "should_match": false,
+    "description": "0.96 inch display vs 1.3 inch display"
+  },
+
+  {
+    "id": "cross_vendor_01",
+    "split": "dev",
+    "category": "cross_vendor_exact",
+    "title_a": "Robu: NodeMCU ESP8266 CP2102 Wireless Development Board",
+    "title_b": "QuartzComponents: ESP8266 NodeMCU Lua WiFi CP2102 Board",
+    "should_match": true,
+    "description": "Real catalog items across Robu and Quartz for CP2102 NodeMCU"
+  },
+  {
+    "id": "cross_vendor_02",
+    "split": "dev",
+    "category": "cross_vendor_exact",
+    "title_a": "MakerBazar: SG90 Micro Servo Motor 9g",
+    "title_b": "Robokits: Towerpro SG90 9g Mini Servo",
+    "should_match": true,
+    "description": "Real catalog items across MakerBazar and Robokits for SG90 servo"
+  },
+  {
+    "id": "cross_vendor_03",
+    "split": "held_out",
+    "category": "cross_vendor_exact",
+    "title_a": "REES52: LM2596 DC-DC Buck Converter Adjustable 3A Power Supply Module",
+    "title_b": "QuartzComponents: LM2596 Step Down Voltage Regulator Module 3A",
+    "should_match": true,
+    "description": "Real catalog items across REES52 and QuartzComponents for LM2596 module"
+  },
+  {
+    "id": "cross_vendor_04",
+    "split": "held_out",
+    "category": "cross_vendor_exact",
+    "title_a": "Robu: HC-SR04 Ultrasonic Distance Sensor",
+    "title_b": "MakerBazar: HC-SR04 Ultrasonic Sensor Module for Arduino",
+    "should_match": true,
+    "description": "Real catalog items across Robu and MakerBazar for HC-SR04"
+  },
+  {
+    "id": "adv_obs_01",
+    "split": "held_out",
+    "category": "adversarial_observed",
+    "title_a": "LILYGO T-SimHat Expansion Board with CAN RS485 1/3-Way Relay DHT11 INA219",
+    "title_b": "DHT11 Temperature and Humidity Sensor",
+    "should_match": false,
+    "description": "Host GSM/Relay expansion board with auxiliary onboard DHT11 vs bare DHT11 sensor"
+  },
+  {
+    "id": "adv_obs_02",
+    "split": "held_out",
+    "category": "adversarial_observed",
+    "title_a": "DHT Shield for WeMos D1 mini DHT11 Single-bus digital Temperature & Humidity Sensor Module",
+    "title_b": "DHT11 Temperature and Humidity Sensor",
+    "should_match": false,
+    "description": "WeMos D1 mini form-factor shield vs standard 3-pin breakout module"
+  },
+  {
+    "id": "adv_obs_03",
+    "split": "held_out",
+    "category": "adversarial_observed",
+    "title_a": "DFRobot Gravity: DHT11 Temperature & Humidity Sensor Single-Wire",
+    "title_b": "DHT11 Digital Humidity and Temperature Sensor Module For DIY Electronics Projects",
+    "should_match": false,
+    "description": "Proprietary DFRobot Gravity ecosystem connector vs standard 0.1\" pitch header"
+  },
+  {
+    "id": "adv_obs_04",
+    "split": "held_out",
+    "category": "adversarial_observed",
+    "title_a": "9 in 1 Arduino Sensor Kit - Ultrasonic, PIR, IR, DHT11, MQ2, LDR, Sound, Rain Sensor",
+    "title_b": "DHT11 Temperature and Humidity Sensor",
+    "should_match": false,
+    "description": "9-in-1 multi-sensor educational combo kit vs standalone single sensor"
+  },
+  {
+    "id": "adv_obs_05",
+    "split": "held_out",
+    "category": "adversarial_observed",
+    "title_a": "Make an IoT based Temperature Level Indicator using LEDs and DHT11 Module with ESP8266-12e",
+    "title_b": "ESP8266 IoT Starter Kit for Beginners with DHT11 Temp Sensor & Electronic Components",
+    "should_match": false,
+    "description": "Different student project kits sharing ESP8266 and DHT11 components"
+  },
+  {
+    "id": "adv_obs_06",
+    "split": "held_out",
+    "category": "adversarial_observed",
+    "title_a": "Servo Mount Holder Bracket For SG90 Micro 9g Servo RC",
+    "title_b": "Tower Pro SG90 Servo Motor - 9 gms Mini/Micro Servo Motor",
+    "should_match": false,
+    "description": "Mounting bracket / hardware accessory vs actual SG90 servo motor"
+  },
+  {
+    "id": "adv_obs_07",
+    "split": "held_out",
+    "category": "adversarial_observed",
+    "title_a": "HC-SR04 Ultrasonic Sensor Acrylic Holder Mounting Bracket",
+    "title_b": "HC-SR04 Ultrasonic Range Finder Sensor Module for Arduino",
+    "should_match": false,
+    "description": "Acrylic mounting bracket vs functional HC-SR04 ultrasonic sensor module"
+  },
+  {
+    "id": "adv_obs_08",
+    "split": "held_out",
+    "category": "adversarial_observed",
+    "title_a": "Raspberry Pi Pico - Original",
+    "title_b": "Raspberry Pi Pico 2 RP2350 Microcontroller Board",
+    "should_match": false,
+    "description": "RP2040 Raspberry Pi Pico 1 vs RP2350 Raspberry Pi Pico 2"
+  },
+  {
+    "id": "adv_obs_09",
+    "split": "held_out",
+    "category": "adversarial_observed",
+    "title_a": "Uno R3 CH340G ATmega328p Development Board - Compatible with Arduino",
+    "title_b": "Unsoldered Nano V3.0 ATmega328P 5V 16MHz CH340",
+    "should_match": false,
+    "description": "Arduino Uno form factor vs Arduino Nano form factor sharing ATmega328P"
+  },
+  {
+    "id": "adv_obs_10",
+    "split": "held_out",
+    "category": "adversarial_observed",
+    "title_a": "Pro-Range DIY Hollow Clock Using Arduino Nano",
+    "title_b": "Official Arduino Nano Development Board",
+    "should_match": false,
+    "description": "DIY Hollow Clock project using Nano vs standalone Arduino Nano board"
+  }
+]
+

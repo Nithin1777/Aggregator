@@ -1,0 +1,1 @@
+{"pair_id": "example_001", "title_a": "5V 2 Channel Relay Module", "specs_a": {"channels": "2", "voltage": "5V"}, "title_b": "Dual Channel 5V Relay Board", "specs_b": {"channels": "2", "voltage": "5V"}, "human_label": "same", "deciding_spec": "channels"}

@@ -1,0 +1,277 @@
+[
+  {
+    "id": "TEST-1",
+    "query": "12v 200rpm motor",
+    "call": "search_components(filters={\"voltage\":\"12\", \"rpm\":\"190-210\"}, query=\"motor\")",
+    "passed": true,
+    "count": 10,
+    "top_5": [
+      {
+        "product_id": 4395,
+        "title": "12V 200 RPM Johnson Geared DC Motor \u2013 Grade A Quality",
+        "specs": {
+          "rpm": "200",
+          "voltage": "12"
+        },
+        "best_price": 391.0,
+        "best_vendor": "Quartz Components",
+        "top_offers": [
+          {
+            "vendor": "Quartz Components",
+            "price": 391.0,
+            "available": true,
+            "url": "https://quartzcomponents.com/products/12v-200-rpm-johnson-geared-dc-motor-grade-a-quality"
+          },
+          {
+            "vendor": "REES52",
+            "price": 490.0,
+            "available": true,
+            "url": "https://rees52.com/products/200-rpm-johnson-12v-dc-geared-motor-high-torque-rs233"
+          }
+        ]
+      },
+      {
+        "product_id": 6005,
+        "title": "12V 200RPM Geared DC Motor",
+        "specs": {
+          "rpm": "200",
+          "voltage": "12"
+        },
+        "best_price": 132.0,
+        "best_vendor": "Quartz Components",
+        "top_offers": [
+          {
+            "vendor": "Quartz Components",
+            "price": 132.0,
+            "available": true,
+            "url": "https://quartzcomponents.com/products/12v-200rpm-geared-dc-motor"
+          },
+          {
+            "vendor": "Robokits India",
+            "price": 454.0,
+            "available": true,
+            "url": "https://robokits.co.in/motors/dc-motor/12v-johnson-motors/johnson-geared-dc-motors/johnson-motor-high-torque-dc-geared-12v-200rpm-grade-a"
+          }
+        ]
+      },
+      {
+        "product_id": 17900,
+        "title": "N20-12V-200 RPM Micro Metal Gear Motor",
+        "specs": {
+          "rpm": "200",
+          "voltage": "12"
+        },
+        "best_price": 239.0,
+        "best_vendor": "Robu.in",
+        "top_offers": [
+          {
+            "vendor": "Robu.in",
+            "price": 239.0,
+            "available": true,
+            "url": "https://robu.in/product/n20-12v-200-rpm-micro-metal-gear-motor/"
+          },
+          {
+            "vendor": "REES52",
+            "price": 395.0,
+            "available": true,
+            "url": "https://rees52.com/products/n20-micro-gear-motor-n20-12v-200-rpm-micro-metal-gear-motor-with-encoder-rs4234"
+          }
+        ]
+      },
+      {
+        "product_id": 44850,
+        "title": "12V 200 RPM Geared Motor Johnson DC Gearbox Motor High-Torque 200 RPM Geared Motor High-Performance 100 RPM DC Geared Motor - ER026",
+        "specs": {
+          "rpm": "200",
+          "voltage": "12"
+        },
+        "best_price": 329.0,
+        "best_vendor": "REES52",
+        "top_offers": [
+          {
+            "vendor": "REES52",
+            "price": 329.0,
+            "available": true,
+            "url": "https://rees52.com/products/12v-200-rpm-geared-motor-johnson-dc-gearbox-motor-high-torque-200-rpm-geared-motor-high-performance-100-rpm-dc-geared-motor-er026"
+          }
+        ]
+      },
+      {
+        "product_id": 44859,
+        "title": "12V 200RPM Gear Motor Centre Shaft DC Geared Motor Heavy Duty Motor for Robotics - ER024",
+        "specs": {
+          "rpm": "200",
+          "voltage": "12"
+        },
+        "best_price": 119.0,
+        "best_vendor": "REES52",
+        "top_offers": [
+          {
+            "vendor": "REES52",
+            "price": 119.0,
+            "available": true,
+            "url": "https://rees52.com/products/12v-200rpm-gear-motor-centre-shaft-dc-geared-motor-heavy-duty-motor-for-robotics-er024"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "TEST-2",
+    "query": "4s 5200mah battery",
+    "call": "search_components(filters={\"cells\":\"4s\", \"capacity_mah\":\"5100-5300\"}, query=\"battery\")",
+    "passed": true,
+    "count": 2,
+    "top_5": [
+      {
+        "product_id": 18998,
+        "title": "Bonka 14.8V 5200mAh 35C 4S Lithium Polymer Battery Pack",
+        "specs": {
+          "capacity_mah": "5200",
+          "cells": "4s",
+          "chemistry": "lipo"
+        },
+        "best_price": 5779.0,
+        "best_vendor": "Robu.in",
+        "top_offers": [
+          {
+            "vendor": "Robu.in",
+            "price": 5779.0,
+            "available": true,
+            "url": "https://robu.in/product/orange-5200mah-4s-40c-lithium-polymer-battery-pack-lipo/"
+          }
+        ]
+      },
+      {
+        "product_id": 32501,
+        "title": "GenX 14.8V 4S 5200mAh 40C / 80C Premium Lipo Lithium Polymer Battery",
+        "specs": {
+          "capacity_mah": "5200",
+          "cells": "4s",
+          "chemistry": "lipo"
+        },
+        "best_price": 3294.0,
+        "best_vendor": "Robokits India",
+        "top_offers": [
+          {
+            "vendor": "Robokits India",
+            "price": 3294.0,
+            "available": true,
+            "url": "https://robokits.co.in/batteries-chargers/drone-batteries/genx-power-premium-lipo-battery/genxpower-14.8v-lipo-batteries/genx-14.8v-4s-5200mah-40c-80c-premium-lipo-lithium-polymer-battery"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "TEST-3",
+    "query": "motor 150 to 250 rpm, cheapest",
+    "call": "search_components(filters={\"rpm\":\"150-250\"}, query=\"motor\", sort=\"price_asc\")",
+    "passed": true,
+    "count": 10,
+    "top_5": [
+      {
+        "product_id": 33449,
+        "title": "Nema17 Planetary Geared BLDC Motor 19Kgcm 208RPM 52W",
+        "specs": {
+          "rpm": "208"
+        },
+        "best_price": 12.0,
+        "best_vendor": "Robokits India",
+        "top_offers": [
+          {
+            "vendor": "Robokits India",
+            "price": 12.0,
+            "available": true,
+            "url": "https://robokits.co.in/motors/rhino-bldc-brushless-dc-motor/rhino-52w-24v-bldc-motors/nema17-planetary-geared-bldc-motor-19kgcm-208rpm-52w"
+          }
+        ]
+      },
+      {
+        "product_id": 44869,
+        "title": "150 RPM Single Shaft BO Motor \u2013 High Torque DC Geared Motor for Robotics, Arduino, DIY Cars & Automation Projects | Buy Online in India",
+        "specs": {
+          "rpm": "150"
+        },
+        "best_price": 55.0,
+        "best_vendor": "REES52",
+        "top_offers": [
+          {
+            "vendor": "REES52",
+            "price": 55.0,
+            "available": true,
+            "url": "https://rees52.com/products/150-rpm-single-shaft-bo-motor-india-delhi-rees52"
+          }
+        ]
+      },
+      {
+        "product_id": 38341,
+        "title": "High Torque BO Motor 150 RPM With Dual Shaft Geared DC Motor Perfect For Robotics & DIY Projects - ML202",
+        "specs": {
+          "rpm": "150"
+        },
+        "best_price": 55.0,
+        "best_vendor": "REES52",
+        "top_offers": [
+          {
+            "vendor": "REES52",
+            "price": 55.0,
+            "available": true,
+            "url": "https://rees52.com/products/high-torque-bo-motor-150-rpm-with-dual-shaft-geared-dc-motor-perfect-for-robotics-diy-projects"
+          }
+        ]
+      },
+      {
+        "product_id": 44490,
+        "title": "180 RPM Micro DC Geared Motor With Back Shaft - RS021",
+        "specs": {
+          "rpm": "180"
+        },
+        "best_price": 99.0,
+        "best_vendor": "REES52",
+        "top_offers": [
+          {
+            "vendor": "REES52",
+            "price": 99.0,
+            "available": true,
+            "url": "https://rees52.com/products/180-rpm-micro-dc-geared-motor-with-back-shaft-rs021"
+          }
+        ]
+      },
+      {
+        "product_id": 44865,
+        "title": "12V 150RPM Gear Motor Centre Shaft DC Geared Motor Heavy Duty Motor for Robotics - ER022",
+        "specs": {
+          "rpm": "150",
+          "voltage": "12"
+        },
+        "best_price": 119.0,
+        "best_vendor": "REES52",
+        "top_offers": [
+          {
+            "vendor": "REES52",
+            "price": 119.0,
+            "available": true,
+            "url": "https://rees52.com/products/12v-150rpm-gear-motor-centre-shaft-dc-geared-motor-heavy-duty-motor-for-robotics"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "TEST-4",
+    "query": "motor with phase resistance 2 ohm",
+    "call": "search_components(query=\"motor phase resistance 2 ohm\", filters={})",
+    "passed": true,
+    "count": 0,
+    "top_5": []
+  },
+  {
+    "id": "TEST-5",
+    "query": "24v 50000rpm motor under 50",
+    "call": "search_components(filters={\"voltage\":\"24\", \"rpm\":\"49000-50000\"}, price_max=50, query=\"motor\")",
+    "passed": true,
+    "count": 0,
+    "top_5": []
+  }
+]

@@ -1,0 +1,29 @@
+{
+  "vendors": {
+    "quartzcomponents": {
+      "name": "Quartz Components",
+      "base_url": "https://quartzcomponents.com",
+      "adapter": "ShopifyAdapter"
+    },
+    "makerbazar": {
+      "name": "MakerBazar",
+      "base_url": "https://makerbazar.in",
+      "adapter": "ShopifyAdapter"
+    },
+    "rees52": {
+      "name": "REES52",
+      "base_url": "https://rees52.com",
+      "adapter": "ShopifyAdapter"
+    },
+    "robu": {
+      "name": "Robu.in",
+      "base_url": "https://robu.in",
+      "adapter": "RobuAdapter"
+    },
+    "robokits": {
+      "name": "Robokits India",
+      "base_url": "https://robokits.co.in",
+      "adapter": "RobokitsAdapter"
+    }
+  }
+}
