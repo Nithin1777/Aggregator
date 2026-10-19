@@ -43,6 +43,13 @@ from gray_zone import evaluate_gray_zone_risk, record_gray_zone_entry
 
 logger = logging.getLogger(__name__)
 
+# Clustering is O(n^2) in the worst case: every product is compared against each
+# cluster representative with regex-based matching. 50-150 items take milliseconds;
+# 1,000 items is ~500k comparisons and minutes of a pegged CPU core. Callers hit
+# this by accident (e.g. passing limit=1000), so make the ceiling explicit.
+GROUPING_WARN_ITEMS = 200
+MAX_GROUPING_ITEMS = 400
+
 class AggregatorEngine:
     """Core aggregation and comparison engine for Indian electronic component vendors."""
 
@@ -203,7 +210,24 @@ class AggregatorEngine:
         - If not in llm_labels, falls back to can_merge (match_components_v2).
         - Assigns card/offer source as 'llm_label' or 'v2_fallback'.
         - Best price badge computed across same-spec offers only.
+
+        Raises ValueError when given more than MAX_GROUPING_ITEMS products: the
+        comparison is quadratic, so a large batch would block for minutes rather
+        than return a result. Paginate at the call site instead.
         """
+        if len(products) > MAX_GROUPING_ITEMS:
+            pairs = len(products) * (len(products) - 1) // 2
+            raise ValueError(
+                f"group_and_compare received {len(products)} products (~{pairs:,} pair comparisons), "
+                f"above the hard limit of {MAX_GROUPING_ITEMS}. Clustering is O(n^2) and this batch "
+                f"would block for minutes. Pass a smaller page (the UI uses <=200, MCP uses <=50)."
+            )
+        if len(products) > GROUPING_WARN_ITEMS:
+            logger.warning(
+                "group_and_compare clustering %d products (~%d pair comparisons); expect slow results.",
+                len(products), len(products) * (len(products) - 1) // 2
+            )
+
         # 1. Enrich products with ComponentItem
         tagged_items: List[Tuple[UnifiedProduct, ComponentItem]] = []
         for p in products:

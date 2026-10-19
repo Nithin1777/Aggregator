@@ -236,6 +236,46 @@ def test_ingest_marks_error_status_on_fetch_failure(fresh_db, fast_retries):
     assert checkpoint.status != "completed"
 
 
+def test_group_and_compare_refuses_pathological_input():
+    """
+    Clustering is O(n^2): a 1000-item batch (~500k regex comparisons) once pinned a
+    CPU core for ~40 minutes. Oversized batches must fail immediately and loudly.
+    """
+    from models import UnifiedProduct
+    from search_service import AggregatorEngine, MAX_GROUPING_ITEMS
+
+    engine = AggregatorEngine()
+    products = [
+        UnifiedProduct(
+            id=i, vendor="robu", vendor_name="Robu.in", external_id=f"e{i}",
+            title=f"Component {i}", normalized_title=f"component {i}", mpn=f"MPN-{i}",
+            price=1.0, available=True, product_url=f"https://robu.in/product/e{i}/",
+        )
+        for i in range(MAX_GROUPING_ITEMS + 1)
+    ]
+    with pytest.raises(ValueError, match="O\\(n\\^2\\)|hard limit"):
+        engine.group_and_compare(products)
+
+
+def test_group_and_compare_still_handles_realistic_pages():
+    """The guard must not reject the sizes real callers use (UI <=200, MCP <=50)."""
+    from models import UnifiedProduct
+    from search_service import AggregatorEngine
+
+    engine = AggregatorEngine()
+    products = [
+        UnifiedProduct(
+            id=i, vendor="robu", vendor_name="Robu.in", external_id=f"r{i}",
+            title=f"ESP32 Board variant {i}", normalized_title=f"esp32 board variant {i}",
+            mpn="ESP32", price=100.0 + i, available=True,
+            product_url=f"https://robu.in/product/r{i}/",
+        )
+        for i in range(150)
+    ]
+    groups = engine.group_and_compare(products)
+    assert len(groups) >= 1
+
+
 def test_clustering_queues_audit_lines_and_flushes_once(fresh_db, monkeypatch):
     """Audit logging must not open the file once per pair."""
     from models import UnifiedProduct
