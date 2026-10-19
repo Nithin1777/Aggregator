@@ -1,0 +1,62 @@
+version: 1
+advertise_min_fill: 0.4
+categories:
+  - id: motor
+    display: Motors
+    detect_keywords:
+      - motor
+      - motors
+      - bldc
+      - stepper
+    attributes:
+      - key: voltage
+        display_name: Operating Voltage
+        type: enum
+        unit: V
+        values: ["3.3", "3.7", "5", "6", "7.4", "9", "12", "14.8", "24", "36", "48"]
+        extract:
+          - voltage_regex
+      - key: rpm
+        display_name: Speed (RPM)
+        type: integer
+        unit: RPM
+        range: [1, 50000]
+        extract:
+          - rpm_regex
+      - key: current_a
+        display_name: Rated Current
+        type: float
+        unit: A
+        extract:
+          - current_a_regex
+
+  - id: battery
+    display: Batteries
+    detect_keywords:
+      - battery
+      - batteries
+      - lipo
+      - li-ion
+      - lifepo4
+      - '18650'
+    attributes:
+      - key: cells
+        display_name: Cell Count
+        type: enum
+        values: ["1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "10s", "12s", "14s", "16s"]
+        extract:
+          - cells_regex
+      - key: capacity_mah
+        display_name: Capacity
+        type: integer
+        unit: mAh
+        range: [10, 100000]
+        extract:
+          - capacity_mah_regex
+          - capacity_ah_regex
+      - key: chemistry
+        display_name: Chemistry
+        type: enum
+        values: ["lipo", "liion", "lifepo4", "nimh", "leadacid"]
+        extract:
+          - chemistry_regex

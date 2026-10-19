@@ -1,0 +1,27 @@
+# Network & TLS/WAF Fingerprint Impersonation
+curl-cffi>=0.16.0
+aiolimiter>=1.1.0
+
+# HTML / XML / JSON-LD Parsing
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Data Models & Schema Validation
+pydantic>=2.0.0
+
+# Search API & Web Presentation Layer
+fastapi>=0.110.0
+uvicorn>=0.28.0
+jinja2>=3.1.0
+
+# CLI & Terminal Dashboard
+typer>=0.12.0
+rich>=13.7.0
+
+# Testing & Verification
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+
+# Taxonomy & MCP Server
+pyyaml>=6.0.0
+mcp>=1.3.0,<2

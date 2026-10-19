@@ -1,0 +1,184 @@
+# Extractor kinds and normalize fields are a CLOSED registry implemented in code.
+# Adding a new kind or normalize field is a code change; adding an extractor that reuses them is YAML-only.
+#
+# NOTE: channels_regex is reserved for thesis test; unused in pilot.
+
+extractors:
+  voltage_regex:
+    kind: regex
+    pattern: '(?<![a-zA-Z0-9])(\d+(?:\.\d+)?)\s*v\b(?![a-zA-Z])'
+    flags:
+      - IGNORECASE
+    normalize:
+      type: string
+      transform: none
+    tests:
+      - in: '12V 200RPM Geared DC Motor'
+        out: '12'
+      - in: 'Mini 3.3V Micro Motor'
+        out: '3.3'
+      - in: 'Heavy Duty 24V DC Motor'
+        out: '24'
+      - in: 'A2212 1200KV BLDC Motor'
+        out: null
+      - in: 'NEMA 17 Stepper Motor 42mm'
+        out: null
+
+  rpm_regex:
+    kind: regex
+    pattern: '(?<![a-zA-Z0-9])(\d{1,5})\s*rpm\b'
+    flags:
+      - IGNORECASE
+    normalize:
+      type: integer
+    tests:
+      - in: '12V 200RPM Geared DC Motor'
+        out: 200
+      - in: 'Johnson Motor 1000 RPM'
+        out: 1000
+      - in: 'High Speed Motor 15000 rpm'
+        out: 15000
+      - in: 'Arduino Uno R3 Board'
+        out: null
+      - in: '12V 10A Power Supply'
+        out: null
+
+  current_a_regex:
+    kind: regex
+    pattern: '(?<![a-zA-Z0-9])(\d+(?:\.\d+)?)\s*(?:a|amp|amps)\b(?![a-zA-Z])'
+    flags:
+      - IGNORECASE
+    normalize:
+      type: float
+    tests:
+      - in: '12V 2.5A DC Motor'
+        out: 2.5
+      - in: '30A Brushless ESC Motor Speed Controller'
+        out: 30.0
+      - in: 'High Torque Motor 5 Amps 12V'
+        out: 5.0
+      - in: 'N20 Geared Motor 300 RPM'
+        out: null
+      - in: 'LiPo Battery 4S 5200mAh'
+        out: null
+
+  cells_regex:
+    kind: regex
+    pattern: '(?<![a-zA-Z0-9])(\d{1,2}s)(?:[0-9]*p)?\b'
+    flags:
+      - IGNORECASE
+    normalize:
+      type: enum
+      transform: lower
+    tests:
+      - in: 'Bonka 14.8V 5200mAh 4S LiPo Battery'
+        out: '4s'
+      - in: 'Orange 3S 2200mAh 30C Battery 3S1P'
+        out: '3s'
+      - in: '6S 22.2V Li-ion Battery Pack'
+        out: '6s'
+      - in: '12V 200RPM Motor'
+        out: null
+      - in: 'ESP32 WiFi Bluetooth Board'
+        out: null
+
+  capacity_mah_regex:
+    kind: regex
+    pattern: '(?<![a-zA-Z0-9])(\d{3,6})\s*mah\b'
+    flags:
+      - IGNORECASE
+    normalize:
+      type: integer
+    tests:
+      - in: 'Bonka 14.8V 5200mAh 4S Battery'
+        out: 5200
+      - in: '18650 2500 mAh Li-ion Cell'
+        out: 2500
+      - in: 'Orange 3S 850mAh LiPo'
+        out: 850
+      - in: '12V 200RPM Motor'
+        out: null
+      - in: 'Battery 5.2Ah Pack'
+        out: null
+
+  capacity_ah_regex:
+    kind: regex
+    pattern: '(?<![a-zA-Z0-9])(\d+(?:\.\d+)?)\s*ah\b'
+    flags:
+      - IGNORECASE
+    normalize:
+      type: integer
+      multiplier: 1000
+    tests:
+      - in: 'Lead Acid 12V 7Ah Battery'
+        out: 7000
+      - in: 'LiFePO4 12V 5.2 Ah Pack'
+        out: 5200
+      - in: 'E-Bike Battery 48V 20Ah'
+        out: 20000
+      - in: '12V 200RPM Motor'
+        out: null
+      - in: 'Bonka 5200mAh Battery'
+        out: null
+
+  chemistry_regex:
+    kind: regex
+    pattern: '\b(li[- ]?po|lithium[- ]polymer|li[- ]?ion|lithium[- ]ion|18650|life(?:po4)?|lithium[- ]iron|ni[- ]?mh|nickel[- ]metal|lead[- ]acid|sla|sealed[- ]lead)\b'
+    flags:
+      - IGNORECASE
+    normalize:
+      type: enum
+      transform: lower
+      synonyms:
+        li-po: lipo
+        lipo: lipo
+        lithium-polymer: lipo
+        lithium polymer: lipo
+        li-ion: liion
+        liion: liion
+        lithium-ion: liion
+        lithium ion: liion
+        '18650': liion
+        lifepo4: lifepo4
+        lifepo: lifepo4
+        life: lifepo4
+        lithium-iron: lifepo4
+        lithium iron: lifepo4
+        ni-mh: nimh
+        nimh: nimh
+        nickel-metal: nimh
+        nickel metal: nimh
+        lead-acid: leadacid
+        lead acid: leadacid
+        sla: leadacid
+        sealed-lead: leadacid
+    tests:
+      - in: 'Bonka 14.8V 5200mAh 4S LiPo Battery'
+        out: 'lipo'
+      - in: 'Samsung 18650 2500mAh 3.7V Cell'
+        out: 'liion'
+      - in: '12V 100Ah LiFePO4 Solar Battery'
+        out: 'lifepo4'
+      - in: '12V 200RPM DC Motor'
+        out: null
+      - in: 'Arduino Mega 2560 Board'
+        out: null
+
+  channels_regex:
+    kind: regex
+    pattern: '\b(\d{1,2})[-\s]*(?:channel|ch|way)\b'
+    flags:
+      - IGNORECASE
+    normalize:
+      type: integer
+    tests:
+      - in: '5V 4 Channel Relay Module with Optocoupler'
+        out: 4
+      - in: '16-Channel 12-bit PWM Servo Driver'
+        out: 16
+      - in: '2 Channel Relay Board 12V'
+        out: 2
+      - in: '12V 200RPM Motor'
+        out: null
+      - in: 'Bonka 4S LiPo Battery'
+        out: null
