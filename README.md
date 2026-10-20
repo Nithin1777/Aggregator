@@ -440,6 +440,20 @@ reports `products_with_descriptions`, `products_with_vendor_attributes` and
 `vendor_attribute_rows`; `get_product` returns `vendor_specs` plus a real `description`
 instead of falling back to the title.
 
+**Robu without a rescrape.** Robu product pages are Cloudflare-protected, but its 85k titles are
+already in SQLite. `scripts/backfill_title_attributes.py` extracts single-value specs from those
+titles (`10K 1/4W`, `100uF 25V`, `3.7V 1300mAh`) into the same `product_attributes` layer, marked
+`source=title_heuristic` and `confidence=0.6`. Kits/ranges are skipped, so the values are honest
+but less rich than a vendor table.
+
+```powershell
+python scripts/backfill_title_attributes.py --vendors robu
+python scripts/backfill_title_attributes.py --vendors robokits
+```
+
+Current catalog totals: **18,474 descriptions**, **261,085 vendor attribute rows**, and
+**76,002 products with attributes** (Robu contributes 59k of those from titles alone).
+
 ### Keeping the taxonomy current
 
 Filterable attributes are defined in `config/taxonomy.yaml` and `config/extractors.yaml`. After

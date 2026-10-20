@@ -548,21 +548,31 @@ def replace_product_attributes(
     attributes: List[Dict[str, Any]],
     source: str = "description",
     conn: Optional[sqlite3.Connection] = None,
+    source_prefix: Optional[str] = None,
 ) -> int:
     """
     Replaces the free-form attributes for one product. Idempotent.
 
     `attributes` items use the `src.spec.description` shape:
     key, label, value, value_num, unit, confidence.
+
+    `source_prefix` scopes the delete (e.g. "title" for title-derived rows), so
+    a title refresh never destroys description-table attributes.
     """
     own = conn is None
     conn = conn or get_db_connection()
     try:
         with conn:
-            conn.execute(
-                "DELETE FROM product_attributes WHERE product_id = ?;",
-                (int(product_id),),
-            )
+            if source_prefix:
+                conn.execute(
+                    "DELETE FROM product_attributes WHERE product_id = ? AND source LIKE ?;",
+                    (int(product_id), f"{source_prefix}%"),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM product_attributes WHERE product_id = ?;",
+                    (int(product_id),),
+                )
             rows = [
                 (
                     int(product_id),
