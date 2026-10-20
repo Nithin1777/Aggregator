@@ -137,7 +137,23 @@ python main.py ingest quartzcomponents --fresh
 
 ## 4. Web UI & REST API
 
-Launch the web application:
+### One command: `aggregate`
+
+The launcher is installed at `C:\Users\nithi\.local\bin\aggregate.cmd`, which is already on `PATH`:
+
+```powershell
+aggregate                 # web on :8000 + MCP SSE on :8001, opens the browser
+aggregate --web           # web only
+aggregate --mcp           # MCP SSE only (http://127.0.0.1:8001/sse)
+aggregate --mcp --stdio   # MCP stdio (for MCP client configs)
+aggregate --help --mcp    # full MCP connection guide (also --mcp-help)
+aggregate --list-tools    # print the exposed MCP tools and exit
+aggregate --port 8010 --mcp-port 8011 --no-open   # custom ports, no browser
+```
+
+`aggregate` detects ports that are already in use instead of starting a duplicate, and `Ctrl+C` stops the processes it started. `--mcp --stdio` keeps stdin/stdout clean for MCP clients. On a fresh checkout, recreate the launcher with `python scripts/install_aggregate.py`.
+
+Launch the web application directly (alternative):
 ```powershell
 python main.py serve --port 8000
 ```
@@ -146,14 +162,18 @@ Open your browser at **http://localhost:8000**:
 - One shared category taxonomy across every vendor (32 categories, live counts).
 - Category, vendor and in-stock filters that combine with the text query.
 - Side-by-side comparison tables with live stock badges and a lowest-price badge.
+- Relevance-ranked results paginated at the comparison-card level (20 cards per page, Prev/Next pager). Irrelevant long-tail matches stay on later pages instead of bloating page 1.
+- Prices are shown tax-inclusive; Robokits and QuartzComponents quote ex-GST prices, so 18% GST is added before comparison. Only the final inclusive price is displayed (no per-vendor tax breakdown).
 - Browse mode: `/?category=resistors` lists a category without typing a query.
 - Dedicated pages for `/categories` and `/vendors`.
 
 ### JSON API Endpoints:
 - `GET /api/search?q={query}&source=live` — Multi-vendor search JSON with comparison groups.
-- `GET /api/search?q={query}&source=local` — Local indexed search JSON; refreshes price/stock before responding. Add `&refresh=auto|force|off` (default `auto`).
-- `GET /api/search?q=&category={slug}` — Browse mode: list a category without a text query.
+- `GET /api/search?q={query}&source=local&page=1&page_size=20` — Paginated local search JSON. `page` is 1-based; `page_size` defaults to 20 (max 50). The response carries `page`, `page_size`, `total_results`, `total_groups`, `total_pages`, `has_next` and `has_prev`. `limit` is still accepted as a legacy alias for `page_size`.
+- `GET /api/search?q={query}&source=local` — Local indexed search JSON; verifies price/stock without blocking the first paint. Add `&refresh=auto|force|off` (default `auto`).
+- `GET /api/search?q=&category={slug}&page=2` — Browse mode: paginate a category without a text query.
 - `GET /api/search?q={query}&category={slug}&vendor={slug}&in_stock=1` — Combine the query with filters.
+- `GET /api/search?q={query}&price_min=100&price_max=500` — Price bounds in INR. A budget written in the query itself (`resistor under ₹500`, `motor 300 to 1200`, `esp32 over 300`) is parsed out of the text and applied the same way.
 - `GET /api/search?q={query}&spec_filters={"rpm":{"lte":1000}}` — Spec-attribute filters (voltage, rpm, capacity_mah, chemistry, ...). Same semantics as the MCP `filters=` argument.
 - `GET /api/suggest?q={prefix}&limit=8` — Type-ahead suggestions (part numbers, products, categories).
 - `GET /api/categories?vendor={slug}` — The taxonomy with live part counts and the filterable attributes of each category.
@@ -162,17 +182,42 @@ Open your browser at **http://localhost:8000**:
 - `GET /health` — Lightweight liveness probe.
 - `POST /api/ingest?vendor={vendor}&max_pages={n}&resume=true` — Trigger background catalog ingestion.
 
+### Ranking and pagination
+The same ranking pipeline runs for **web search and the MCP `search_components` text path** (`src/search/retrieval.py::rank_products`), so an agent and a browser get the same ordering.
+
+1. **Retrieval order** — SQLite FTS5 BM25 (`ORDER BY rank`), after strict/typo-corrected/relaxed query resolution.
+2. **Listing score** — RRF base (`10 * (1 + 50/(60+position+1))`) plus:
+   - canonical boost (+25 brand/category, +35 exact MPN, +2 other),
+   - gentle length penalty (`1 / (1 + 0.035 * max(0, tokens-5))`),
+   - keyword repetition penalty (−4 per repeat),
+   - **product-role/attachment affinity** (`src/search/product_prior.py`): a title that *is* the part beats a title that merely mentions it. It detects accessories/consumables/enclosures (`bracket`, `brush`, `cooler`, `case`, …), kits/bundles, query text appearing only after `for …` / `with …`, and core component nouns. Prefix matching lets `stm32` match `STM32F103C8T6`.
+   - **taxonomy category hint** — a bare category/domain query (`display`, `led`, `battery`, `raspberry pi 5`, `nema17 stepper`) boosts products in that canonical category; accessory queries such as `battery holder` and ambiguous terms are left alone.
+3. **Group score** — cards inherit the position of their best listing, then receive:
+   - exact-token (+8), contiguous-phrase (+4), role-affinity (−4 × affinity), category (+6);
+   - **multi-vendor depth**: −4 per vendor offer (max −12) for broad queries, −3 per offer (max −9) for exact MPN lookups;
+   - **stock**: in-stock cards get −4 (−2 for exact MPN), cards with zero purchasable offers get +2 (+1 for exact MPN);
+   - **bundle/kit penalty**: a kit/combo card is pushed down for a bare component query, unless the query itself asks for a kit/set/combo.
+4. **Pagination** — ranking is global; pages are contiguous slices. A fixed 200-listing cluster window keeps pages 1–9 stable (later pages expand to 400). `page=1` holds the strongest matches; accessories, kits and “for X” long-tail items move to pages 2, 3, … instead of pushing the real part down.
+
+Plural/singular title variants are normalized before matching (`Kit` vs `Kits`), so they merge into one comparison card instead of producing duplicates.
+
 ---
 
 ## 5. Search-Time Price/Stock Refresh (Live Values, Offline Fallback)
 
-Every **local** search — Web UI, `GET /api/search?source=local`, `python main.py search --local`, and the MCP tools `search_components`, `get_product`, `search_by_mpn` — re-verifies **price and stock** against the live vendors before the response is displayed.
+Every **local** search — Web UI, `GET /api/search?source=local`, `python main.py search --local`, and the MCP tools `search_components`, `get_product`, `search_by_mpn` — re-verifies **price and stock** against the live vendors.
+
+### Web search never blocks on the price lookup
+The browser first renders the cached page in well under a second, then a background refresh runs for the listings on that page and writes the verified values to SQLite. The page does **not** re-render itself when that finishes (the old auto re-read caused a loading spinner and a scroll jump a few seconds after every search); the refreshed values are used by the next search/page/filter action. `refresh=force` performs verification synchronously if the caller wants it in the same response.
+
+The CLI and MCP tools stay synchronous on purpose (agents need the verified value in the same response); their refreshes are bounded by the same budget.
 
 ### What gets refreshed
 - Only `price` and `available` (stock) for listings already matched in the local catalog.
 - Titles, specs, descriptions, images, URLs, MPNs, SKUs and all other fields are never modified.
 - Refreshed values are persisted to SQLite (`products.price_stock_updated_at`, `price_stock_attempted_at`, `price_stock_source`), so the cache always holds the most recent known value.
 - Refresh never inserts or removes products. Live results without a cached match are ignored.
+- An implausibly large price collapse (>70% below the cached value on a listing over ₹100) is rejected and logged instead of overwriting good data with a parser fragment.
 
 ### Offline and failure behavior
 - If the internet or a vendor is unavailable, times out, or rate-limits, the search still succeeds with the **last cached price/stock**.
@@ -216,6 +261,7 @@ python main.py search "IG52 motor" --local --cache-only # no vendor calls
 |---|---|
 | `live` | Price/stock refreshed from live vendors. |
 | `partial` | Refreshed, but one or more vendors failed; remaining listings use cache. |
+| `refreshing` | Web only: cached values were returned immediately and verification is running in the background; the page does not auto re-render. |
 | `fresh_cache` | Cached values were within the TTL; no vendor call was needed. |
 | `cached` | Refresh was attempted but unavailable, or no live listing matched; cached values served. |
 | `offline_cooldown` | Vendors were unreachable recently; cache served without retrying. |
@@ -231,7 +277,18 @@ python main.py search "IG52 motor" --local --cache-only # no vendor calls
 | `PRICE_STOCK_TTL` | `180` | Seconds before cached price/stock is considered stale. |
 | `PRICE_STOCK_TIMEOUT` | `8` | Wall-clock budget in seconds for one refresh pass. |
 
-Additional tunables live in `config.py`: `price_stock_offline_cooldown_seconds` (60), `price_stock_max_refresh_queries` (2), and `price_stock_live_limit_per_vendor` (15).
+Additional tunables live in `config.py`: `price_stock_offline_cooldown_seconds` (60), `price_stock_max_refresh_queries` (2), `price_stock_live_limit_per_vendor` (15), `price_stock_sync_max_products` (30; broader result sets use the background/cached path), `robokits_gst_rate` (0.18), and `quartz_gst_rate` (0.18).
+
+### Vendor tax handling
+Robokits and QuartzComponents list prices **excluding GST**. The adapters multiply the scraped amount by the vendor's GST rate before storing it, so every vendor's `price` is tax-inclusive and comparisons are like-for-like. The original ex-GST amount is kept in `extra.price_ex_gst` for data/debugging use, but the storefront only displays the final inclusive price.
+
+Historical rows can be repaired without a full re-scrape:
+```powershell
+python scripts/apply_vendor_gst.py --vendor quartzcomponents --rate 0.18
+```
+The script is idempotent (rows already carrying `extra.gst_rate` are skipped) and clears the refresh marker so the next search re-verifies the converted price.
+
+Existing catalogs that were ingested before this change can be healed in two ways: any page viewed through search re-verifies and rewrites its visible Robokits prices, and the whole vendor can be re-ingested with `python main.py ingest robokits --fresh`.
 
 Check cache coverage and the last successful refresh with:
 ```powershell

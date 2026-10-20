@@ -25,6 +25,7 @@ class RobokitsAdapter(BaseAdapter):
         self._vendor_id = "robokits"
         self._vendor_name = "Robokits India"
         self._base_url = settings.robokits_base_url.rstrip("/")
+        self._gst_rate = max(0.0, float(getattr(settings, "robokits_gst_rate", 0.18) or 0.0))
         self._session: Optional[AsyncSession] = None
         self._lock = asyncio.Lock()
 
@@ -98,18 +99,49 @@ class RobokitsAdapter(BaseAdapter):
 
     @staticmethod
     def _extract_price_from_text(txt: str) -> Optional[float]:
+        """
+        Extracts a rupee amount from text.
+
+        Prefers explicitly currency-marked numbers and never treats a percentage
+        (the "-37%" sale badge) as a price. The old generic "first number" scan
+        turned `₹345.00 ₹216.00 -37%` into 37 on card variants whose price labels
+        were missing, which is exactly how a ₹216 part was cached as ₹37.
+        """
         if not txt:
             return None
-        clean = re.sub(r"[^\d,\.]", " ", txt).strip()
-        matches = re.findall(r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", clean)
-        for m in matches:
+
+        # 1. Currency-prefixed amounts, e.g. "₹ 1,299.00", "Rs. 850".
+        currency = re.findall(
+            r"(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)",
+            txt,
+            flags=re.IGNORECASE,
+        )
+        # 2. Bare amounts, but reject percentages ("-37%") and decimals that are
+        #    part of model numbers/ratings.
+        bare = re.findall(r"(?<![\w.])((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(?!\s*%)(?![\w.])", txt)
+
+        for match in currency + bare:
             try:
-                val = float(m.replace(",", ""))
-                if val > 0:
-                    return val
+                val = float(match.replace(",", ""))
             except ValueError:
-                pass
+                continue
+            if val > 0:
+                return val
         return None
+
+    def _with_gst(self, base_price: float) -> float:
+        """Converts Robokits' ex-GST price to the tax-inclusive price shown by other vendors."""
+        if base_price <= 0:
+            return 0.0
+        return round(base_price * (1.0 + self._gst_rate), 2)
+
+    def _price_note(self, base_price: float) -> Optional[str]:
+        if base_price <= 0 or self._gst_rate <= 0:
+            return None
+        return (
+            f"₹{base_price:,.2f} + {self._gst_rate * 100:.0f}% GST "
+            f"(tax-inclusive price shown)"
+        )
 
     def _extract_card_price(self, card) -> float:
         """
@@ -222,7 +254,10 @@ class RobokitsAdapter(BaseAdapter):
                 mpn = extract_mpn(title) or (sku if sku else None)
 
                 # 4. Price Parsing (SALE price if discounted, else regular price; never discount %)
-                price = self._extract_card_price(card)
+                # Robokits publishes ex-GST prices; store the tax-inclusive value so
+                # the comparison against other storefronts is like-for-like.
+                price_ex_gst = self._extract_card_price(card)
+                price = self._with_gst(price_ex_gst)
 
                 # 5. Stock Status
                 is_out_of_stock = bool(re.search(r"out of stock|ships within|sold out", card_text, re.IGNORECASE))
@@ -252,9 +287,13 @@ class RobokitsAdapter(BaseAdapter):
                     product_url=product_url,
                     image_url=image_url,
                     category=None,
+                    price_note=self._price_note(price_ex_gst),
                     extra={
                         "model": sku,
-                        "products_id": external_id
+                        "products_id": external_id,
+                        "price_ex_gst": price_ex_gst,
+                        "gst_rate": self._gst_rate,
+                        "price_note": self._price_note(price_ex_gst),
                     }
                 )
                 products.append(prod)

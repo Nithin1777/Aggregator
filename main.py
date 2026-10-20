@@ -6,7 +6,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # Ensure UTF-8 output on Windows terminals and pipes
 if sys.platform == "win32":
@@ -30,6 +30,7 @@ from config import settings
 import db
 from models import ClickFeedback, SearchResponse
 from search_service import AggregatorEngine
+from src.search.query_terms import parse_price_constraints
 from src.web.render import icon_svg
 
 # Logging configuration
@@ -67,8 +68,23 @@ web_app = FastAPI(
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def _static_asset_version() -> str:
+    """Cache-busting token for JS/CSS so a fix is never hidden by a stale tab."""
+    try:
+        files = [
+            STATIC_DIR / "js" / "aggregate.js",
+            STATIC_DIR / "css" / "aggregate.css",
+        ]
+        return str(max(int(path.stat().st_mtime) for path in files if path.exists()))
+    except Exception:  # noqa: BLE001 - never break page rendering for a cache key
+        return "1"
+
+
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.globals["icon"] = icon_svg
+templates.env.globals["asset_version"] = _static_asset_version()
 
 web_app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -133,6 +149,35 @@ def _normalize_limit(value, default: int = 70) -> int:
     return max(1, min(200, value))
 
 
+def _normalize_page(value) -> int:
+    """Normalizes the 1-based page number (direct calls skip validation)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 1
+    return max(1, value)
+
+
+def _normalize_page_size(value, fallback_limit=None) -> int:
+    """Normalizes the cards-per-page size (direct calls skip validation)."""
+    default = settings.search_page_size
+    raw = value if isinstance(value, int) and not isinstance(value, bool) else None
+    if raw is None and isinstance(fallback_limit, int) and not isinstance(fallback_limit, bool):
+        raw = fallback_limit
+    if raw is None:
+        raw = default
+    return max(1, min(int(settings.search_page_size_max), int(raw)))
+
+
+def _normalize_price(value) -> Optional[float]:
+    """Normalizes an optional price bound (direct calls skip validation)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def _normalize_spec_filters(value) -> Dict[str, Any]:
     """Parses the `spec_filters` query parameter (a JSON object)."""
     if isinstance(value, dict):
@@ -174,6 +219,7 @@ def _page_context(
     category: str = "",
     vendor: str = "",
     in_stock: bool = False,
+    page: int = 1,
 ) -> dict:
     """Shared template context for the public pages."""
     categories = db.get_categories()
@@ -184,6 +230,7 @@ def _page_context(
         "category": category,
         "vendor": vendor,
         "in_stock": in_stock,
+        "page": page,
         "has_results": bool(query or category or vendor),
         "categories": categories,
         "vendors": vendors,
@@ -204,6 +251,7 @@ async def web_ui(
     category: Optional[str] = Query(None, description="Canonical category slug"),
     vendor: Optional[str] = Query(None, description="Vendor slug"),
     in_stock: bool = Query(False, description="Only show listings that are in stock"),
+    page: int = Query(1, ge=1, description="Results page"),
 ):
     """Search page: type-ahead suggestions, category filters and comparison cards."""
     context = _page_context(
@@ -211,6 +259,7 @@ async def web_ui(
         category=_normalize_optional(category) or "",
         vendor=_normalize_optional(vendor) or "",
         in_stock=_normalize_flag(in_stock),
+        page=_normalize_page(page),
     )
     return templates.TemplateResponse(
         request=request,
@@ -283,15 +332,24 @@ async def api_popular(limit: int = Query(8, ge=1, le=25)):
 async def api_search(
     q: str = Query("", description="Component name or part number"),
     source: str = Query("local", pattern="^(live|local)$", description="Search source"),
-    limit: int = Query(70, ge=1, le=200, description="Max results limit"),
+    limit: Optional[int] = Query(
+        None, ge=1, le=200,
+        description="Legacy alias for page_size (kept for older clients)",
+    ),
+    page: int = Query(1, ge=1, description="1-based page of comparison cards"),
+    page_size: Optional[int] = Query(
+        None, ge=1, le=50, description="Comparison cards per page (default 20)"
+    ),
     refresh: str = Query(
         "auto",
         pattern="^(auto|force|off)$",
-        description="Live price/stock refresh: 'auto' (TTL), 'force', or 'off' (cache only)"
+        description="Live price/stock refresh: 'auto' (TTL/background), 'force', or 'off' (cache only)"
     ),
     category: Optional[str] = Query(None, description="Canonical category slug"),
     vendor: Optional[str] = Query(None, description="Vendor slug"),
     in_stock: bool = Query(False, description="Only return listings that are in stock"),
+    price_min: Optional[float] = Query(None, ge=0, description="Minimum price in INR"),
+    price_max: Optional[float] = Query(None, ge=0, description="Maximum price in INR"),
     spec_filters: Optional[str] = Query(
         None,
         description='JSON object of spec filters, e.g. {"voltage": {"gte": 12}}',
@@ -300,15 +358,31 @@ async def api_search(
     """
     JSON API endpoint for real-time or local component search.
 
+    Results are paginated at the comparison-card level: `page`/`page_size` select
+    which ranked groups are returned, so irrelevant long-tail matches stay on
+    later pages instead of bloating the first response.
+
     Without a query string the endpoint falls back to browsing the filtered
     category, so `/?category=resistors` returns real listings.
     """
     engine = get_engine()
     query = (q or "").strip() if isinstance(q, str) else ""
+    original_query = query
+    # "resistor under ₹500" / "motor 300 to 1200" carry a budget in the text.
+    query, text_price_min, text_price_max = parse_price_constraints(query)
     category = _normalize_optional(category)
     vendor = _normalize_optional(vendor)
     in_stock = _normalize_flag(in_stock)
-    limit = _normalize_limit(limit)
+    page = _normalize_page(page)
+    page_size = _normalize_page_size(page_size, fallback_limit=limit)
+    price_min = _normalize_price(price_min)
+    price_max = _normalize_price(price_max)
+    if price_min is None:
+        price_min = text_price_min
+    if price_max is None:
+        price_max = text_price_max
+    if price_min is not None and price_max is not None and price_min > price_max:
+        price_min, price_max = price_max, price_min
     spec_filters = _normalize_spec_filters(spec_filters)
 
     if spec_filters:
@@ -332,23 +406,20 @@ async def api_search(
         if normalized is not None:
             spec_filters = normalized
 
-    if not query and (category or vendor):
+    if not query and (
+        category or vendor or spec_filters
+        or price_min is not None or price_max is not None
+    ):
         # Browse mode: list the filtered catalog instead of searching.
-        products = await asyncio.to_thread(
-            db.list_products_by_category,
+        resp = await engine.browse_local(
+            page=page,
+            page_size=page_size,
             category=category or None,
             vendor=vendor or None,
             in_stock_only=bool(in_stock),
-            limit=limit,
             spec_filters=spec_filters or None,
-        )
-        groups = await asyncio.to_thread(engine.group_and_compare, products, query=None)
-        resp = SearchResponse(
-            query=query,
-            total_results=len(products),
-            source="local_db",
-            results=products,
-            comparison_groups=groups,
+            price_min=price_min,
+            price_max=price_max,
         )
     else:
         if not query:
@@ -356,18 +427,24 @@ async def api_search(
         if source == "local":
             resp = await engine.search_local_refreshed(
                 query,
-                limit,
+                page=page,
+                page_size=page_size,
                 vendor=vendor or None,
                 in_stock_only=bool(in_stock),
                 refresh_mode=_normalize_refresh_mode(refresh),
                 category=category or None,
                 spec_filters=spec_filters or None,
+                price_min=price_min,
+                price_max=price_max,
+                background_refresh=True,
             )
         else:
-            resp = await engine.search_live(query=query, limit_per_vendor=min(limit // 2, 25))
+            resp = await engine.search_live(
+                query=query, limit_per_vendor=min(page_size, 25)
+            )
 
         try:
-            db.record_search_query(query)
+            db.record_search_query(original_query or query)
         except Exception:  # noqa: BLE001 - telemetry must never break a search
             pass
 

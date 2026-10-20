@@ -45,6 +45,7 @@ ICONS: Dict[str, str] = {
     "check": "<path d=\"M20 6 9 17l-5-5\" />",
     "x": "<path d=\"M18 6 6 18\" /> <path d=\"m6 6 12 12\" />",
     "chevron-right": "<path d=\"m9 18 6-6-6-6\" />",
+    "chevron-left": "<path d=\"m15 18-6-6 6-6\" />",
     "chevron-down": "<path d=\"m6 9 6 6 6-6\" />",
     "external-link": "<path d=\"M15 3h6v6\" /> <path d=\"M10 14 21 3\" /> <path d=\"M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6\" />",
     "sliders-horizontal": "<path d=\"M10 5H3\" /> <path d=\"M12 19H3\" /> <path d=\"M14 3v4\" /> <path d=\"M16 17v4\" /> <path d=\"M21 12h-9\" /> <path d=\"M21 19h-5\" /> <path d=\"M21 5h-7\" /> <path d=\"M8 10v4\" /> <path d=\"M8 12H3\" />",

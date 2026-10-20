@@ -60,6 +60,11 @@
     inStock: !!config.inStock,
     specFilters: {},
     requestId: 0,
+    page: Math.max(1, parseInt(config.page, 10) || 1),
+  };
+
+  const resetPage = () => {
+    state.page = 1;
   };
 
   /* ---------------------------------------------------------------------
@@ -271,6 +276,7 @@
     if (state.category) params.set("category", state.category);
     if (state.vendor) params.set("vendor", state.vendor);
     if (state.inStock) params.set("in_stock", "1");
+    if (state.page > 1) params.set("page", String(state.page));
     if (Object.keys(state.specFilters).length) {
       params.set("spec_filters", JSON.stringify(state.specFilters));
     }
@@ -296,6 +302,7 @@
       category: params.get("category") || "",
       vendor: params.get("vendor") || "",
       inStock: params.get("in_stock") === "1",
+      page: Math.max(1, parseInt(params.get("page") || "1", 10) || 1),
       specFilters: specFilters,
     };
   };
@@ -412,6 +419,7 @@
       state.query = "";
       state.category = item.value;
       state.vendor = "";
+      resetPage();
       closeSuggest(root);
       syncUrl(true);
       renderFilters();
@@ -421,6 +429,7 @@
     const input = $("[data-search-input]", root);
     if (input) input.value = item.value;
     state.query = item.value;
+    resetPage();
     closeSuggest(root);
     syncUrl(true);
     performSearch(item.value);
@@ -498,12 +507,14 @@
         closeSuggest(root);
         if (!value) {
           state.query = "";
+          resetPage();
           syncUrl(true);
           renderFilters();
           performSearch("");
           return;
         }
         state.query = value;
+        resetPage();
         syncUrl(true);
         performSearch(value);
       });
@@ -606,7 +617,7 @@
       '<div class="card__foot">' +
       '<div class="card__price"><strong>' +
       formatPrice(price) +
-      "</strong><span>incl. taxes at source</span></div>" +
+      "</strong></div>" +
       '<a href="' +
       escapeHtml(offer.product_url) +
       '" target="_blank" rel="noopener noreferrer" ' +
@@ -775,6 +786,7 @@
     const labels = {
       live: "Live prices verified",
       partial: "Live prices (partial)",
+      refreshing: "Cached prices",
       fresh_cache: "Cached prices (fresh)",
       cached: "Cached prices",
       offline_cooldown: "Offline - cached prices",
@@ -790,6 +802,30 @@
     text.textContent =
       (labels[refresh.status] || "Cached prices") +
       (refresh.refreshed_products ? " · " + refresh.refreshed_products : "");
+  };
+
+  const renderPager = (data) => {
+    const pager = $("[data-pager]");
+    const status = $("[data-page-status]");
+    const prev = $("[data-page-prev]");
+    const next = $("[data-page-next]");
+    if (!pager) return;
+
+    const groups = (data.comparison_groups || []).length;
+    if (!groups) {
+      pager.hidden = true;
+      return;
+    }
+
+    const page = Math.max(1, Number(data.page) || 1);
+    const pages = Number(data.total_pages) || 0;
+    if (status) {
+      status.textContent =
+        pages > 0 && page <= pages ? "Page " + page + " of " + pages : "Page " + page;
+    }
+    if (prev) prev.disabled = !data.has_prev;
+    if (next) next.disabled = !data.has_next;
+    pager.hidden = !(data.has_prev || data.has_next);
   };
 
   const renderResultsMeta = (data) => {
@@ -896,7 +932,8 @@
     const params = new URLSearchParams();
     if (state.query) params.set("q", state.query);
     params.set("source", "local");
-    params.set("limit", "70");
+    params.set("page", String(state.page));
+    params.set("page_size", "20");
     params.set("refresh", "auto");
     if (state.category) params.set("category", state.category);
     if (state.vendor) params.set("vendor", state.vendor);
@@ -934,6 +971,7 @@
 
       const rendered = renderResults(data);
       renderResultsMeta(data);
+      renderPager(data);
 
       if (!rendered) {
         const title = $("[data-empty-title]");
@@ -956,6 +994,8 @@
     } catch (err) {
       if (requestId !== state.requestId) return;
       console.error("Search failed", err);
+      const pager = $("[data-pager]");
+      if (pager) pager.hidden = true;
       showState("error");
     }
   };
@@ -971,6 +1011,7 @@
       state.category = state.category === slug && slug ? "" : slug;
       // Spec filters belong to a category: drop them when it changes.
       state.specFilters = {};
+      resetPage();
       renderFilters();
       syncUrl(true);
       performSearch();
@@ -982,6 +1023,7 @@
       event.preventDefault();
       const slug = vendorEl.getAttribute("data-vendor-slug") || "";
       state.vendor = state.vendor === slug ? "" : slug;
+      resetPage();
       renderFilters();
       syncUrl(true);
       performSearch();
@@ -996,6 +1038,7 @@
       state.query = term;
       state.category = "";
       state.vendor = "";
+      resetPage();
       renderFilters();
       syncUrl(true);
       performSearch(term);
@@ -1008,6 +1051,7 @@
       if (kind === "category") state.category = "";
       if (kind === "vendor") state.vendor = "";
       if (kind === "in_stock") state.inStock = false;
+      resetPage();
       renderFilters();
       syncUrl(true);
       performSearch();
@@ -1019,6 +1063,7 @@
       state.vendor = "";
       state.inStock = false;
       state.specFilters = {};
+      resetPage();
       renderFilters();
       syncUrl(true);
       performSearch();
@@ -1034,6 +1079,7 @@
   if (inStockBox) {
     inStockBox.addEventListener("change", () => {
       state.inStock = inStockBox.checked;
+      resetPage();
       renderFilters();
       syncUrl(true);
       performSearch();
@@ -1053,6 +1099,7 @@
   // Spec filter inputs: apply on change (and on Enter for the number fields).
   const applySpecFilters = () => {
     state.specFilters = collectSpecFilters();
+    resetPage();
     const reset = $("[data-clear-spec-filters]");
     if (reset) reset.hidden = Object.keys(state.specFilters).length === 0;
     syncUrl(true);
@@ -1078,9 +1125,25 @@
   document.addEventListener("click", (event) => {
     if (!event.target.closest("[data-clear-spec-filters]")) return;
     state.specFilters = {};
+    resetPage();
     renderSpecFilters();
     syncUrl(true);
     performSearch();
+  });
+
+  document.addEventListener("click", (event) => {
+    const prev = event.target.closest("[data-page-prev]");
+    const next = event.target.closest("[data-page-next]");
+    if (!prev && !next) return;
+    event.preventDefault();
+    const target = prev ? state.page - 1 : state.page + 1;
+    if (target < 1) return;
+    state.page = target;
+    syncUrl(true);
+    performSearch();
+    if (cardsContainer) {
+      cardsContainer.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
   });
 
   /* ---------------------------------------------------------------------
@@ -1162,6 +1225,7 @@
     state.category = params.category;
     state.vendor = params.vendor;
     state.inStock = params.inStock;
+    state.page = params.page;
     state.specFilters = params.specFilters;
     suggestRoots.forEach((root) => {
       const input = $("[data-search-input]", root);

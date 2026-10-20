@@ -13,7 +13,7 @@
   <meta name="description" content="{{ page_description|default('Compare prices and stock for electronic components across India''s leading distributors.') }}">
   <meta name="theme-color" content="#4338ca">
   <link rel="icon" href="{{ url_for('static', path='icons/favicon.svg') }}" type="image/svg+xml">
-  <link rel="stylesheet" href="{{ url_for('static', path='css/aggregate.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='css/aggregate.css') }}?v={{ asset_version }}">
   {% block head %}{% endblock %}
 </head>
 <body class="{% if has_results|default(false) %}has-results{% endif %}">
@@ -75,7 +75,7 @@
   </figure>
 </div>
 
-<script src="{{ url_for('static', path='js/aggregate.js') }}" defer></script>
+<script src="{{ url_for('static', path='js/aggregate.js') }}?v={{ asset_version }}" defer></script>
 {% block scripts %}{% endblock %}
 </body>
 </html>

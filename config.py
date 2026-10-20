@@ -28,6 +28,16 @@ class Settings(BaseModel):
     robokits_base_url: str = "https://robokits.co.in"
     rees52_base_url: str = "https://rees52.com"
 
+    # Robokits lists prices excluding GST. Displayed/comparison prices must be
+    # tax-inclusive like every other storefront (Robu, Quartz, ...) show them.
+    robokits_gst_rate: float = 0.18
+    # QuartzComponents also quotes prices excluding GST.
+    quartz_gst_rate: float = 0.18
+
+    # Web search pagination. The API returns this many comparison cards per page.
+    search_page_size: int = 20
+    search_page_size_max: int = 50
+
     # Rate Limiting & Delays (seconds)
     shopify_page_delay: float = 0.4
     robu_request_delay: float = 1.2
@@ -58,6 +68,12 @@ class Settings(BaseModel):
     price_stock_offline_cooldown_seconds: float = 60.0
     # Per-vendor result limit used for the refresh lookups.
     price_stock_live_limit_per_vendor: int = 15
+    # Above this many visible listings a synchronous refresh is skipped: a broad
+    # search can only match a fraction of its rows against 15 live results per
+    # vendor, so paying seconds of latency for it makes the whole page feel slow.
+    price_stock_sync_max_products: int = 30
+    # Background (non-blocking) refresh used by the web search page.
+    price_stock_background_refresh: bool = True
 
     def __init__(self, **kwargs):
         import os

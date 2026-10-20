@@ -41,17 +41,18 @@ from normalizer import (
     normalize_title,
 )
 from src.search.retrieval import search_catalog_ranked
+from src.search.product_prior import coverage, query_affinity, query_category_hint
+from src.search.query_intent import get_query_intent
 from gray_zone import evaluate_gray_zone_risk, record_gray_zone_entry
 
 
 
 logger = logging.getLogger(__name__)
 
-# Clustering is O(n^2) in the worst case: every product is compared against each
-# cluster representative with regex-based matching. 50-150 items take milliseconds;
-# 1,000 items is ~500k comparisons and minutes of a pegged CPU core. Callers hit
-# this by accident (e.g. passing limit=1000), so make the ceiling explicit.
-GROUPING_WARN_ITEMS = 200
+# Clustering is O(n^2) in the worst case, but the normalizer's pure functions are
+# memoized, so a 200-item page clusters in ~150 ms. The hard ceiling stays: 400
+# items is ~80k pair comparisons, and anything larger blocks for seconds.
+GROUPING_WARN_ITEMS = 400
 MAX_GROUPING_ITEMS = 400
 
 class AggregatorEngine:
@@ -64,7 +65,8 @@ class AggregatorEngine:
             "quartzcomponents": ShopifyAdapter(
                 vendor_id="quartzcomponents",
                 vendor_name="Quartz Components",
-                base_url=settings.quartz_base_url
+                base_url=settings.quartz_base_url,
+                gst_rate=settings.quartz_gst_rate,
             ),
             "makerbazar": ShopifyAdapter(
                 vendor_id="makerbazar",
@@ -89,6 +91,8 @@ class AggregatorEngine:
         # a circuit breaker so an offline catalog serves cache instantly.
         self._refresh_in_progress = False
         self._refresh_cooldown_until = 0.0
+        # Background (non-blocking) web refresh tasks, kept referenced until done.
+        self._refresh_tasks: set = set()
         # Tracks which event loop owns the adapters' HTTP sessions. A reused engine
         # (tests, embedded servers) must not send sessions across loop boundaries.
         self._active_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -248,8 +252,9 @@ class AggregatorEngine:
 
         # 2. Strict grouping by evaluate_pair_merge
         clusters: List[Dict[str, Any]] = []
+        cluster_orders: List[int] = []
 
-        for p, ci in tagged_items:
+        for order, (p, ci) in enumerate(tagged_items):
             placed = False
             for cluster in clusters:
                 rep_ci = cluster["ci"]
@@ -262,6 +267,9 @@ class AggregatorEngine:
                     break
             if not placed:
                 clusters.append({"ci": ci, "items": [(p, ci)], "reasons": [], "sources": []})
+                # Position of the best-ranked listing in this cluster. `products`
+                # arrives in retrieval order, so this is the group's relevance.
+                cluster_orders.append(order)
 
         # Flush queued audit lines once for the whole pass (single file open).
         self._flush_decisions()
@@ -307,7 +315,8 @@ class AggregatorEngine:
                     variant_key=variant_key,
                     source=card_source,
                     price_updated_at=p.price_updated_at,
-                    price_source=p.price_source or "cache"
+                    price_source=p.price_source or "cache",
+                    price_note=p.price_note,
                 )
                 if p.vendor not in offers_by_vendor:
                     offers_by_vendor[p.vendor] = offer
@@ -374,8 +383,65 @@ class AggregatorEngine:
                         if sib.variant_key != g.variant_key
                     ]
 
-        # Sort groups: multi-vendor matches first, then in-stock count, then title
-        result.sort(key=lambda g: (-g.total_offers, -g.in_stock_count, g.canonical_name))
+        # Sort groups. With a text query, relevance wins: a group inherits the rank
+        # position of its best-matching listing, gets a bonus when every query token
+        # appears in its canonical name, and a smaller bonus for multi-vendor depth
+        # (that is the whole point of a comparison engine). Without a query the page
+        # is a category browse, so richer/better-priced groups come first.
+        if query:
+            category_hint = query_category_hint(query)
+            exact_query = get_query_intent(query).intent == "exact_lookup"
+            # Broad catalogue queries benefit more from vendor depth than an
+            # exact MPN lookup, where the part itself must stay on top.
+            offer_weight = 3.0 if exact_query else 4.0
+            kit_query = bool(re.search(r"\b(kit|combo|set|pack|bundle|starter)\b", query, re.IGNORECASE))
+            # Stock is a ranking signal, not only a tie-breaker: a card with no
+            # purchasable offer should not sit above an in-stock alternative.
+            in_stock_adjust = -2.0 if exact_query else -4.0
+            out_of_stock_adjust = 1.0 if exact_query else 2.0
+            scored: List[Tuple[float, int, int, str, ComparisonGroup]] = []
+            for order, group in zip(cluster_orders, result):
+                exact_bonus = (
+                    8.0 if coverage(query, group.canonical_name) >= 1.0 else 0.0
+                )
+                # Cheap phrase match: "raspberry pi pico" as a contiguous run.
+                phrase_bonus = 4.0 if query.strip().lower() in group.canonical_name.lower() else 0.0
+                # Role/attachment prior: a card that *is* the part beats a card
+                # that merely mentions it ("bracket for IG52" vs "IG52 motor").
+                role = query_affinity(group.canonical_name, query)
+                category_bonus = (
+                    6.0
+                    if category_hint and group.category_canonical == category_hint
+                    else 0.0
+                )
+                stock_adjust = (
+                    in_stock_adjust if group.in_stock_count > 0 else out_of_stock_adjust
+                )
+                # A bundle is a valid result, but for a bare component query it
+                # should not sit above the individual part just because its title
+                # is short. Explicit kit/combo searches skip this penalty.
+                bundle_penalty = (
+                    14.0
+                    if not kit_query and classify_product_form(group.canonical_name) == "kit"
+                    else 0.0
+                )
+                relevance = (
+                    order
+                    - offer_weight * min(group.total_offers, 3)
+                    - exact_bonus
+                    - phrase_bonus
+                    - 4.0 * role
+                    - category_bonus
+                    + stock_adjust
+                    + bundle_penalty
+                )
+                scored.append(
+                    (relevance, -group.in_stock_count, -group.total_offers, group.canonical_name.lower(), group)
+                )
+            scored.sort(key=lambda item: item[:4])
+            result = [item[4] for item in scored]
+        else:
+            result.sort(key=lambda g: (-g.total_offers, -g.in_stock_count, g.canonical_name))
         return result
 
     # ------------------------------------------------------------------
@@ -667,14 +733,36 @@ class AggregatorEngine:
 
         fetched_at = db.utc_now_iso()
         updates: List[Dict[str, Any]] = []
+        rejected_ids: List[int] = []
         for p in candidates:
             live = matched.get(p.id)
             if live is None:
                 continue
-            p.price = float(live.price)
+            try:
+                new_price = float(live.price)
+            except (TypeError, ValueError):
+                rejected_ids.append(p.id)
+                continue
+            if new_price <= 0:
+                rejected_ids.append(p.id)
+                continue
+            # Guard against a parser/page-layout regression silently replacing a
+            # real price with a fragment (the "₹216 -> ₹37" discount-badge bug).
+            if p.price >= 100 and new_price < p.price * 0.30:
+                logger.warning(
+                    "[Price/Stock] Ignoring implausible drop for %s (%s): %.2f -> %.2f",
+                    p.id, p.title[:60], p.price, new_price,
+                )
+                rejected_ids.append(p.id)
+                continue
+            p.price = new_price
             p.available = bool(live.available)
             p.price_source = "live"
             p.price_updated_at = fetched_at
+            # Carry vendor price-basis metadata (e.g. Robokits' "ex-GST + 18%")
+            # so a refreshed response explains the number it is showing.
+            if getattr(live, "price_note", None):
+                p.price_note = live.price_note
             updates.append(
                 {
                     "id": p.id,
@@ -691,7 +779,7 @@ class AggregatorEngine:
                 len(updates) - applied,
             )
 
-        unmatched_ids = [p.id for p in candidates if p.id not in matched]
+        unmatched_ids = [p.id for p in candidates if p.id not in matched] + rejected_ids
         if unmatched_ids:
             # Record the attempt even when it failed, so an offline catalog is not
             # hammered on every page view until the TTL elapses.
@@ -735,6 +823,139 @@ class AggregatorEngine:
                 )
         return info
 
+    # ------------------------------------------------------------------
+    # Pagination helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pool_size(page: int, page_size: int) -> int:
+        """
+        Products to cluster for one page.
+
+        The pool must not grow with the page number for early pages, otherwise a
+        deeper page re-clusters a larger set and cards already shown on page 1
+        can move or duplicate. A fixed 200-listing window (up to MAX_GROUPING_ITEMS)
+        keeps pages 1-10 stable; only very deep pages expand it.
+        """
+        base = min(MAX_GROUPING_ITEMS, max(200, page_size * 6))
+        if page * page_size >= base:
+            base = min(MAX_GROUPING_ITEMS, page * page_size * 3)
+        return max(page_size, base)
+
+    @classmethod
+    def _slice_page(
+        cls,
+        groups: List[ComparisonGroup],
+        products: List[UnifiedProduct],
+        page: int,
+        page_size: int,
+        total_matches: int,
+    ) -> Tuple[List[ComparisonGroup], List[UnifiedProduct], int, int, bool, bool]:
+        start = (page - 1) * page_size
+        page_groups = groups[start:start + page_size]
+        wanted = {
+            (offer.vendor, str(offer.external_id))
+            for group in page_groups
+            for offer in group.offers
+        }
+        page_products = [
+            p for p in products if (p.vendor, str(p.external_id)) in wanted
+        ]
+        total_groups = len(groups)
+        # Only advertise a page count once every matching listing was clustered:
+        # before that the pool is a window and the count would keep growing.
+        exhausted = len(products) >= total_matches
+        total_pages = (
+            (total_groups + page_size - 1) // page_size
+            if exhausted and total_groups
+            else 0
+        )
+        more_in_pool = (start + page_size) < total_groups
+        more_in_catalog = not exhausted and len(products) < MAX_GROUPING_ITEMS
+        has_next = more_in_pool or more_in_catalog
+        return page_groups, page_products, total_groups, total_pages, has_next, page > 1
+
+    @classmethod
+    def _page_response(
+        cls,
+        query: str,
+        page: int,
+        page_size: int,
+        groups: List[ComparisonGroup],
+        products: List[UnifiedProduct],
+        total_matches: int,
+        price_refresh: Optional[PriceStockRefreshInfo] = None,
+        source: str = "local_db",
+    ) -> SearchResponse:
+        (
+            page_groups,
+            page_products,
+            total_groups,
+            total_pages,
+            has_next,
+            has_prev,
+        ) = cls._slice_page(groups, products, page, page_size, total_matches)
+        return SearchResponse(
+            query=query,
+            total_results=total_matches,
+            source=source,
+            results=page_products,
+            comparison_groups=page_groups,
+            price_refresh=price_refresh,
+            page=page,
+            page_size=page_size,
+            total_groups=total_groups,
+            total_pages=total_pages,
+            returned_results=len(page_products),
+            has_next=has_next,
+            has_prev=has_prev,
+        )
+
+    # ------------------------------------------------------------------
+    # Search-time price/stock refresh (continued)
+    # ------------------------------------------------------------------
+
+    def _schedule_background_refresh(
+        self, products: List[UnifiedProduct], query: Optional[str]
+    ) -> bool:
+        """
+        Kicks off a non-blocking live price/stock refresh for one page of listings.
+
+        Search must not wait seconds for five storefronts before painting a page.
+        The refreshed values are persisted to SQLite, and the client re-reads the
+        page once (`refresh=off`) after the badge announces the refresh.
+        """
+        if not getattr(settings, "price_stock_refresh_enabled", True):
+            return False
+        if self._refresh_in_progress:
+            return False
+        ids = [p.id for p in products if p.id is not None]
+        if not ids:
+            return False
+
+        # Claim the slot synchronously so two concurrent requests cannot both
+        # start a refresh in the gap before the task runs.
+        self._refresh_in_progress = True
+        task = asyncio.create_task(self._run_background_refresh(ids, query))
+        self._refresh_tasks.add(task)
+        task.add_done_callback(self._refresh_tasks.discard)
+        return True
+
+    async def _run_background_refresh(self, product_ids: List[int], query: Optional[str]) -> None:
+        try:
+            await self._ensure_adapter_loop()
+            # Re-read so the background task never mutates objects owned by a
+            # response that is being serialized.
+            products = await asyncio.to_thread(db.get_products_by_ids, product_ids)
+            await self._refresh_price_stock_inner(products, query=query, force=False)
+        except Exception as exc:  # noqa: BLE001 - background refresh must never crash the app
+            logger.warning("[Price/Stock] Background refresh failed: %s", exc)
+            self._refresh_cooldown_until = time.monotonic() + float(
+                getattr(settings, "price_stock_offline_cooldown_seconds", 60.0)
+            )
+        finally:
+            self._refresh_in_progress = False
+
     async def search_local_refreshed(
         self,
         query: str,
@@ -744,43 +965,150 @@ class AggregatorEngine:
         refresh_mode: str = "auto",
         category: Optional[str] = None,
         spec_filters: Optional[Dict[str, Any]] = None,
+        price_min: Optional[float] = None,
+        price_max: Optional[float] = None,
+        page: int = 1,
+        page_size: Optional[int] = None,
+        background_refresh: bool = False,
     ) -> SearchResponse:
         """
-        Local catalog search that refreshes price/stock for the matched listings
-        before building the response, falling back to cached values when offline.
+        Local catalog search with group-level pagination and price/stock refresh.
 
         refresh_mode: 'auto' (respect the TTL), 'force' (bypass the TTL), 'off'.
-        category: optional canonical category slug to filter on.
+        page/page_size: which page of comparison cards to return.
+        background_refresh: when True (web UI), a stale price refresh runs after
+        the response instead of blocking it; the client re-reads once it lands.
         """
-        products = await asyncio.to_thread(
-            search_catalog_ranked,
+        page = max(1, int(page or 1))
+        requested = page_size if page_size is not None else limit
+        page_size = max(1, min(int(requested or settings.search_page_size), settings.search_page_size_max))
+        pool = self._pool_size(page, page_size)
+
+        total_matches = await asyncio.to_thread(
+            db.count_search_products,
             query=query,
-            limit=limit,
             vendor=vendor,
             in_stock_only=in_stock_only,
             category=category,
             spec_filters=spec_filters,
+            price_min=price_min,
+            price_max=price_max,
+        )
+        products = await asyncio.to_thread(
+            search_catalog_ranked,
+            query=query,
+            limit=pool,
+            vendor=vendor,
+            in_stock_only=in_stock_only,
+            category=category,
+            spec_filters=spec_filters,
+            price_min=price_min,
+            price_max=price_max,
+        )
+        groups = await asyncio.to_thread(self.group_and_compare, products, query=query)
+
+        page_groups, page_products, _, _, _, _ = self._slice_page(
+            groups, products, page, page_size, total_matches
         )
 
         price_refresh: Optional[PriceStockRefreshInfo] = None
-        if products and refresh_mode != "off":
-            price_refresh = await self.refresh_price_stock(
-                products, query=query, force=(refresh_mode == "force")
-            )
-            if in_stock_only:
-                # Availability may have flipped during the refresh; an explicit
-                # in-stock filter must stay truthful.
-                products = [p for p in products if p.available]
+        if page_products and refresh_mode != "off":
+            sync_limit = max(1, int(getattr(settings, "price_stock_sync_max_products", 30)))
+            if (
+                background_refresh
+                and refresh_mode == "auto"
+                and getattr(settings, "price_stock_background_refresh", True)
+            ):
+                if self._schedule_background_refresh(page_products, query):
+                    price_refresh = PriceStockRefreshInfo(
+                        status="refreshing",
+                        cached_products=len(page_products),
+                        message=(
+                            "Showing cached prices while live prices are verified in the "
+                            "background; the page refreshes automatically when done."
+                        ),
+                    )
+                else:
+                    price_refresh = PriceStockRefreshInfo(
+                        status="fresh_cache",
+                        cached_products=len(page_products),
+                        message="A live price refresh is already running; serving cached values.",
+                    )
+            elif refresh_mode == "force" or len(page_products) <= sync_limit:
+                price_refresh = await self.refresh_price_stock(
+                    page_products, query=query, force=(refresh_mode == "force")
+                )
+                if price_refresh.refreshed_products:
+                    # Prices/stock changed: rebuild so best-price badges and stock
+                    # filters reflect the verified values.
+                    groups = await asyncio.to_thread(
+                        self.group_and_compare, products, query=query
+                    )
+            else:
+                price_refresh = PriceStockRefreshInfo(
+                    status="cached",
+                    cached_products=len(page_products),
+                    message=(
+                        "Broad search: showing cached prices. Use refresh=force to verify "
+                        "this page live, or narrow the query."
+                    ),
+                )
 
-        comparison_groups = await asyncio.to_thread(self.group_and_compare, products, query=query)
-        return SearchResponse(
+        return self._page_response(
             query=query,
-            total_results=len(products),
-            source="local_db",
-            results=products,
-            comparison_groups=comparison_groups,
+            page=page,
+            page_size=page_size,
+            groups=groups,
+            products=products,
+            total_matches=total_matches,
             price_refresh=price_refresh,
         )
+
+    async def browse_local(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        category: Optional[str] = None,
+        vendor: Optional[str] = None,
+        in_stock_only: bool = False,
+        spec_filters: Optional[Dict[str, Any]] = None,
+        price_min: Optional[float] = None,
+        price_max: Optional[float] = None,
+    ) -> SearchResponse:
+        """Paginated category/vendor browse (no text query)."""
+        page = max(1, int(page or 1))
+        page_size = max(1, min(int(page_size or settings.search_page_size), settings.search_page_size_max))
+        pool = self._pool_size(page, page_size)
+
+        total_matches = await asyncio.to_thread(
+            db.count_products_by_category,
+            category=category or None,
+            vendor=vendor or None,
+            in_stock_only=bool(in_stock_only),
+            spec_filters=spec_filters or None,
+            price_min=price_min,
+            price_max=price_max,
+        )
+        products = await asyncio.to_thread(
+            db.list_products_by_category,
+            category=category or None,
+            vendor=vendor or None,
+            in_stock_only=bool(in_stock_only),
+            limit=pool,
+            spec_filters=spec_filters or None,
+            price_min=price_min,
+            price_max=price_max,
+        )
+        groups = await asyncio.to_thread(self.group_and_compare, products, None)
+        return self._page_response(
+            query="",
+            page=page,
+            page_size=page_size,
+            groups=groups,
+            products=products,
+            total_matches=total_matches,
+        )
+
 
     async def search_live(self, query: str, limit_per_vendor: int = 15) -> SearchResponse:
         """
@@ -857,7 +1185,14 @@ class AggregatorEngine:
             source="live",
             results=all_products,
             comparison_groups=comparison_groups,
-            price_refresh=price_refresh
+            price_refresh=price_refresh,
+            page=1,
+            page_size=max(1, len(comparison_groups)),
+            total_groups=len(comparison_groups),
+            total_pages=1 if comparison_groups else 0,
+            returned_results=len(all_products),
+            has_next=False,
+            has_prev=False,
         )
 
     def search_local(
@@ -867,7 +1202,9 @@ class AggregatorEngine:
         vendor: Optional[str] = None,
         in_stock_only: bool = False,
         category: Optional[str] = None,
-        spec_filters: Optional[Dict[str, Any]] = None
+        spec_filters: Optional[Dict[str, Any]] = None,
+        price_min: Optional[float] = None,
+        price_max: Optional[float] = None,
     ) -> SearchResponse:
         """
         Queries indexed database using Enhanced SQLite BM25 + RRF and intent-gated ranking.
@@ -881,7 +1218,9 @@ class AggregatorEngine:
             vendor=vendor,
             in_stock_only=in_stock_only,
             category=category,
-            spec_filters=spec_filters
+            spec_filters=spec_filters,
+            price_min=price_min,
+            price_max=price_max,
         )
         comparison_groups = self.group_and_compare(products, query=query)
         return SearchResponse(

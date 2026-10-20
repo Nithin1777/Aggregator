@@ -455,6 +455,22 @@ def row_to_unified_product(row: sqlite3.Row) -> UnifiedProduct:
 
     price_updated_at = _get("price_stock_updated_at")
     price_source = _get("price_stock_source")
+    extra = json.loads(row["raw_json"]) if _get("raw_json") else {}
+    price = float(row["price"])
+    # Some vendors quote ex-GST prices while the catalog stores tax-inclusive
+    # values, so derive the note from the stored price (a refresh only rewrites
+    # `price`, which would leave an ingest-time note stale).
+    price_note = extra.get("price_note") if isinstance(extra, dict) else None
+    gst_rate = 0.0
+    if row["vendor"] == "robokits":
+        gst_rate = max(0.0, float(getattr(settings, "robokits_gst_rate", 0.18) or 0.0))
+    elif row["vendor"] == "quartzcomponents":
+        gst_rate = max(0.0, float(getattr(settings, "quartz_gst_rate", 0.18) or 0.0))
+    if gst_rate > 0 and price > 0:
+        base = round(price / (1.0 + gst_rate), 2)
+        price_note = (
+            f"₹{base:,.2f} + {gst_rate * 100:.0f}% GST (tax-inclusive price shown)"
+        )
     return UnifiedProduct(
         id=row["id"],
         vendor=row["vendor"],
@@ -464,7 +480,7 @@ def row_to_unified_product(row: sqlite3.Row) -> UnifiedProduct:
         normalized_title=row["normalized_title"],
         mpn=row["mpn"],
         sku=row["sku"],
-        price=float(row["price"]),
+        price=price,
         available=bool(row["available"]),
         product_url=row["product_url"],
         image_url=row["image_url"],
@@ -476,7 +492,8 @@ def row_to_unified_product(row: sqlite3.Row) -> UnifiedProduct:
         updated_at=str(row["updated_at"]) if row["updated_at"] else None,
         price_updated_at=str(price_updated_at) if price_updated_at else None,
         price_source=price_source if price_source else None,
-        extra=json.loads(row["raw_json"]) if _get("raw_json") else {},
+        price_note=price_note,
+        extra=extra,
     )
 
 
@@ -1053,20 +1070,15 @@ def suggest_mpns(needle: str, limit: int = 5, cutoff: float = 0.72) -> List[str]
         conn.close()
 
 
-def list_products_by_category(
-    category: Optional[str] = None,
-    vendor: Optional[str] = None,
-    in_stock_only: bool = False,
-    limit: int = 70,
-    spec_filters: Optional[Dict[str, Any]] = None,
-) -> List[UnifiedProduct]:
-    """
-    Lists catalog entries for browsing (no text query).
-
-    Used by the category pages: the most relevant, best-priced listings of a
-    category so a user can browse without typing anything. `spec_filters`
-    applies the same shared spec-attribute filters as the search path.
-    """
+def _browse_filter_clauses(
+    category: Optional[str],
+    vendor: Optional[str],
+    in_stock_only: bool,
+    spec_filters: Optional[Dict[str, Any]],
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+) -> Tuple[List[str], List[Any], List[str], List[Any]]:
+    """Shared WHERE/JOIN builder for category browsing and its total count."""
     clauses: List[str] = []
     where_params: List[Any] = []
 
@@ -1078,6 +1090,12 @@ def list_products_by_category(
         where_params.append(vendor)
     if in_stock_only:
         clauses.append("available = 1")
+    if price_min is not None:
+        clauses.append("price >= ?")
+        where_params.append(float(price_min))
+    if price_max is not None:
+        clauses.append("price <= ?")
+        where_params.append(float(price_max))
 
     joins: List[str] = []
     join_params: List[Any] = []
@@ -1095,10 +1113,33 @@ def list_products_by_category(
         )
         clauses.extend(spec_where)
         where_params.extend(spec_where_params)
+    return joins, join_params, clauses, where_params
 
+
+def list_products_by_category(
+    category: Optional[str] = None,
+    vendor: Optional[str] = None,
+    in_stock_only: bool = False,
+    limit: int = 70,
+    offset: int = 0,
+    spec_filters: Optional[Dict[str, Any]] = None,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+) -> List[UnifiedProduct]:
+    """
+    Lists catalog entries for browsing (no text query).
+
+    Used by the category pages: the most relevant, best-priced listings of a
+    category so a user can browse without typing anything. `spec_filters`
+    applies the same shared spec-attribute filters as the search path.
+    """
+    joins, join_params, clauses, where_params = _browse_filter_clauses(
+        category, vendor, in_stock_only, spec_filters,
+        price_min=price_min, price_max=price_max,
+    )
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params: List[Any] = join_params + where_params
-    params.append(max(1, int(limit)))
+    params.extend([max(1, int(limit)), max(0, int(offset))])
 
     conn = get_db_connection()
     try:
@@ -1108,13 +1149,116 @@ def list_products_by_category(
             {" ".join(joins)}
             {where}
             ORDER BY p.available DESC, p.price ASC, p.id ASC
-            LIMIT ?;
+            LIMIT ? OFFSET ?;
             """,
             params,
         ).fetchall()
         return [row_to_unified_product(r) for r in rows]
     finally:
         conn.close()
+
+
+def count_products_by_category(
+    category: Optional[str] = None,
+    vendor: Optional[str] = None,
+    in_stock_only: bool = False,
+    spec_filters: Optional[Dict[str, Any]] = None,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+) -> int:
+    """Total listings in a browse filter (drives the pager's total count)."""
+    joins, join_params, clauses, where_params = _browse_filter_clauses(
+        category, vendor, in_stock_only, spec_filters,
+        price_min=price_min, price_max=price_max,
+    )
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            f"SELECT COUNT(DISTINCT p.id) FROM products p {' '.join(joins)} {where};",
+            join_params + where_params,
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+
+def _prepare_search_query(
+    conn: sqlite3.Connection,
+    query: str,
+    vendor: Optional[str],
+    in_stock_only: bool,
+    category: Optional[str],
+    spec_filters: Optional[Dict[str, Any]],
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Resolves a text query into the exact SQL fragments shared by search and count.
+
+    Returns None when the query is empty or nothing in the index resembles it
+    (callers must return [] / 0 instead of silently matching the whole catalog).
+    """
+    clean_q = query.strip() if query else ""
+    if not clean_q:
+        return None
+
+    plan = resolve_query_plan(clean_q, conn=conn)
+    if not plan.resolved or not plan.effective_tokens:
+        return None
+
+    # Relaxed/corrected plans match any term; strict plans use the wider
+    # variation set (all terms, concatenation, bigram merges).
+    if plan.is_relaxed:
+        fts_query = relaxed_fts_expr(plan.effective_tokens)
+    else:
+        fts_query = " OR ".join(fts_variations(plan.effective_tokens))
+
+    # Spec-attribute filters (voltage, rpm, capacity_mah, ...) reuse the exact
+    # same builder the MCP server uses, so a filter means the same thing in both.
+    spec_joins: List[str] = []
+    spec_join_params: List[Any] = []
+    spec_where: List[str] = []
+    spec_where_params: List[Any] = []
+    if spec_filters:
+        advertised = load_catalog_specs(conn)
+        norm_filters, error = parse_and_validate_filters(spec_filters, advertised)
+        if error:
+            raise ValueError(error["message"])
+        spec_joins, spec_join_params, spec_where, spec_where_params = build_spec_clauses(
+            norm_filters, advertised
+        )
+
+    where_clauses = ["products_fts MATCH ?"]
+    where_params: List[Any] = [fts_query]
+    if vendor:
+        where_clauses.append("p.vendor = ?")
+        where_params.append(vendor)
+    if in_stock_only:
+        where_clauses.append("p.available = 1")
+    if category:
+        where_clauses.append("p.category_canonical = ?")
+        where_params.append(category)
+    if price_min is not None:
+        where_clauses.append("p.price >= ?")
+        where_params.append(float(price_min))
+    if price_max is not None:
+        where_clauses.append("p.price <= ?")
+        where_params.append(float(price_max))
+    where_clauses.extend(spec_where)
+
+    return {
+        "clean_q": clean_q,
+        "plan": plan,
+        "fts_query": fts_query,
+        "where_clauses": where_clauses,
+        "where_params": where_params,
+        "spec_joins": spec_joins,
+        "spec_join_params": spec_join_params,
+        "spec_where": spec_where,
+        "spec_where_params": spec_where_params,
+    }
 
 
 def search_products(
@@ -1124,7 +1268,9 @@ def search_products(
     vendor: Optional[str] = None,
     in_stock_only: bool = False,
     category: Optional[str] = None,
-    spec_filters: Optional[Dict[str, Any]] = None
+    spec_filters: Optional[Dict[str, Any]] = None,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
 ) -> List[UnifiedProduct]:
     """
     Performs search using FTS5 with fallback to LIKE pattern matching.
@@ -1140,92 +1286,121 @@ def search_products(
     """
     conn = get_db_connection()
     results: List[UnifiedProduct] = []
-    clean_q = query.strip() if query else ""
-    if not clean_q:
-        return []
-
     try:
-        cursor = conn.cursor()
-        plan = resolve_query_plan(clean_q, conn=conn)
-        if not plan.resolved or not plan.effective_tokens:
+        prepared = _prepare_search_query(
+            conn, query, vendor, in_stock_only, category, spec_filters,
+            price_min=price_min, price_max=price_max,
+        )
+        if prepared is None:
             return []
-
-        # Relaxed/corrected plans match any term; strict plans use the wider
-        # variation set (all terms, concatenation, bigram merges).
-        if plan.is_relaxed:
-            fts_query = relaxed_fts_expr(plan.effective_tokens)
-        else:
-            fts_query = " OR ".join(fts_variations(plan.effective_tokens))
-
-        # Spec-attribute filters (voltage, rpm, capacity_mah, ...) reuse the
-        # exact same builder the MCP server uses, so a filter means the same
-        # thing in both places.
-        spec_joins: List[str] = []
-        spec_join_params: List[Any] = []
-        spec_where: List[str] = []
-        spec_where_params: List[Any] = []
-        if spec_filters:
-            advertised = load_catalog_specs(conn)
-            norm_filters, error = parse_and_validate_filters(spec_filters, advertised)
-            if error:
-                raise ValueError(error["message"])
-            (
-                spec_joins,
-                spec_join_params,
-                spec_where,
-                spec_where_params,
-            ) = build_spec_clauses(norm_filters, advertised)
-
-        where_clauses = ["products_fts MATCH ?"]
-        where_params: List[Any] = [fts_query]
-
-        if vendor:
-            where_clauses.append("p.vendor = ?")
-            where_params.append(vendor)
-        if in_stock_only:
-            where_clauses.append("p.available = 1")
-        if category:
-            where_clauses.append("p.category_canonical = ?")
-            where_params.append(category)
-
-        where_clauses.extend(spec_where)
 
         sql = f"""
             SELECT p.* FROM products p
             JOIN products_fts fts ON p.id = fts.rowid
-            {" ".join(spec_joins)}
-            WHERE {" AND ".join(where_clauses)}
+            {" ".join(prepared["spec_joins"])}
+            WHERE {" AND ".join(prepared["where_clauses"])}
             ORDER BY rank
             LIMIT ? OFFSET ?;
         """
         # Parameter order follows the SQL text: join params, then WHERE params.
-        params: List[Any] = spec_join_params + where_params + spec_where_params
+        params: List[Any] = (
+            prepared["spec_join_params"]
+            + prepared["where_params"]
+            + prepared["spec_where_params"]
+        )
         params.extend([limit, offset])
 
+        cursor = conn.cursor()
         try:
             cursor.execute(sql, params)
             rows = cursor.fetchall()
         except sqlite3.OperationalError:
             rows = _search_products_like(
                 cursor,
-                clean_q,
+                prepared["clean_q"],
                 (limit, offset),
                 vendor,
                 in_stock_only,
                 category,
-                spec_joins=spec_joins,
-                spec_join_params=spec_join_params,
-                spec_where=spec_where,
-                spec_where_params=spec_where_params,
+                spec_joins=prepared["spec_joins"],
+                spec_join_params=prepared["spec_join_params"],
+                spec_where=prepared["spec_where"],
+                spec_where_params=prepared["spec_where_params"],
             )
 
         for r in rows:
             results.append(row_to_unified_product(r))
-
     finally:
         conn.close()
 
     return results
+
+
+def count_search_products(
+    query: str,
+    vendor: Optional[str] = None,
+    in_stock_only: bool = False,
+    category: Optional[str] = None,
+    spec_filters: Optional[Dict[str, Any]] = None,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+) -> int:
+    """Total listings matching a search (used for pager totals, not just the page)."""
+    conn = get_db_connection()
+    try:
+        prepared = _prepare_search_query(
+            conn, query, vendor, in_stock_only, category, spec_filters,
+            price_min=price_min, price_max=price_max,
+        )
+        if prepared is None:
+            return 0
+
+        sql = f"""
+            SELECT COUNT(DISTINCT p.id) FROM products p
+            JOIN products_fts fts ON p.id = fts.rowid
+            {" ".join(prepared["spec_joins"])}
+            WHERE {" AND ".join(prepared["where_clauses"])};
+        """
+        params: List[Any] = (
+            prepared["spec_join_params"]
+            + prepared["where_params"]
+            + prepared["spec_where_params"]
+        )
+        try:
+            row = conn.execute(sql, params).fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.OperationalError:
+            like = f"%{prepared['clean_q']}%"
+            like_where = [
+                "(p.title LIKE ? OR p.normalized_title LIKE ? OR p.mpn LIKE ? OR p.sku LIKE ?)"
+            ]
+            like_params: List[Any] = [like, like, like, like]
+            if vendor:
+                like_where.append("p.vendor = ?")
+                like_params.append(vendor)
+            if in_stock_only:
+                like_where.append("p.available = 1")
+            if category:
+                like_where.append("p.category_canonical = ?")
+                like_params.append(category)
+            if price_min is not None:
+                like_where.append("p.price >= ?")
+                like_params.append(float(price_min))
+            if price_max is not None:
+                like_where.append("p.price <= ?")
+                like_params.append(float(price_max))
+            like_where.extend(prepared["spec_where"])
+            like_params.extend(prepared["spec_where_params"])
+            row = conn.execute(
+                f"SELECT COUNT(DISTINCT p.id) FROM products p "
+                f"{' '.join(prepared['spec_joins'])} "
+                f"WHERE {' AND '.join(like_where)};",
+                prepared["spec_join_params"] + like_params,
+            ).fetchone()
+            return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
 
 
 def _search_products_like(
@@ -1267,6 +1442,75 @@ def _search_products_like(
     params.extend(list(page))
     cursor.execute(sql_like, params)
     return cursor.fetchall()
+
+def apply_vendor_gst(
+    vendor: str,
+    rate: float,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    One-off/idempotent conversion of a vendor's stored ex-GST prices.
+
+    Rows ingested after the adapter learned about GST already carry
+    `extra.gst_rate`; those are skipped. The original amount is preserved in
+    `extra.price_ex_gst`, and the refresh marker is cleared so the next search
+    re-verifies against the vendor.
+    """
+    rate = max(0.0, float(rate or 0.0))
+    if rate <= 0:
+        return {"vendor": vendor, "rate": rate, "updated": 0, "skipped": 0, "dry_run": dry_run}
+
+    conn = get_db_connection()
+    updated = 0
+    skipped = 0
+    try:
+        rows = conn.execute(
+            "SELECT id, price, raw_json FROM products WHERE vendor = ? AND price > 0;",
+            (vendor,),
+        ).fetchall()
+
+        with conn:
+            for row in rows:
+                try:
+                    extra = json.loads(row["raw_json"]) if row["raw_json"] else {}
+                except (TypeError, ValueError):
+                    extra = {}
+                if not isinstance(extra, dict):
+                    extra = {}
+                if "gst_rate" in extra:
+                    skipped += 1
+                    continue
+
+                base_price = float(row["price"])
+                new_price = round(base_price * (1.0 + rate), 2)
+                extra["price_ex_gst"] = base_price
+                extra["gst_rate"] = rate
+                extra["price_note"] = (
+                    f"₹{base_price:,.2f} + {rate * 100:.0f}% GST "
+                    f"(tax-inclusive price shown)"
+                )
+                if not dry_run:
+                    conn.execute(
+                        """
+                        UPDATE products
+                        SET price = ?,
+                            raw_json = ?,
+                            price_stock_attempted_at = NULL
+                        WHERE id = ?;
+                        """,
+                        (new_price, json.dumps(extra), row["id"]),
+                    )
+                updated += 1
+    finally:
+        conn.close()
+    return {
+        "vendor": vendor,
+        "rate": rate,
+        "updated": updated,
+        "skipped": skipped,
+        "dry_run": dry_run,
+    }
+
 
 def get_db_stats() -> Dict[str, Any]:
     """Returns database summary statistics and vendor checkpoints."""

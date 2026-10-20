@@ -2,6 +2,7 @@
 Component title normalization, MPN extraction, and cross-vendor matching engine.
 """
 import re
+from functools import lru_cache
 from typing import List, Optional, Set, Tuple
 
 # Known electronic part number patterns and common component chips
@@ -101,12 +102,15 @@ NOISE_WORDS = {
     "fast", "delivery", "warranty", "month", "months", "year"
 }
 
+@lru_cache(maxsize=16384)
 def clean_html(text: str) -> str:
     """Strip any basic HTML markup from a string."""
     if not text:
         return ""
     return re.sub(r"<[^>]+>", " ", text).strip()
 
+
+@lru_cache(maxsize=16384)
 def strip_compatibility_clauses(text: str) -> str:
     """Removes trailing compatibility spam like 'Compatible with Arduino/ESP32', 'for Arduino/ESP32/sensors', or host accessory clauses."""
     m = re.search(
@@ -123,6 +127,7 @@ INVALID_MPN_TOKENS = {
     "TTL", "UART", "I2C", "SPI", "GPIO", "DIP", "SMD", "PCB", "LED", "LCD", "OLED", "PWM"
 }
 
+@lru_cache(maxsize=16384)
 def extract_mpn(title: str) -> Optional[str]:
     """
     Extracts the most canonical Manufacturer Part Number (MPN) or IC identifier from a product title.
@@ -175,6 +180,7 @@ def extract_mpn(title: str) -> Optional[str]:
 
     return None
 
+@lru_cache(maxsize=16384)
 def normalize_title(title: str) -> str:
     """
     Produces a clean, lowercased, canonical string representing the core component.
@@ -213,10 +219,36 @@ def normalize_title(title: str) -> str:
 
     return " ".join(deduped).strip()
 
-def get_token_set(text: str) -> Set[str]:
-    """Returns normalized set of keywords."""
-    return set(re.findall(r"\b\w{2,}\b", text.lower()))
+_PLURAL_EXCEPTIONS = {
+    "lens", "series", "species", "gas", "bus", "plus", "news", "analysis",
+    "basis", "axis", "status", "alias", "canvas", "atlas", "cms", "rms",
+}
 
+
+def _singularize(token: str) -> str:
+    """
+    Light singularization for match similarity only.
+
+    Vendor titles disagree on plurality ("Creality Display Kit" vs "Kits"), and
+    exact-token Jaccard then drops below the merge threshold, producing duplicate
+    comparison cards. Part numbers are left untouched.
+    """
+    if len(token) <= 3 or token in _PLURAL_EXCEPTIONS or any(ch.isdigit() for ch in token):
+        return token
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+    if token.endswith("s") and not token.endswith(("ss", "us", "is", "ics")):
+        return token[:-1]
+    return token
+
+
+@lru_cache(maxsize=16384)
+def get_token_set(text: str) -> Set[str]:
+    """Returns normalized set of keywords (plural-tolerant)."""
+    return {_singularize(t) for t in re.findall(r"\b\w{2,}\b", text.lower())}
+
+
+@lru_cache(maxsize=32768)
 def calculate_token_similarity(t1: str, t2: str) -> float:
     """Calculates Jaccard similarity between two token sets."""
     s1 = get_token_set(t1)
@@ -268,6 +300,7 @@ SYNONYM_REPLACEMENTS = [
     (r"\bhcsr04\b", "hc-sr04"),
 ]
 
+@lru_cache(maxsize=16384)
 def apply_synonyms(text: str) -> str:
     """Standardizes electronic synonyms, abbreviations, and units."""
     res = text.lower()
@@ -330,6 +363,7 @@ def canonical_base_mpn(mpn: Optional[str]) -> Optional[str]:
         return "ESP32"
     return mpn.upper()
 
+@lru_cache(maxsize=16384)
 def extract_board_model(t: str) -> Optional[str]:
     """Extracts commercial microcontroller development board models."""
     # ICs with bootloaders (e.g. ATMega328P with Arduino Uno Bootloader) are bare ICs, not boards
@@ -412,6 +446,7 @@ def extract_board_model(t: str) -> Optional[str]:
 
     return None
 
+@lru_cache(maxsize=16384)
 def extract_bundles(title: str) -> Set[str]:
     """Detects bundled accessories, combo items, or peripheral add-ons."""
     t = clean_html(title).lower()
@@ -436,6 +471,7 @@ def extract_bundles(title: str) -> Set[str]:
         bundles.add("heatsink")
     return bundles
 
+@lru_cache(maxsize=16384)
 def extract_hardware_specs(title: str) -> dict:
     """Extracts distinctive hardware specs (pin count, dimensions, RAM, direction)."""
     t = apply_synonyms(title.lower())
@@ -574,10 +610,10 @@ def extract_hardware_specs(title: str) -> dict:
 # ---------------------------------------------------------------------------
 
 PRODUCT_FORMS = [
-    ("kit", re.compile(r"\b(kit|combo|starter\s*pack|learning\s*pack|starter\s*kit|learning\s*kit|project\s*kit|make\s+an?|kt\d{3,4}|(?:measure|display|monitor|build)\b.*\busing\b)\b", re.IGNORECASE)),
+    ("kit", re.compile(r"\b(kits?|combos?|starter\s*packs?|learning\s*packs?|starter\s*kits?|learning\s*kits?|project\s*kits?|make\s+an?|kt\d{3,4}|(?:measure|display|monitor|build)\b.*\busing\b)\b", re.IGNORECASE)),
     ("composite", re.compile(r"\b(\d+\s*in\s*\d+|\d+-way|\d+\s*channel|multi[- ]?sensor|multi[- ]?function)\b", re.IGNORECASE)),
     ("accessory", re.compile(r"\b(brackets?|mount(?:ing)?(?:\s*(?:brackets?|stands?|holders?))?|holders?|stands?|wheels?|pulleys?|standoffs?|screws?(?:\s*set)?|antennas?|cables?|wires?|cords?|sleeves?|casing\s*pipes?|sockets?|shock\s*absorbers?|vibration\s*dampers?|heat\s*sinks?|heatsinks?)\b", re.IGNORECASE)),
-    ("enclosure", re.compile(r"\b(case|enclosure|box|housing|cover|acrylic\s*shell)\b", re.IGNORECASE)),
+    ("enclosure", re.compile(r"\b(cases?|enclosures?|box(?:es)?|housings?|covers?|acrylic\s*shells?)\b", re.IGNORECASE)),
     ("robotics", re.compile(r"\b(drone|quadcopter|robot\s*chassis|smart\s*car|robotic\s*arm)\b", re.IGNORECASE)),
     ("shield", re.compile(r"\b(shield|[- ]?hat|bonnet|featherwing)\b", re.IGNORECASE)),
     ("expansion", re.compile(r"\b(exp[ae]nsion|expander|breakout\s*board|terminal\s*adapter|adapter\s*(?:plate|board|programmer)|carrier|base(?:\s*board|\s*plate)?|motherboard|quad\s*gpio)\b", re.IGNORECASE)),
@@ -616,6 +652,7 @@ def are_forms_incompatible(fa: Optional[str], fb: Optional[str]) -> bool:
     # and specialized forms (chip, accessory, enclosure, shield, expansion, kit, robotics) never merge across forms.
     return True
 
+@lru_cache(maxsize=16384)
 def classify_product_form(title: str) -> Optional[str]:
     """Classifies physical product packaging, architecture, and form factor."""
     clean = strip_compatibility_clauses(clean_html(title))
@@ -631,6 +668,7 @@ def classify_product_form(title: str) -> Optional[str]:
             return form_name
     return None
 
+@lru_cache(maxsize=16384)
 def count_title_mpns(title: str) -> int:
     """Counts distinct major IC/module identifiers present in a title."""
     clean = clean_html(title).upper()

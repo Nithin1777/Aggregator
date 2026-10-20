@@ -2,12 +2,14 @@
 Ranking adjustments applied in all modes, weight-gated by intent.
 Implements:
 1. Canonical Boost: +W_c if product.is_canonical AND product.canonical_for == query_key
-2. Length Penalty: score *= 1 / log(1 + token_count) (always on - fixes SEO stuffing)
+2. Length Penalty: gentle linear decay after 5 tokens (suppresses SEO stuffing without
+   letting a short accessory title outrank a descriptive product title)
 3. Brand Repetition Penalty: subtract W_r * max(0, count - 1) (always on)
+4. Query/title role affinity: +/-(0..1.6) for "is this the part or an accessory?".
 """
-import math
 import re
 from typing import Any, List, Optional
+from src.search.product_prior import query_affinity
 from src.search.query_intent import QueryIntentResult
 
 class RankingAdjuster:
@@ -61,10 +63,12 @@ class RankingAdjuster:
                 w_c = self.w_canonical_default
             score += w_c
 
-        # 2. LENGTH PENALTY (always on — score *= 1 / log(1 + token_count))
-        # For a short clean title of 4 tokens: log(5) = 1.609 -> multiplier = 0.621
-        # For a long SEO title of 25 tokens: log(26) = 3.258 -> multiplier = 0.307
-        length_factor = 1.0 / math.log(1.0 + token_count)
+        # 2. LENGTH PENALTY (always on, but gentle)
+        # The old 1/log(1+n) curve made a 6-word accessory title score twice a
+        # 14-word product title. That is how "Mounting Bracket For IG52" beat the
+        # actual IG52 motor. This linear curve still suppresses SEO stuffing but
+        # does not punish descriptive product names as hard.
+        length_factor = 1.0 / (1.0 + 0.035 * max(0, token_count - 5))
         score *= length_factor
 
         # 3. BRAND / KEYWORD REPETITION PENALTY (always on)
@@ -84,6 +88,11 @@ class RankingAdjuster:
                 t_matches = len(re.findall(rf"\b{re.escape(tok)}\b", norm_title))
                 if t_matches > 1:
                     score -= self.w_repetition * (t_matches - 1)
+
+        # 4. PRODUCT-ROLE / ATTACHMENT AFFINITY
+        # "Mounting Bracket For IG52" mentions the query but is not the part;
+        # "... IG52 ... Motor" is. This is a small prior, not a hard filter.
+        score += 4.0 * query_affinity(title, query)
 
         return max(0.01, score)
 

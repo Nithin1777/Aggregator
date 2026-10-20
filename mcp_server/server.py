@@ -29,6 +29,7 @@ import db
 from models import PriceStockRefreshInfo, UnifiedProduct
 from search_service import AggregatorEngine
 from src.search.query_terms import QueryPlan, relaxed_fts_expr, strict_fts_expr
+from src.search.retrieval import rank_products
 from src.spec.filters import (
     _nearest_keys,
     build_spec_clauses,
@@ -509,6 +510,31 @@ def _build_sql_query(
     params = join_params + where_params
     select_params = params + order_params + [limit, offset]
     return count_sql, params, select_sql, select_params
+
+
+def _category_spec_bonus(
+    conn: sqlite3.Connection,
+    product_ids: List[int],
+    spec_keys: Optional[List[str]],
+) -> Dict[int, float]:
+    """
+    Reproduces the category spec-coverage ORDER BY as a score bonus.
+
+    The SQL path puts products carrying more of the category's extracted specs
+    first. When the shared Python ranker is used instead, the same signal is
+    applied as a large per-spec bonus so it still dominates raw BM25.
+    """
+    if not product_ids or not spec_keys:
+        return {}
+    id_ph = ", ".join(["?"] * len(product_ids))
+    key_ph = ", ".join(["?"] * len(spec_keys))
+    rows = conn.execute(
+        f"SELECT product_id, COUNT(1) FROM product_specs "
+        f"WHERE product_id IN ({id_ph}) AND key IN ({key_ph}) "
+        f"GROUP BY product_id;",
+        list(product_ids) + list(spec_keys),
+    ).fetchall()
+    return {int(pid): 100.0 * int(count) for pid, count in rows}
 
 # =====================================================================
 # 6 AGENT-FIRST TOOLS
@@ -1233,6 +1259,7 @@ def search_components(
                 warnings=warnings
             )
 
+        active_category_keys = _category_spec_keys(conn, category_norm) if category_norm else None
         count_sql, count_params, select_sql, select_params = _build_sql_query(
             norm_filters or {},
             catalog_specs,
@@ -1241,7 +1268,7 @@ def search_components(
             price_max=price_max,
             in_stock_only=in_stock_only,
             category=category_norm,
-            category_spec_keys=(_category_spec_keys(conn, category_norm) if category_norm else None),
+            category_spec_keys=active_category_keys,
             require_spec_scope=require_spec_scope,
             sort=sort,
             limit=effective_limit,
@@ -1285,8 +1312,54 @@ def search_components(
             )
 
         refresh_info: Optional[PriceStockRefreshInfo] = None
-        cur.execute(select_sql, select_params)
-        rows = cur.fetchall()
+
+        # Text relevance uses the same ranker as the web UI. The SQL path gives
+        # the BM25 candidate order; Python applies canonical/length/role
+        # adjustments, then the requested cursor offset slices that ranking.
+        rank_mode = bool(
+            query is not None
+            and query_plan is not None
+            and query_plan.resolved
+            and sort == "relevance"
+        )
+        if rank_mode:
+            pool_limit = min(1000, max(400, offset + effective_limit + 200))
+            _, _, rank_sql, rank_params = _build_sql_query(
+                norm_filters or {},
+                catalog_specs,
+                fts_tokens=query_plan.effective_tokens,
+                fts_relaxed=query_plan.is_relaxed,
+                price_max=price_max,
+                in_stock_only=in_stock_only,
+                category=category_norm,
+                category_spec_keys=active_category_keys,
+                require_spec_scope=require_spec_scope,
+                sort=sort,
+                limit=pool_limit,
+                offset=0,
+            )
+            cur.execute(rank_sql, rank_params)
+            candidate_rows = cur.fetchall()
+            candidate_products = [db.row_to_unified_product(r) for r in candidate_rows]
+            bonus = _category_spec_bonus(
+                conn,
+                [p.id for p in candidate_products if p.id is not None],
+                active_category_keys,
+            )
+            ranked = rank_products(
+                candidate_products,
+                effective_query,
+                bonus_by_id=bonus or None,
+            )
+            page_products = ranked[offset:offset + effective_limit]
+            row_by_id = {r["id"]: r for r in candidate_rows}
+            rows = [
+                row_by_id[p.id] for p in page_products
+                if p.id is not None and p.id in row_by_id
+            ]
+        else:
+            cur.execute(select_sql, select_params)
+            rows = cur.fetchall()
 
         if refresh and rows:
             # Verify price/stock for the displayed page before the response is built;
@@ -1299,18 +1372,25 @@ def search_components(
             warnings.extend(_price_stock_fallback_warning(refresh_info))
             if refresh_info.attempted and refresh_info.refreshed_products > 0:
                 # Re-read the page so displayed prices/stock reflect the refresh.
-                cur.execute(select_sql, select_params)
-                rows = cur.fetchall()
+                page_ids = [r["id"] for r in rows]
+                if page_ids:
+                    id_ph = ", ".join(["?"] * len(page_ids))
+                    cur.execute(
+                        f"SELECT * FROM products WHERE id IN ({id_ph});", page_ids
+                    )
+                    row_by_id = {r["id"]: r for r in cur.fetchall()}
+                    rows = [row_by_id[i] for i in page_ids if i in row_by_id]
 
         ids = [r["id"] for r in rows]
-        placeholders = ", ".join(["?"] * len(ids))
         result_spec_counts: Dict[str, int] = {}
-        cur.execute(
-            f"SELECT key, COUNT(1) FROM product_specs WHERE product_id IN ({placeholders}) GROUP BY key;",
-            ids
-        )
-        for spec_key, spec_count in cur.fetchall():
-            result_spec_counts[spec_key] = spec_count
+        if ids:
+            placeholders = ", ".join(["?"] * len(ids))
+            cur.execute(
+                f"SELECT key, COUNT(1) FROM product_specs WHERE product_id IN ({placeholders}) GROUP BY key;",
+                ids
+            )
+            for spec_key, spec_count in cur.fetchall():
+                result_spec_counts[spec_key] = spec_count
 
         # Spec presence across the returned page: tells the caller whether a field
         # is genuinely absent from the part or simply never extracted for it.

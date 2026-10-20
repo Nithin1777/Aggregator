@@ -170,6 +170,26 @@ def test_refresh_does_not_import_unmatched_live_products(temp_db):
     assert len(db.search_products("IG52")) == 1
 
 
+def test_refresh_rejects_implausible_price_collapse(temp_db):
+    """
+    A parser regression once turned a ₹216 listing's "-37%" badge into ₹37.
+    Refresh must not overwrite a real cached price with such a fragment.
+    """
+    db.upsert_products([_product(price=216.0, available=True)])
+    products = db.search_products("IG52")
+    _backdate_refresh_cache()
+
+    adapter = FakeAdapter(products=[_product(price=37.0, available=True)])
+    engine = _engine_with(adapter)
+
+    info = asyncio.run(engine.refresh_price_stock(products, query="IG52 motor"))
+
+    assert info.refreshed_products == 0
+    assert products[0].price == 216.0
+    stored = db.search_products("IG52")[0]
+    assert stored.price == 216.0
+
+
 def test_offline_refresh_falls_back_to_cached_values(temp_db):
     db.upsert_products([_product(price=199.0, available=True)])
     products = db.search_products("IG52")

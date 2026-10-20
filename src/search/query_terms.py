@@ -118,6 +118,74 @@ def fts_variations(tokens: Sequence[str]) -> List[str]:
     return deduped
 
 
+# ---------------------------------------------------------------------------
+# Price constraints embedded in a text query
+# ---------------------------------------------------------------------------
+
+_PRICE_NUM = r"(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+_PRICE_CURRENCY = r"(?:(?:₹|rs\.?|inr)\s*)?"
+_PRICE_RANGE_RE = re.compile(
+    rf"{_PRICE_CURRENCY}{_PRICE_NUM}\s*(?:-|–|to)\s*{_PRICE_CURRENCY}{_PRICE_NUM}",
+    re.IGNORECASE,
+)
+_PRICE_MAX_RE = re.compile(
+    rf"\b(?:under|below|less\s+than|upto|up\s*to|max(?:imum)?|within)\b\s*"
+    rf"{_PRICE_CURRENCY}{_PRICE_NUM}",
+    re.IGNORECASE,
+)
+_PRICE_MIN_RE = re.compile(
+    rf"\b(?:over|above|more\s+than|at\s+least|min(?:imum)?)\b\s*"
+    rf"{_PRICE_CURRENCY}{_PRICE_NUM}",
+    re.IGNORECASE,
+)
+
+
+def _price_value(raw: str) -> Optional[float]:
+    try:
+        return float(raw.replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_price_constraints(
+    query: Optional[str],
+) -> Tuple[str, Optional[float], Optional[float]]:
+    """
+    Pulls an explicit budget out of free text and returns the remaining query.
+
+    "resistor under ₹500" -> ("resistor", None, 500.0)
+    "12v motor 300 to 1200" -> ("12v motor", 300.0, 1200.0)
+    "esp32 over 300" -> ("esp32", 300.0, None)
+
+    Only explicit comparison words/ranges are treated as prices, so a part
+    number like "MAX232" or "ESP32 500" is left untouched.
+    """
+    text = query or ""
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
+
+    match = _PRICE_RANGE_RE.search(text)
+    if match:
+        low = _price_value(match.group(1))
+        high = _price_value(match.group(2))
+        if low is not None and high is not None:
+            price_min, price_max = min(low, high), max(low, high)
+            text = text[:match.start()] + " " + text[match.end():]
+
+    if price_max is None:
+        match = _PRICE_MAX_RE.search(text)
+        if match:
+            price_max = _price_value(match.group(1))
+            text = text[:match.start()] + " " + text[match.end():]
+
+    if price_min is None:
+        match = _PRICE_MIN_RE.search(text)
+        if match:
+            price_min = _price_value(match.group(1))
+            text = text[:match.start()] + " " + text[match.end():]
+
+    cleaned = re.sub(r"\s+", " ", text).strip(" ,;-")
+    return cleaned, price_min, price_max
 @dataclass
 class QueryPlan:
     """Outcome of resolving a user/agent query against the live FTS index."""

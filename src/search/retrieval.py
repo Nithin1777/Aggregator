@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import db
 from models import UnifiedProduct
 from src.search.canonical_boost import adjust_search_score
+from src.search.product_prior import query_category_hint
 from src.search.query_intent import QueryIntentResult, get_query_intent
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,9 @@ class EnhancedSQLiteBackend:
         vendor: Optional[str] = None,
         in_stock_only: bool = False,
         category: Optional[str] = None,
-        spec_filters: Optional[Dict[str, Any]] = None
+        spec_filters: Optional[Dict[str, Any]] = None,
+        price_min: Optional[float] = None,
+        price_max: Optional[float] = None,
     ) -> List[UnifiedProduct]:
         intent_res = get_query_intent(query)
         
@@ -69,7 +72,9 @@ class EnhancedSQLiteBackend:
             vendor=vendor,
             in_stock_only=in_stock_only,
             category=category,
-            spec_filters=spec_filters
+            spec_filters=spec_filters,
+            price_min=price_min,
+            price_max=price_max,
         )
 
         if not raw_candidates:
@@ -81,7 +86,9 @@ class EnhancedSQLiteBackend:
                     vendor=vendor,
                     in_stock_only=in_stock_only,
                     category=category,
-                    spec_filters=spec_filters
+                    spec_filters=spec_filters,
+                    price_min=price_min,
+                    price_max=price_max,
                 )
 
         # Ensure canonical hero product(s) for matched intent key are in candidates pool
@@ -127,27 +134,48 @@ class EnhancedSQLiteBackend:
         if not raw_candidates:
             return []
 
-        # 2. Score candidates using RRF base score + Canonical Boost + Length Penalty + Repetition Penalty
-        scored_products: List[Tuple[float, UnifiedProduct]] = []
-        for rank_idx, prod in enumerate(raw_candidates):
-            # Reciprocal rank from FTS / BM25
-            rrf_base = 1.0 / (60.0 + (rank_idx + 1))
-            # Convert to a score range comparable to BM25
-            base_score = 10.0 * (1.0 + rrf_base * 50.0)
+        return rank_products(raw_candidates, query, limit=limit)
 
-            final_score = adjust_search_score(
-                base_score=base_score,
-                title=prod.title,
-                is_canonical=prod.is_canonical,
-                canonical_for=prod.canonical_for,
-                intent_result=intent_res,
-                query=query
-            )
-            scored_products.append((final_score, prod))
 
-        # 3. Sort by adjusted score descending
-        scored_products.sort(key=lambda x: x[0], reverse=True)
-        return [p for _, p in scored_products[:limit]]
+def rank_products(
+    products: List[UnifiedProduct],
+    query: str,
+    limit: Optional[int] = None,
+    bonus_by_id: Optional[Dict[int, float]] = None,
+) -> List[UnifiedProduct]:
+    """
+    Shared relevance ranking for every text-search surface (web and MCP).
+
+    Input order is the retrieval order (BM25). Each candidate gets an RRF base
+    score plus the canonical/length/repetition/product-role adjustments, then
+    the list is sorted. `bonus_by_id` lets a caller preserve an extra signal
+    (the MCP category spec-coverage boost) without duplicating the ranker.
+    """
+    intent_res = get_query_intent(query)
+    category_hint = query_category_hint(query)
+    scored_products: List[Tuple[float, UnifiedProduct]] = []
+    for rank_idx, prod in enumerate(products):
+        # Reciprocal rank from FTS / BM25
+        rrf_base = 1.0 / (60.0 + (rank_idx + 1))
+        base_score = 10.0 * (1.0 + rrf_base * 50.0)
+
+        final_score = adjust_search_score(
+            base_score=base_score,
+            title=prod.title,
+            is_canonical=prod.is_canonical,
+            canonical_for=prod.canonical_for,
+            intent_result=intent_res,
+            query=query,
+        )
+        if bonus_by_id and prod.id is not None:
+            final_score += bonus_by_id.get(prod.id, 0.0)
+        if category_hint and prod.category_canonical == category_hint:
+            final_score += 8.0
+        scored_products.append((final_score, prod))
+
+    scored_products.sort(key=lambda item: item[0], reverse=True)
+    ranked = [product for _, product in scored_products]
+    return ranked[:limit] if limit is not None else ranked
 
 
 _meili_backend = MeiliSearchBackend()
@@ -159,7 +187,9 @@ def search_catalog_ranked(
     vendor: Optional[str] = None,
     in_stock_only: bool = False,
     category: Optional[str] = None,
-    spec_filters: Optional[Dict[str, Any]] = None
+    spec_filters: Optional[Dict[str, Any]] = None,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
 ) -> List[UnifiedProduct]:
     """
     Main ranked catalog search function.
@@ -179,5 +209,7 @@ def search_catalog_ranked(
         vendor=vendor,
         in_stock_only=in_stock_only,
         category=category,
-        spec_filters=spec_filters
+        spec_filters=spec_filters,
+        price_min=price_min,
+        price_max=price_max,
     )

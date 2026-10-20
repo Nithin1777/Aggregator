@@ -30,6 +30,10 @@ class UnifiedProduct(BaseModel):
     updated_at: Optional[str] = None
     price_updated_at: Optional[str] = Field(None, description="UTC timestamp of the last successful live price/stock fetch")
     price_source: Optional[str] = Field(None, description="'live' if price/stock was fetched from the vendor, 'cache' if never refreshed")
+    price_note: Optional[str] = Field(
+        None,
+        description="Human-readable note about how the displayed price was derived (e.g. GST included)",
+    )
     extra: Dict[str, Any] = Field(default_factory=dict, description="Vendor-specific metadata")
 
 class VendorOffer(BaseModel):
@@ -52,6 +56,9 @@ class VendorOffer(BaseModel):
     source: Optional[str] = Field(default="v2_fallback", description="Source of merge decision: llm_label or v2_fallback")
     price_updated_at: Optional[str] = Field(None, description="UTC timestamp of the last live price/stock fetch for this offer")
     price_source: Optional[str] = Field(None, description="'live' if fetched from the vendor, 'cache' if served from the local catalog")
+    price_note: Optional[str] = Field(
+        None, description="Human-readable note about the price basis (e.g. GST included)"
+    )
 
 class ComparisonGroup(BaseModel):
     """Side-by-side comparison for identical or matching components across vendors."""
@@ -109,6 +116,15 @@ class SearchResponse(BaseModel):
     price_refresh: Optional[PriceStockRefreshInfo] = Field(
         None, description="Outcome of the search-time price/stock refresh (live vs cached fallback)"
     )
+    # Group-level pagination. `total_results` counts matching listings; these
+    # fields describe the page of comparison cards actually returned.
+    page: int = Field(1, description="1-based page number of comparison groups")
+    page_size: int = Field(20, description="Comparison groups requested per page")
+    total_groups: int = Field(0, description="Comparison groups ranked in the current candidate pool")
+    total_pages: int = Field(0, description="Pages available in the current candidate pool")
+    returned_results: int = Field(0, description="Listings included in this page's groups")
+    has_next: bool = Field(False, description="True when another page can be fetched")
+    has_prev: bool = Field(False, description="True when this is not the first page")
 
 
 class ScrapeState(BaseModel):

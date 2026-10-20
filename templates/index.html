@@ -265,6 +265,15 @@
 
           <div data-state="results" hidden>
             <div id="cards-container"></div>
+            <nav class="pager" data-pager aria-label="Search result pages" hidden>
+              <button type="button" class="btn btn--sm" data-page-prev>
+                {{ icon("chevron-left", 14) }} Previous
+              </button>
+              <span class="pager__status" data-page-status>Page 1</span>
+              <button type="button" class="btn btn--sm" data-page-next>
+                Next {{ icon("chevron-right", 14) }}
+              </button>
+            </nav>
           </div>
         </div>
 
@@ -282,6 +291,7 @@
   "category": {{ (category or "") | tojson }},
   "vendor": {{ (vendor or "") | tojson }},
   "inStock": {{ (in_stock or false) | tojson }},
+  "page": {{ (page or 1) | tojson }},
   "categories": {{ categories | tojson }},
   "vendors": {{ vendors | tojson }},
   "autoSearch": {{ has_results | tojson }}

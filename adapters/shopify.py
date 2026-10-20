@@ -16,11 +16,32 @@ logger = logging.getLogger(__name__)
 class ShopifyAdapter(BaseAdapter):
     """Adapter for Shopify-powered electronic stores (QuartzComponents, MakerBazar)."""
 
-    def __init__(self, vendor_id: str, vendor_name: str, base_url: str):
+    def __init__(
+        self,
+        vendor_id: str,
+        vendor_name: str,
+        base_url: str,
+        gst_rate: float = 0.0,
+    ):
         self._vendor_id = vendor_id
         self._vendor_name = vendor_name
         self._base_url = base_url.rstrip("/")
+        self._gst_rate = max(0.0, float(gst_rate or 0.0))
         self._session: Optional[AsyncSession] = None
+
+    def _with_gst(self, base_price: float) -> float:
+        """Convert an ex-GST catalogue price to the tax-inclusive price."""
+        if base_price <= 0 or self._gst_rate <= 0:
+            return base_price
+        return round(base_price * (1.0 + self._gst_rate), 2)
+
+    def _price_note(self, base_price: float) -> Optional[str]:
+        if base_price <= 0 or self._gst_rate <= 0:
+            return None
+        return (
+            f"₹{base_price:,.2f} + {self._gst_rate * 100:.0f}% GST "
+            f"(tax-inclusive price shown)"
+        )
 
     @property
     def vendor_id(self) -> str:
@@ -123,9 +144,10 @@ class ShopifyAdapter(BaseAdapter):
 
                 price_raw = v0.get("price")
                 try:
-                    price = float(price_raw) if price_raw is not None else 0.0
+                    price_ex_gst = float(price_raw) if price_raw is not None else 0.0
                 except (ValueError, TypeError):
-                    price = 0.0
+                    price_ex_gst = 0.0
+                price = self._with_gst(price_ex_gst)
 
                 available = bool(v0.get("available", False))
                 sku = v0.get("sku")
@@ -154,10 +176,13 @@ class ShopifyAdapter(BaseAdapter):
                     product_url=product_url,
                     image_url=image_url,
                     category=category,
+                    price_note=self._price_note(price_ex_gst),
                     extra={
                         "handle": handle,
                         "variants_count": len(variants),
-                        "tags": item.get("tags", [])
+                        "tags": item.get("tags", []),
+                        "price_ex_gst": price_ex_gst,
+                        "gst_rate": self._gst_rate,
                     }
                 )
                 products.append(prod)
@@ -199,9 +224,10 @@ class ShopifyAdapter(BaseAdapter):
 
                 price_raw = item.get("price")
                 try:
-                    price = float(price_raw) if price_raw is not None else 0.0
+                    price_ex_gst = float(price_raw) if price_raw is not None else 0.0
                 except (ValueError, TypeError):
-                    price = 0.0
+                    price_ex_gst = 0.0
+                price = self._with_gst(price_ex_gst)
 
                 available = bool(item.get("available", True))
                 handle = item.get("handle") or ""
@@ -235,7 +261,12 @@ class ShopifyAdapter(BaseAdapter):
                     product_url=product_url,
                     image_url=image_url,
                     category=item.get("type"),
-                    extra={"handle": handle}
+                    price_note=self._price_note(price_ex_gst),
+                    extra={
+                        "handle": handle,
+                        "price_ex_gst": price_ex_gst,
+                        "gst_rate": self._gst_rate,
+                    }
                 )
                 products.append(prod)
             except Exception as e:
