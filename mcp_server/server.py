@@ -195,8 +195,16 @@ class ToolResponseEnvelope(BaseModel):
         ),
     )
 
+_description_schema_ready = False
+
+
 def get_db() -> sqlite3.Connection:
-    return db.get_db_connection()
+    global _description_schema_ready
+    conn = db.get_db_connection()
+    if not _description_schema_ready:
+        db.ensure_description_schema(conn)
+        _description_schema_ready = True
+    return conn
 
 def make_response(
     data: Any,
@@ -815,12 +823,16 @@ def describe_catalog() -> ToolResponseEnvelope:
                 ],
             })
 
+        vendor_spec_stats = db.description_stats()
         data = {
             "total_products": total_products,
             "counts": {
                 "products": total_products,
                 "spec_rows": cur.execute("SELECT COUNT(1) FROM product_specs;").fetchone()[0],
                 "spec_keys_advertised": len(spec_keys_list),
+                "vendor_attribute_rows": vendor_spec_stats["attribute_rows"],
+                "products_with_vendor_attributes": vendor_spec_stats["products_with_attributes"],
+                "products_with_descriptions": vendor_spec_stats["descriptions"],
             },
             "products_by_vendor": products_by_vendor,
             "products_by_spec_category": products_by_spec_category,
@@ -1184,6 +1196,10 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
     attribute-less categories, 'specs_not_extracted' is empty (never every catalog key), and
     'raw_attributes' / 'description' are the authoritative details.
 
+    'vendor_specs' is the much larger free-form attribute set parsed from the vendor's
+    description table/list (tolerance, package, dielectric, dimensions, ...). It is the
+    layer to use for fit questions when the taxonomy has no filter for that field.
+
     Behavior When No Matches: Returns ok:false with error_code='product_not_found' if the product ID does not exist in the catalog.
     """
     conn = get_db()
@@ -1288,13 +1304,19 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
             spec_extraction_scope = "unclassified"
             specs_not_extracted = []
 
-        if raw_meta.get("body"):
+        stored_description = db.get_product_description(product_id)
+        if stored_description and stored_description.get("description"):
+            description = stored_description["description"]
+            description_source = f"vendor_page:{stored_description.get('source') or 'stored'}"
+        elif raw_meta.get("body"):
             description, description_source = raw_meta["body"], "vendor_page"
         elif raw_meta.get("short_description"):
             description, description_source = raw_meta["short_description"], "vendor_page_short"
         else:
             # Never present the title as if it were a description.
             description, description_source = p.get("title"), "title_fallback"
+
+        vendor_specs = db.get_product_attributes(product_id)
 
         data = {
             "product_id": p["id"],
@@ -1324,6 +1346,8 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
             "specs": {key: str(value["value"]) for key, value in extracted_specs.items()},
             "spec_details": extracted_specs,
             "extracted_specs": extracted_specs,
+            "vendor_specs": vendor_specs,
+            "vendor_spec_count": len(vendor_specs),
             "specs_not_extracted": specs_not_extracted,
             "spec_extraction_method": spec_extraction_method,
             "vendor_offers": offers,
@@ -1842,6 +1866,7 @@ def search_components(
                     rows = [row_by_id[i] for i in page_ids if i in row_by_id]
 
         ids = [r["id"] for r in rows]
+        attribute_counts = db.get_attribute_counts(ids)
         result_spec_counts: Dict[str, int] = {}
         if ids:
             placeholders = ", ".join(["?"] * len(ids))
@@ -1924,6 +1949,7 @@ def search_components(
                 "vendor_sku": r["sku"],
                 "product_url": r["product_url"],
                 "specs": specs,
+                "vendor_spec_count": attribute_counts.get(pid, 0),
                 "specs_not_extracted": specs_not_extracted,
                 "low_confidence_specs": low_confidence_specs,
             })
@@ -2318,6 +2344,7 @@ def search_by_mpn(
             )
             for pid, spec_key, spec_value in cur.fetchall():
                 specs_by_product.setdefault(pid, {})[spec_key] = spec_value
+        attribute_counts = db.get_attribute_counts([r["id"] for r in rows]) if rows else {}
 
         listings = [
             {
@@ -2336,6 +2363,7 @@ def search_by_mpn(
                 "mpn": r["mpn"],
                 "category": r["category"],
                 "specs": specs_by_product.get(r["id"], {}),
+                "vendor_spec_count": attribute_counts.get(r["id"], 0),
             }
             for r in rows
         ]

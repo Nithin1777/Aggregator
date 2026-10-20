@@ -121,6 +121,42 @@ def _ensure_price_stock_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_description_schema(conn: sqlite3.Connection) -> None:
+    """
+    Vendor descriptions and the free-form attributes extracted from them.
+
+    `product_specs` stays the taxonomy-filterable layer. Vendor tables often
+    carry dozens of attributes the taxonomy does not define yet (tolerance,
+    package, dielectric, interface, ...); they live here so agents can answer
+    fit questions without waiting for a taxonomy migration.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS product_descriptions (
+            product_id INTEGER PRIMARY KEY,
+            description TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'vendor_page',
+            fetched_at TEXT
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS product_attributes (
+            product_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            label TEXT,
+            value TEXT NOT NULL,
+            value_num REAL,
+            unit TEXT,
+            source TEXT NOT NULL DEFAULT 'description_table',
+            confidence REAL DEFAULT 1.0,
+            PRIMARY KEY (product_id, key)
+        );
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_product_attributes_key "
+        "ON product_attributes(key);"
+    )
+
+
 def _ensure_category_schema(conn: sqlite3.Connection) -> None:
     """
     Idempotently adds the canonical category layer.
@@ -227,6 +263,9 @@ def init_db():
 
             # 2b. Canonical category layer (user facing taxonomy + facets)
             _ensure_category_schema(conn)
+
+            # 2c. Vendor descriptions and free-form attributes
+            _ensure_description_schema(conn)
 
             # 2b. Variant families table for Option B
             conn.execute("""
@@ -446,6 +485,172 @@ def upsert_products(products: List[UnifiedProduct]) -> int:
     finally:
         conn.close()
     return count
+
+def ensure_description_schema(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Creates product_descriptions/product_attributes if an older DB lacks them."""
+    own = conn is None
+    conn = conn or get_db_connection()
+    try:
+        with conn:
+            _ensure_description_schema(conn)
+    finally:
+        if own:
+            conn.close()
+
+
+def save_product_description(
+    product_id: int,
+    description: str,
+    source: str = "vendor_page",
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Stores the cleaned vendor description (idempotent per product)."""
+    own = conn is None
+    conn = conn or get_db_connection()
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO product_descriptions (product_id, description, source, fetched_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(product_id) DO UPDATE SET
+                    description = excluded.description,
+                    source = excluded.source,
+                    fetched_at = excluded.fetched_at;
+                """,
+                (int(product_id), description or "", source, utc_now_iso()),
+            )
+    finally:
+        if own:
+            conn.close()
+
+
+def get_product_description(product_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT description, source, fetched_at FROM product_descriptions WHERE product_id = ?;",
+            (int(product_id),),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "description": row[0],
+            "source": row[1],
+            "fetched_at": row[2],
+        }
+    finally:
+        conn.close()
+
+
+def replace_product_attributes(
+    product_id: int,
+    attributes: List[Dict[str, Any]],
+    source: str = "description",
+    conn: Optional[sqlite3.Connection] = None,
+) -> int:
+    """
+    Replaces the free-form attributes for one product. Idempotent.
+
+    `attributes` items use the `src.spec.description` shape:
+    key, label, value, value_num, unit, confidence.
+    """
+    own = conn is None
+    conn = conn or get_db_connection()
+    try:
+        with conn:
+            conn.execute(
+                "DELETE FROM product_attributes WHERE product_id = ?;",
+                (int(product_id),),
+            )
+            rows = [
+                (
+                    int(product_id),
+                    str(item["key"])[:80],
+                    str(item.get("label") or item["key"])[:120],
+                    str(item["value"])[:500],
+                    item.get("value_num"),
+                    item.get("unit"),
+                    item.get("source") or source,
+                    float(item.get("confidence", 1.0)),
+                )
+                for item in attributes
+                if item.get("key") and item.get("value") is not None
+            ]
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO product_attributes
+                        (product_id, key, label, value, value_num, unit, source, confidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    rows,
+                )
+            return len(rows)
+    finally:
+        if own:
+            conn.close()
+
+
+def get_product_attributes(product_id: int) -> Dict[str, Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT key, label, value, value_num, unit, source, confidence "
+            "FROM product_attributes WHERE product_id = ? ORDER BY key;",
+            (int(product_id),),
+        ).fetchall()
+        return {
+            row[0]: {
+                "label": row[1],
+                "value": row[2],
+                "value_num": row[3],
+                "unit": row[4],
+                "source": row[5],
+                "confidence": row[6],
+            }
+            for row in rows
+        }
+    finally:
+        conn.close()
+
+
+def get_attribute_counts(product_ids: List[int]) -> Dict[int, int]:
+    """Number of vendor attributes per product, for compact list payloads."""
+    if not product_ids:
+        return {}
+    placeholders = ", ".join(["?"] * len(product_ids))
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            f"SELECT product_id, COUNT(1) FROM product_attributes "
+            f"WHERE product_id IN ({placeholders}) GROUP BY product_id;",
+            list(product_ids),
+        ).fetchall()
+        return {int(r[0]): int(r[1]) for r in rows}
+    finally:
+        conn.close()
+
+
+def description_stats() -> Dict[str, int]:
+    conn = get_db_connection()
+    try:
+        return {
+            "descriptions": int(
+                conn.execute("SELECT COUNT(1) FROM product_descriptions;").fetchone()[0]
+            ),
+            "attribute_rows": int(
+                conn.execute("SELECT COUNT(1) FROM product_attributes;").fetchone()[0]
+            ),
+            "products_with_attributes": int(
+                conn.execute(
+                    "SELECT COUNT(DISTINCT product_id) FROM product_attributes;"
+                ).fetchone()[0]
+            ),
+        }
+    finally:
+        conn.close()
+
 
 def row_to_unified_product(row: sqlite3.Row) -> UnifiedProduct:
     """Maps a `products` row (including optional refresh columns) to UnifiedProduct."""

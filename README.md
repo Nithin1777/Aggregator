@@ -411,6 +411,35 @@ of all nine catalog keys. The web equivalents are the same filters through `sour
 pagination uses `next_cursor` (with `stale_cursor` protection), and a miss returns
 `data.suggested_mpns` (closest catalog part numbers) instead of a dead end.
 
+### Vendor descriptions and free-form specs
+
+The taxonomy only defines attributes for a few categories. Vendor descriptions carry far more:
+QuartzComponents and MakerBazar publish two-column `Specification | Value` tables (resistance,
+tolerance, dielectric, package, dimensions, ...), and REES52/Robokits publish prose specs.
+
+`scripts/backfill_descriptions.py` stores those descriptions in `product_descriptions` and parses
+the tables/lists into `product_attributes`. The curated, filterable layer stays in
+`product_specs`; `vendor_specs` is the larger free-form layer returned by `get_product`.
+
+```powershell
+# Shopify: quartzcomponents, makerbazar, rees52 (fast, ~75 catalog pages)
+python scripts/backfill_descriptions.py --vendors quartzcomponents,makerbazar,rees52
+
+# Robokits product pages (one request per product)
+python scripts/backfill_descriptions.py --vendors robokits --limit 100
+
+# Robu is Cloudflare-protected; 403s are skipped, so run it where the IP is allowed
+python scripts/backfill_descriptions.py --vendors robu --limit 50
+
+# Inspect without writing
+python scripts/backfill_descriptions.py --vendors quartzcomponents --limit 5 --dry-run
+```
+
+The script is idempotent (existing descriptions are skipped unless `--force`). `describe_catalog`
+reports `products_with_descriptions`, `products_with_vendor_attributes` and
+`vendor_attribute_rows`; `get_product` returns `vendor_specs` plus a real `description`
+instead of falling back to the title.
+
 ### Keeping the taxonomy current
 
 Filterable attributes are defined in `config/taxonomy.yaml` and `config/extractors.yaml`. After
