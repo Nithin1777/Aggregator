@@ -320,11 +320,31 @@ shows what was actually searched.
 ### Component categories
 
 `search_components`, `count_components` (and the web search) accept a `category` filter —
-`battery`, `motor`, `relay`, or any value in `describe_catalog` →
-`counts.products_by_spec_category`. Within a category, genuine components rank above
-bundles/chargers/kits that merely mention the category word (ranking prefers products that carry
-the category's extracted specs). Unknown categories return `error_code: "unknown_category"` with
-the valid list.
+`battery`, `motor`, `relay`, or any taxonomy category (see `describe_catalog` → `data.taxonomy`).
+The name is case-insensitive and plural tolerant (`Motor`, `motors` → `motor`); a typo returns
+`error_code: "unknown_category"` with ranked nearest categories (`motr` → `motor`).
+
+A filter key must be valid **for that category**. Asking for `chemistry` under `category="motor"`
+is not an empty result — it returns `error_code: "filter_not_applicable_to_category"` with the
+keys that do apply. Categories with no attributes (for example `resistors` today) return
+`filter_support: "none"` instead of silently returning zero rows.
+
+### Request validation and diagnosis
+
+Every empty/rejected result carries a single `diagnosis` object, so an agent branches on
+`diagnosis.reason` instead of inferring intent from a warning string:
+
+```json
+{"ok": false, "error_code": "filter_not_applicable_to_category",
+ "diagnosis": {"reason": "filter_not_applicable_to_category", "category": "motor",
+               "not_applicable_keys": ["chemistry"],
+               "applicable_keys": ["current_a", "rpm", "torque_kgcm", "voltage"],
+               "filter_support": "partial"}}
+```
+
+Numeric keys reject non-numeric values (`rpm: "abc"` → `invalid_filter_value`) instead of
+returning a confident zero. `tolerance` is a fraction of `eq` (`0.05` = ±5%) and must be
+`0 < tolerance <= 1`; `tolerance: 5` is rejected. `price_max` must be `>= 0`.
 
 ### Fit filtering (will this part work for my need?)
 

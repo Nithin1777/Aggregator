@@ -10,6 +10,7 @@ import difflib
 import hashlib
 import json
 import logging
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -38,13 +39,15 @@ from src.spec.filters import (
     load_catalog_specs as _load_catalog_specs,
     normalize_scalar,
     parse_and_validate_filters,
+    resolve_category,
+    validate_filter_scope,
 )
 from src.spec.taxonomy_loader import get_taxonomy
 
 logger = logging.getLogger(__name__)
 
-SERVER_VERSION = "1.7.0"
-SCHEMA_VERSION = "1.6.0"
+SERVER_VERSION = "1.8.0"
+SCHEMA_VERSION = "1.7.0"
 
 # Hard ceiling on page size. An agent asking for 1000 rows is almost always
 # paginating by accident, and a negative limit becomes SQL `LIMIT -1` (= no limit).
@@ -174,6 +177,13 @@ class ToolResponseEnvelope(BaseModel):
     valid_keys: Optional[List[str]] = Field(None, description="List of valid queryable spec keys")
     suggestions: Optional[List[Dict[str, Any]]] = Field(None, description="Suggested keys, values, or operator fixes")
     details: Optional[Dict[str, Any]] = Field(None, description="Additional context or debugging info")
+    diagnosis: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Single machine-readable explanation for an empty, rejected, or low-confidence result. "
+            "Branch on diagnosis.reason instead of inferring from warnings."
+        ),
+    )
 
 def get_db() -> sqlite3.Connection:
     return db.get_db_connection()
@@ -187,6 +197,7 @@ def make_response(
     filters_applied: Optional[Dict[str, Any]] = None,
     coverage: Optional[Dict[str, Any]] = None,
     warnings: Optional[List[Dict[str, Any]]] = None,
+    diagnosis: Optional[Dict[str, Any]] = None,
 ) -> ToolResponseEnvelope:
     """Builds a successful uniform response envelope."""
     payload = {
@@ -199,6 +210,7 @@ def make_response(
         "filters_applied": filters_applied or {},
         "coverage": coverage or {},
         "warnings": warnings or [],
+        "diagnosis": diagnosis,
         "server_version": SERVER_VERSION,
         "schema_version": SCHEMA_VERSION,
     }
@@ -210,6 +222,7 @@ def make_error(
     valid_keys: Optional[List[str]] = None,
     suggestions: Optional[List[Dict[str, Any]]] = None,
     details: Optional[Dict[str, Any]] = None,
+    diagnosis: Optional[Dict[str, Any]] = None,
 ) -> ToolResponseEnvelope:
     """Builds a structured error envelope without throwing bare ValueErrors."""
     payload = {
@@ -219,6 +232,7 @@ def make_error(
         "valid_keys": valid_keys,
         "suggestions": suggestions or [],
         "details": details or {},
+        "diagnosis": diagnosis or {"reason": error_code, **(details or {})},
         "server_version": SERVER_VERSION,
     }
     return ToolResponseEnvelope(**payload)
@@ -277,8 +291,16 @@ def _enum_suggestions(key: str, spec_meta: Dict[str, Any], requested: Any, limit
 def _enum_filter_suggestions(
     norm_filters: Optional[Dict[str, Any]],
     catalog_specs: Dict[str, Dict[str, Any]],
+    conn: Optional[sqlite3.Connection] = None,
+    category: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Closest populated enum values for every unmatched-filter key (not just the last one)."""
+    """
+    Closest populated enum values for every unmatched-filter key.
+
+    When a category is supplied, suggestions come from that category's observed
+    values (spec_stats), not from the global distribution: suggesting `lipo` to a
+    motor query is worse than suggesting nothing.
+    """
     suggestions: List[Dict[str, Any]] = []
     for fk in (norm_filters or {}):
         if catalog_specs[fk]["type"] != "enum":
@@ -286,7 +308,23 @@ def _enum_filter_suggestions(
         requested = norm_filters[fk]
         if isinstance(requested, dict):
             requested = requested.get("eq", requested.get("in"))
-        suggestions.extend(_enum_suggestions(fk, catalog_specs[fk], requested))
+
+        meta = catalog_specs[fk]
+        if conn is not None and category:
+            row = conn.execute(
+                "SELECT value_counts FROM spec_stats WHERE category = ? AND key = ?;",
+                (category, fk),
+            ).fetchone()
+            scoped = None
+            if row and row[0]:
+                try:
+                    scoped = json.loads(row[0])
+                except (TypeError, ValueError):
+                    scoped = None
+            if scoped:
+                meta = {**meta, "value_counts": scoped}
+
+        suggestions.extend(_enum_suggestions(fk, meta, requested))
     return suggestions
 
 
@@ -358,6 +396,10 @@ def _parse_and_validate_filters(
         valid_keys=error.get("valid_keys"),
         suggestions=error.get("suggestions"),
         details=error.get("details"),
+        diagnosis={
+            "reason": error["error_code"],
+            **(error.get("details") or {}),
+        },
     )
 
 
@@ -378,6 +420,71 @@ def _category_spec_keys(conn: sqlite3.Connection, category: str) -> List[str]:
         (category,),
     ).fetchall()
     return [str(r[0]) for r in rows]
+
+
+def _resolve_category_or_error(
+    conn: sqlite3.Connection,
+    category: Optional[str],
+) -> Tuple[Optional[str], Optional[ToolResponseEnvelope]]:
+    """
+    Resolves a category name (case/plural/typo tolerant) or returns a structured error.
+
+    The previous implementation did an exact lower-case membership check and then
+    suggested the first ten categories alphabetically, so 'motors' failed and
+    'motr' never suggested 'motor'.
+    """
+    if category is None or not str(category).strip():
+        return None, None
+
+    valid_categories = _valid_categories(conn)
+    resolved, suggestions = resolve_category(category, valid_categories)
+    if resolved is not None:
+        return resolved, None
+
+    return None, make_error(
+        error_code="unknown_category",
+        message=(
+            f"Component category '{category}' is not present in the catalog. "
+            f"Closest valid categories: {suggestions}."
+        ),
+        suggestions=[{"category": c} for c in suggestions],
+        details={"valid_categories": valid_categories},
+        diagnosis={
+            "reason": "unknown_category",
+            "provided_category": str(category),
+            "nearest_categories": suggestions,
+        },
+    )
+
+
+def _validate_price_max(price_max: Optional[float]) -> Tuple[Optional[float], Optional[ToolResponseEnvelope]]:
+    """Rejects negative / non-finite budgets instead of silently turning them into 0 matches."""
+    if price_max is None:
+        return None, None
+    try:
+        value = float(price_max)
+    except (TypeError, ValueError):
+        return None, make_error(
+            error_code="invalid_filter_value",
+            message=f"price_max must be a number in INR; got {price_max!r}.",
+            suggestions=[{"price_max": 500}],
+            details={"key": "price_max", "provided_value": price_max},
+        )
+    if not math.isfinite(value) or value < 0:
+        return None, make_error(
+            error_code="invalid_filter_value",
+            message=f"price_max must be a finite number >= 0; got {price_max!r}.",
+            suggestions=[{"price_max": 500}],
+            details={"key": "price_max", "provided_value": price_max, "expected": ">= 0"},
+        )
+    return value, None
+
+
+def _category_filter_support(conn: sqlite3.Connection, category: Optional[str]) -> str:
+    """'none' | 'partial' for the requested category's filterable attributes."""
+    if not category:
+        return "unknown"
+    return "partial" if _category_spec_keys(conn, category) else "none"
 
 
 def _applicable_spec_keys(conn: sqlite3.Connection) -> Dict[str, List[str]]:
@@ -735,11 +842,13 @@ def count_components(
     Recommended Call Order: Call after describe_catalog and before search_components to size query results and verify filter coverage.
 
     Parameter Syntax:
-      - filters: dict (supports scalar equality or operators in, gte, lte, gt, lt, eq, tolerance, default: null)
+      - filters: dict (supports scalar equality or operators in, gte, lte, gt, lt, eq, tolerance;
+        tolerance is a fraction of eq: 0.05 means +/-5%, must be > 0 and <= 1. Default: null)
       - query: str (FTS text search string, default: null)
-      - price_max: float (maximum price in INR, default: null)
+      - price_max: float (maximum price in INR, must be >= 0; default: null)
       - in_stock_only: bool (default: false)
-      - category: str (restrict to a catalog category such as 'battery', 'motor', 'resistors'; see describe_catalog data.taxonomy, default: null)
+      - category: str (restrict to a catalog category such as 'battery', 'motor', 'resistors';
+        case-insensitive, plural tolerant; see describe_catalog data.taxonomy, default: null)
 
     Natural-Language Queries: phrases like "battery to power an arduino" are handled by dropping
     filler words and relaxing an all-terms match to an any-term match when needed; warnings report it.
@@ -757,27 +866,31 @@ def count_components(
         cur.execute("SELECT COUNT(1) FROM products;")
         total_products = cur.fetchone()[0]
 
+        price_max_norm, price_err = _validate_price_max(price_max)
+        if price_err:
+            return price_err
+
         catalog_specs = _load_catalog_specs(conn)
         norm_filters, err = _parse_and_validate_filters(filters, catalog_specs)
         if err:
             return err
 
-        category_norm: Optional[str] = None
-        require_spec_scope = False
-        if category is not None and str(category).strip():
-            category_norm = str(category).strip().lower()
-            valid_categories = _valid_categories(conn)
-            if category_norm not in valid_categories:
-                return make_error(
-                    error_code="unknown_category",
-                    message=f"Component category '{category}' is not present in the catalog.",
-                    suggestions=[{"category": c} for c in valid_categories[:10]],
-                    details={"valid_categories": valid_categories},
-                )
-            # Categories with filterable attributes keep their original scope:
-            # only products whose specs were extracted for that category match.
-            require_spec_scope = bool(_category_spec_keys(conn, category_norm))
+        category_norm, category_err = _resolve_category_or_error(conn, category)
+        if category_err:
+            return category_err
 
+        category_keys = _category_spec_keys(conn, category_norm) if category_norm else []
+        scope_error = validate_filter_scope(norm_filters or {}, category_norm, category_keys)
+        if scope_error:
+            return make_error(
+                error_code=scope_error["error_code"],
+                message=scope_error["message"],
+                suggestions=scope_error.get("suggestions"),
+                details=scope_error.get("details"),
+                diagnosis={"reason": scope_error["error_code"], **(scope_error.get("details") or {})},
+            )
+
+        require_spec_scope = bool(category_keys)
 
         if query is not None and not str(query).strip():
             return make_error(
@@ -798,7 +911,9 @@ def count_components(
                 catalog_specs, total_products, norm_filters or {}, 0
             )
             warnings.extend(query_plan.warnings)
-            suggestions = _enum_filter_suggestions(norm_filters, catalog_specs)
+            suggestions = _enum_filter_suggestions(
+                norm_filters, catalog_specs, conn=conn, category=category_norm
+            )
             if suggestions:
                 warnings.append({
                     "code": "filter_value_not_present",
@@ -816,12 +931,18 @@ def count_components(
                     "filters": norm_filters or {},
                     "query": (query or "").strip() or None,
                     "query_effective": query_plan.effective_query,
-                    "price_max": price_max,
+                    "price_max": price_max_norm,
                     "in_stock_only": bool(in_stock_only),
                     "category": category_norm,
+                    "filter_support": _category_filter_support(conn, category_norm),
                 },
                 coverage=coverage,
-                warnings=warnings
+                warnings=warnings,
+                diagnosis={
+                    "reason": "query_unresolved",
+                    "query": (query or "").strip(),
+                    "query_suggestions": query_plan.suggestions,
+                },
             )
 
         count_sql, params, _, _ = _build_sql_query(
@@ -829,7 +950,7 @@ def count_components(
             catalog_specs,
             fts_tokens=(query_plan.effective_tokens if query_plan else None),
             fts_relaxed=(query_plan.is_relaxed if query_plan else False),
-            price_max=price_max,
+            price_max=price_max_norm,
             in_stock_only=in_stock_only,
             category=category_norm,
             require_spec_scope=require_spec_scope
@@ -842,13 +963,40 @@ def count_components(
         )
 
         suggestions: List[Dict[str, Any]] = []
+        diagnosis: Optional[Dict[str, Any]] = None
         if total_count == 0 and norm_filters:
-            suggestions.extend(_enum_filter_suggestions(norm_filters, catalog_specs))
+            suggestions.extend(
+                _enum_filter_suggestions(
+                    norm_filters, catalog_specs, conn=conn, category=category_norm
+                )
+            )
             if suggestions:
                 warnings.append({
                     "code": "filter_value_not_present",
                     "message": "Filter matched 0 catalog rows; see data.suggestions for the closest populated values."
                 })
+                diagnosis = {
+                    "reason": "filter_value_not_present",
+                    "filters": norm_filters or {},
+                    "category": category_norm,
+                }
+            else:
+                diagnosis = {
+                    "reason": "no_matching_filter_combination",
+                    "filters": norm_filters or {},
+                    "category": category_norm,
+                    "hint": (
+                        "Each key is valid for this category, but no product carries a value "
+                        "matching all filters at once. Relax one bound or remove a key."
+                    ),
+                }
+        elif total_count == 0:
+            diagnosis = {
+                "reason": "no_catalog_match",
+                "query": (query or "").strip() or None,
+                "filters": norm_filters or {},
+                "category": category_norm,
+            }
 
         if query_plan is not None:
             warnings.extend(query_plan.warnings)
@@ -856,9 +1004,10 @@ def count_components(
         filters_applied = {
             "filters": norm_filters or {},
             "query": (query or "").strip() or None,
-            "price_max": price_max,
+            "price_max": price_max_norm,
             "in_stock_only": bool(in_stock_only),
             "category": category_norm,
+            "filter_support": _category_filter_support(conn, category_norm),
         }
         if query_plan is not None and query_plan.resolved:
             original = (query or "").strip()
@@ -871,7 +1020,8 @@ def count_components(
             returned=0,
             filters_applied=filters_applied,
             coverage=coverage,
-            warnings=warnings
+            warnings=warnings,
+            diagnosis=diagnosis,
         )
     finally:
         conn.close()
@@ -1060,16 +1210,18 @@ def search_components(
     Recommended Call Order: Call after sizing the query with count_components to retrieve paginated component comparison cards.
 
     Parameter Syntax:
-      - filters: dict (supports scalar equality or operators in, gte, lte, gt, lt, eq, tolerance, default: null)
+      - filters: dict (supports scalar equality or operators in, gte, lte, gt, lt, eq, tolerance;
+        tolerance is a fraction of eq: 0.05 means +/-5%, must be > 0 and <= 1. Default: null)
       - query: str (FTS query string, default: null)
-      - price_max: float (max price in INR, default: null)
+      - price_max: float (max price in INR, must be >= 0; default: null)
       - in_stock_only: bool (default: false; listings flag out-of-stock rather than silently omitting)
       - sort: str (one of 'relevance', 'price_asc', 'price_desc', default: 'relevance')
       - limit: int (page size, 1 to 50 inclusive; values >50 are clamped with a warning, <1 is rejected, default: 10)
       - cursor: str (opaque cursor from previous page's next_cursor; bound to the query, default: null)
       - refresh: bool (default: true; verify price/stock live before returning, TTL-aware)
       - force_refresh: bool (default: false; bypass the refresh TTL to re-verify now)
-      - category: str (restrict to a catalog category, e.g. 'battery', 'motor', 'resistors'; see describe_catalog data.taxonomy, default: null)
+      - category: str (restrict to a catalog category, e.g. 'battery', 'motor', 'resistors';
+        case-insensitive, plural tolerant; see describe_catalog data.taxonomy, default: null)
 
     Natural-Language Queries: phrases like "battery to power an arduino for 8 hours" are
     understood: filler words are dropped, an all-terms match is relaxed to an any-term match
@@ -1098,7 +1250,7 @@ def search_components(
     rank-ordered suggestions if an enum value was unmatched (data.query_suggestions when the text
     query itself could be misspelled) — never an error.
     Errors: unknown_filter_key, unknown_category, unsupported_operator, operator_not_supported_for_type,
-    invalid_filter_value, empty_query, invalid_cursor, stale_cursor.
+    invalid_filter_value, filter_not_applicable_to_category, empty_query, invalid_cursor, stale_cursor.
     """
     if sort not in ("relevance", "price_asc", "price_desc"):
         return make_error(
@@ -1152,6 +1304,10 @@ def search_components(
         cur.execute("SELECT COUNT(1) FROM products;")
         total_products = cur.fetchone()[0]
 
+        price_max_norm, price_err = _validate_price_max(price_max)
+        if price_err:
+            return price_err
+
         catalog_specs = _load_catalog_specs(conn)
         all_catalog_keys = sorted(catalog_specs.keys())
 
@@ -1159,22 +1315,22 @@ def search_components(
         if err:
             return err
 
-        category_norm: Optional[str] = None
-        require_spec_scope = False
-        if category is not None and str(category).strip():
-            category_norm = str(category).strip().lower()
-            valid_categories = _valid_categories(conn)
-            if category_norm not in valid_categories:
-                return make_error(
-                    error_code="unknown_category",
-                    message=f"Component category '{category}' is not present in the catalog.",
-                    suggestions=[{"category": c} for c in valid_categories[:10]],
-                    details={"valid_categories": valid_categories},
-                )
-            # Categories with filterable attributes keep their original scope:
-            # only products whose specs were extracted for that category match.
-            require_spec_scope = bool(_category_spec_keys(conn, category_norm))
+        category_norm, category_err = _resolve_category_or_error(conn, category)
+        if category_err:
+            return category_err
 
+        category_keys = _category_spec_keys(conn, category_norm) if category_norm else []
+        scope_error = validate_filter_scope(norm_filters or {}, category_norm, category_keys)
+        if scope_error:
+            return make_error(
+                error_code=scope_error["error_code"],
+                message=scope_error["message"],
+                suggestions=scope_error.get("suggestions"),
+                details=scope_error.get("details"),
+                diagnosis={"reason": scope_error["error_code"], **(scope_error.get("details") or {})},
+            )
+
+        require_spec_scope = bool(category_keys)
 
         # --- query understanding: stop words, typo correction, AND -> OR relaxation ---
         query_plan: Optional[QueryPlan] = None
@@ -1184,7 +1340,7 @@ def search_components(
 
         # --- cursor is bound to the query that produced it ---
         fingerprint = _query_fingerprint(
-            norm_filters, effective_query, price_max, in_stock_only, sort, category_norm
+            norm_filters, effective_query, price_max_norm, in_stock_only, sort, category_norm
         )
         offset = 0
         if cursor:
@@ -1217,9 +1373,10 @@ def search_components(
         filters_applied = {
             "filters": norm_filters or {},
             "query": (query or "").strip() or None,
-            "price_max": price_max,
+            "price_max": price_max_norm,
             "in_stock_only": bool(in_stock_only),
             "category": category_norm,
+            "filter_support": _category_filter_support(conn, category_norm),
             "sort": sort,
             "limit": effective_limit,
             "offset": offset,
@@ -1235,7 +1392,9 @@ def search_components(
             # Nothing in the index resembles the query: do NOT silently drop the
             # text filter (that would return the whole catalog). Guide instead.
             warnings.extend(query_plan.warnings)
-            suggestions = _enum_filter_suggestions(norm_filters, catalog_specs)
+            suggestions = _enum_filter_suggestions(
+                norm_filters, catalog_specs, conn=conn, category=category_norm
+            )
             if suggestions:
                 warnings.append({
                     "code": "filter_value_not_present",
@@ -1256,7 +1415,12 @@ def search_components(
                 coverage=_build_coverage_and_warnings(
                     catalog_specs, total_products, norm_filters or {}, 0
                 )[0],
-                warnings=warnings
+                warnings=warnings,
+                diagnosis={
+                    "reason": "query_unresolved",
+                    "query": (query or "").strip(),
+                    "query_suggestions": query_plan.suggestions,
+                },
             )
 
         active_category_keys = _category_spec_keys(conn, category_norm) if category_norm else None
@@ -1265,7 +1429,7 @@ def search_components(
             catalog_specs,
             fts_tokens=(query_plan.effective_tokens if query_plan else None),
             fts_relaxed=(query_plan.is_relaxed if query_plan else False),
-            price_max=price_max,
+            price_max=price_max_norm,
             in_stock_only=in_stock_only,
             category=category_norm,
             category_spec_keys=active_category_keys,
@@ -1287,12 +1451,29 @@ def search_components(
 
         if total_matches == 0:
             suggestions: List[Dict[str, Any]] = []
-            suggestions.extend(_enum_filter_suggestions(norm_filters, catalog_specs))
+            suggestions.extend(
+                _enum_filter_suggestions(
+                    norm_filters, catalog_specs, conn=conn, category=category_norm
+                )
+            )
+            diagnosis: Dict[str, Any]
             if suggestions:
                 warnings.append({
                     "code": "filter_value_not_present",
                     "message": "Filter value matched 0 catalog rows; see data.suggestions for the closest populated values."
                 })
+                diagnosis = {
+                    "reason": "filter_value_not_present",
+                    "filters": norm_filters or {},
+                    "category": category_norm,
+                }
+            else:
+                diagnosis = {
+                    "reason": "no_catalog_match",
+                    "query": (query or "").strip() or None,
+                    "filters": norm_filters or {},
+                    "category": category_norm,
+                }
             zero_data: Dict[str, Any] = {
                 "results": [],
                 "suggestions": suggestions,
@@ -1308,7 +1489,8 @@ def search_components(
                 next_cursor=None,
                 filters_applied=filters_applied,
                 coverage=coverage,
-                warnings=warnings
+                warnings=warnings,
+                diagnosis=diagnosis,
             )
 
         refresh_info: Optional[PriceStockRefreshInfo] = None
@@ -1329,7 +1511,7 @@ def search_components(
                 catalog_specs,
                 fts_tokens=query_plan.effective_tokens,
                 fts_relaxed=query_plan.is_relaxed,
-                price_max=price_max,
+                price_max=price_max_norm,
                 in_stock_only=in_stock_only,
                 category=category_norm,
                 category_spec_keys=active_category_keys,
