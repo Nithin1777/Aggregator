@@ -34,10 +34,10 @@ _INDUCTANCE_RE = re.compile(
     r"(?<![a-z0-9.])(\d+(?:\.\d+)?)\s*(uh|µh|mh|h)\b", re.IGNORECASE
 )
 _VOLTAGE_RE = re.compile(
-    r"(?<![\w.-])(\d+(?:\.\d+)?)\s*(?:v|vdc|vac)\b", re.IGNORECASE
+    r"(?<![\w.-])(\d+(?:\.\d+)?)\s*(mv|v|vdc|vac)\b", re.IGNORECASE
 )
 _CURRENT_RE = re.compile(
-    r"(?<![\w.-])(\d+(?:\.\d+)?)\s*(?:a|amp|amps)\b", re.IGNORECASE
+    r"(?<![\w.-])(\d+(?:\.\d+)?)\s*(ma|ua|a|amp|amps)\b", re.IGNORECASE
 )
 _POWER_RE = re.compile(
     r"(?<![\w.-])(\d+(?:\.\d+)?|\d+/\d+)\s*(?:w|watt|watts)\b", re.IGNORECASE
@@ -129,14 +129,23 @@ def extract_title_attributes(
     volt = _VOLTAGE_RE.search(text)
     if volt and not _RANGE_RE.search(text[max(0, volt.start() - 2): volt.end() + 2]):
         raw = _number(volt.group(1))
+        unit = (volt.group(2) or "v").lower()
         if raw is not None:
-            _add(out, "voltage", "Voltage", f"{raw:g} V", raw, "v")
+            value = raw / 1000.0 if unit == "mv" else raw
+            _add(out, "voltage", "Voltage", f"{value:g} V", value, "v")
 
     amp = _CURRENT_RE.search(text)
     if amp:
         raw = _number(amp.group(1))
+        unit = (amp.group(2) or "a").lower()
         if raw is not None:
-            _add(out, "current", "Current", f"{raw:g} A", raw, "a")
+            if unit == "ma":
+                value = raw / 1000.0
+            elif unit == "ua":
+                value = raw / 1_000_000.0
+            else:
+                value = raw
+            _add(out, "current", "Current", f"{value:g} A", value, "a")
 
     power = _POWER_RE.search(text)
     if power:

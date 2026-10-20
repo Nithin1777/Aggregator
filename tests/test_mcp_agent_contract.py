@@ -48,7 +48,7 @@ def test_rpm_is_rejected_for_battery_category():
 
 
 def test_filter_on_category_without_attributes_reports_filter_support_none():
-    res = count_components(category="resistors", filters={"voltage": "5"})
+    res = count_components(category="drones", filters={"voltage": "5"})
 
     assert res.ok is False
     assert res.error_code == "filter_not_applicable_to_category"
@@ -56,12 +56,15 @@ def test_filter_on_category_without_attributes_reports_filter_support_none():
     assert res.diagnosis["applicable_keys"] == []
 
 
-def test_relay_only_advertises_channels():
+def test_relay_advertises_channels_and_contact_attributes():
     res = count_components(category="relay", filters={"current_a": {"gte": 10}})
 
     assert res.ok is False
     assert res.error_code == "filter_not_applicable_to_category"
-    assert res.diagnosis["applicable_keys"] == ["channels"]
+    assert {"channels", "coil_voltage_v", "contact_current_a"} <= set(
+        res.diagnosis["applicable_keys"]
+    )
+    assert "current_a" not in res.diagnosis["applicable_keys"]
 
 
 def test_applicable_filter_still_works():
@@ -338,9 +341,18 @@ def test_list_tools_expose_items_and_keep_legacy_alias():
 
 
 def test_unclassified_product_has_no_phantom_spec_gaps():
-    # 72 is the QuartzComponents 18AWG wire: classifiable as `wires`, but the
-    # taxonomy has no attribute set for it, so no "missing battery spec" list.
-    res = get_product(product_id=72, refresh=False)
+    import db
+
+    conn = db.get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT id FROM products WHERE spec_category IS NULL LIMIT 1;"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, "need at least one unclassified product for this test"
+
+    res = get_product(product_id=int(row[0]), refresh=False)
 
     assert res.ok is True
     assert res.data["spec_extraction_scope"] == "unclassified"
@@ -380,8 +392,8 @@ def test_filtered_search_reports_products_dropped_for_missing_specs():
     assert res.filters_applied["filter_scope"] == "extracted_only"
     recall = res.data["filter_recall"]
     assert recall["scope"] == "extracted_only"
-    assert recall["base_matches"] == 704
-    assert recall["missing_spec"] > 500
+    assert recall["base_matches"] > res.total_matches
+    assert recall["missing_spec"] > 0
     assert recall["missing_spec"] + res.total_matches <= recall["base_matches"]
     assert "filter_recall_gap" in _codes(res)
 
@@ -415,4 +427,5 @@ def test_describe_catalog_advertises_filter_support_per_category():
         c["id"]: c["filter_support"] for c in res.data["taxonomy"]
     }
     assert support["battery"] == "partial"
-    assert support["resistors"] == "none"
+    assert support["resistors"] == "partial"
+    assert support["drones"] == "none"

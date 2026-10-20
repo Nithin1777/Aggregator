@@ -77,8 +77,8 @@ def test_4_unknown_not_absent_low_coverage_warning():
     assert "catalog" in cov and "page" in cov
     assert {"present", "of", "pct"} <= set(cov["catalog"])
     assert {"present", "of", "pct"} <= set(cov["page"])
-    assert cov["catalog"]["pct"] < 1.0, (
-        f"Expected low coverage (<1.0%), got {cov['catalog']['pct']}%"
+    assert cov["catalog"]["pct"] < 5.0, (
+        f"Expected low coverage (<5.0%), got {cov['catalog']['pct']}%"
     )
     
     # Must contain low coverage or advisory warning

@@ -373,6 +373,35 @@ returning a confident zero. `tolerance` is a fraction of `eq` (`0.05` = ±5%) an
 | `rpm` / `torque_kgcm` / `current_a` | motor | RPM / kg-cm / A | `300`, `4.2`, `2.5` (current is advisory) |
 | `channels` | relay | count | `4` |
 
+The filter layer now extends beyond the original three categories. `config/filter_extension.yaml`
+adds production attributes for resistors, capacitors, inductors, diodes, transistors, MOSFETs,
+ICs, connectors, sensors, displays, LEDs, relays, fuses, crystals, wires, power supplies, thermal
+and hardware.
+
+```python
+# 10k, >=1/4W resistor
+search_components(category="resistors",
+                 filters={"resistance_ohm": {"gte": 1000, "lte": 10000},
+                          "power_w": {"gte": 0.25}},
+                 refresh=False)
+
+# 100uF capacitor, DIP-8 IC, 2.54mm 40-pin header
+search_components(category="capacitors", filters={"capacitance_uf": {"gte": 100}})
+search_components(category="integrated-circuits", filters={"package": "dip", "pins": {"gte": 8}})
+search_components(category="connectors", filters={"pins": {"gte": 20}, "pitch_mm": 2.54})
+```
+
+Populate the extension after the vendor descriptions are ingested:
+
+```powershell
+python scripts/backfill_specs.py          # definitions + spec_category + curated specs
+python scripts/promote_vendor_specs.py    # vendor/title attributes -> product_specs
+```
+
+`promote_vendor_specs.py` is idempotent and preserves `manual` and `rule` rows. Current result:
+**76 attribute definitions**, **49 advertised keys**, **144k promoted spec rows**, **64k products**.
+Restart the web/MCP processes after changing the taxonomy so their in-memory cache reloads.
+
 ```python
 # MCP / Python: "I need a 12 V motor, 1000 rpm or less, at least 5 kg-cm"
 search_components(filters={"voltage": "12", "rpm": {"lte": 1000}, "torque_kgcm": {"gte": 5}},

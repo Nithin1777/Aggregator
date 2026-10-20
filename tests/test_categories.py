@@ -128,7 +128,7 @@ def test_taxonomy_has_unique_ids_and_labels():
 
 
 def test_taxonomy_keeps_the_spec_categories_and_their_attributes():
-    """The three spec categories keep their ids, keywords and attributes."""
+    """The curated spec categories keep their ids, keywords and core attributes."""
     taxonomy = get_taxonomy()
 
     motor = taxonomy.categories["motor"]
@@ -144,9 +144,13 @@ def test_taxonomy_keeps_the_spec_categories_and_their_attributes():
 
     relay = taxonomy.categories["relay"]
     assert relay.detect_keywords == ["relay", "relays"]
-    assert set(relay.attributes.keys()) == {"channels"}
+    assert {"channels", "coil_voltage_v", "contact_current_a"} <= set(
+        relay.attributes.keys()
+    )
 
-    assert set(taxonomy.categories_with_attributes()) == {"motor", "battery", "relay"}
+    filterable = set(taxonomy.categories_with_attributes())
+    assert {"motor", "battery", "relay", "resistors", "capacitors"} <= filterable
+    assert len(filterable) >= 20
 
 
 def test_taxonomy_covers_the_whole_catalog():

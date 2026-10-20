@@ -1,0 +1,581 @@
+# Filter extension: vendor-backed, production-facing spec filters.
+#
+# These attributes are merged into config/taxonomy.yaml at load time and are
+# populated by scripts/promote_vendor_specs.py.
+categories:
+- id: resistors
+  attributes:
+  - key: resistance_ohm
+    display_name: Resistance
+    type: float
+    unit: ohm
+    range:
+    - 0.0001
+    - 1000000000
+  - key: power_w
+    display_name: Power Rating
+    type: float
+    unit: W
+    range:
+    - 0.001
+    - 1000
+  - key: tolerance_pct
+    display_name: Tolerance
+    type: float
+    unit: '%'
+    range:
+    - 0.001
+    - 20
+  - key: package
+    display_name: Package
+    type: enum
+    values:
+    - '0201'
+    - '0402'
+    - '0603'
+    - 0805
+    - '1206'
+    - '1210'
+    - '2010'
+    - '2512'
+    - axial
+    - radial
+    - through-hole
+- id: capacitors
+  attributes:
+  - key: capacitance_uf
+    display_name: Capacitance
+    type: float
+    unit: uF
+    range:
+    - 1.0e-06
+    - 1000000
+  - key: voltage_v
+    display_name: Voltage Rating
+    type: float
+    unit: V
+    range:
+    - 1
+    - 10000
+  - key: tolerance_pct
+    display_name: Tolerance
+    type: float
+    unit: '%'
+    range:
+    - 0.001
+    - 100
+  - key: package
+    display_name: Package
+    type: enum
+    values:
+    - '0201'
+    - '0402'
+    - '0603'
+    - 0805
+    - '1206'
+    - '1210'
+    - '1812'
+    - radial
+    - axial
+    - snap-in
+    - through-hole
+  - key: capacitor_type
+    display_name: Capacitor Type
+    type: enum
+    values:
+    - ceramic
+    - electrolytic
+    - tantalum
+    - film
+    - supercapacitor
+- id: inductors
+  attributes:
+  - key: inductance_uh
+    display_name: Inductance
+    type: float
+    unit: uH
+    range:
+    - 0.01
+    - 1000000000
+  - key: current_a
+    display_name: Current Rating
+    type: float
+    unit: A
+    range:
+    - 0.001
+    - 1000
+  - key: tolerance_pct
+    display_name: Tolerance
+    type: float
+    unit: '%'
+    range:
+    - 0.001
+    - 30
+  - key: package
+    display_name: Package
+    type: enum
+    values:
+    - '0402'
+    - '0603'
+    - 0805
+    - '1206'
+    - '1210'
+    - radial
+    - axial
+    - through-hole
+- id: diodes
+  attributes:
+  - key: forward_current_a
+    display_name: Forward Current
+    type: float
+    unit: A
+    range:
+    - 0.001
+    - 1000
+  - key: reverse_voltage_v
+    display_name: Reverse Voltage
+    type: float
+    unit: V
+    range:
+    - 1
+    - 10000
+  - key: package
+    display_name: Package
+    type: enum
+    values:
+    - sod-123
+    - sma
+    - smb
+    - smc
+    - do-41
+    - do-15
+    - to-220
+    - through-hole
+  - key: diode_type
+    display_name: Diode Type
+    type: enum
+    values:
+    - rectifier
+    - schottky
+    - zener
+    - switching
+    - tvs
+    - other
+- id: transistors
+  attributes:
+  - key: vceo_v
+    display_name: VCEO
+    type: float
+    unit: V
+    range:
+    - 1
+    - 2000
+  - key: ic_a
+    display_name: Collector Current
+    type: float
+    unit: A
+    range:
+    - 0.001
+    - 100
+  - key: power_w
+    display_name: Power Dissipation
+    type: float
+    unit: W
+    range:
+    - 0.001
+    - 1000
+  - key: package
+    display_name: Package
+    type: enum
+    values:
+    - to-92
+    - to-220
+    - to-247
+    - sot-23
+    - sot-223
+    - dpak
+    - dip
+    - through-hole
+  - key: transistor_type
+    display_name: Transistor Type
+    type: enum
+    values:
+    - npn
+    - pnp
+    - darlington
+- id: semiconductors
+  attributes:
+  - key: vds_v
+    display_name: VDS
+    type: float
+    unit: V
+    range:
+    - 1
+    - 2000
+  - key: id_a
+    display_name: Drain Current
+    type: float
+    unit: A
+    range:
+    - 0.001
+    - 1000
+  - key: power_w
+    display_name: Power Dissipation
+    type: float
+    unit: W
+    range:
+    - 0.001
+    - 2000
+  - key: package
+    display_name: Package
+    type: enum
+    values:
+    - to-220
+    - to-247
+    - to-252
+    - to-263
+    - sot-23
+    - dpak
+    - d2pak
+    - through-hole
+  - key: channel_type
+    display_name: Channel Type
+    type: enum
+    values:
+    - n_channel
+    - p_channel
+- id: integrated-circuits
+  attributes:
+  - key: package
+    display_name: Package
+    type: enum
+    values:
+    - dip
+    - soic
+    - sop
+    - ssop
+    - tssop
+    - qfn
+    - tqfp
+    - lqfp
+    - bga
+    - sot-23
+    - to-220
+    - module
+  - key: pins
+    display_name: Pin Count
+    type: integer
+    unit: pins
+    range:
+    - 2
+    - 1000
+  - key: supply_voltage_v
+    display_name: Supply Voltage
+    type: float
+    unit: V
+    range:
+    - 0.5
+    - 1000
+- id: connectors
+  attributes:
+  - key: pins
+    display_name: Pin Count
+    type: integer
+    unit: pins
+    range:
+    - 1
+    - 200
+  - key: pitch_mm
+    display_name: Pitch
+    type: float
+    unit: mm
+    range:
+    - 0.5
+    - 10
+  - key: connector_type
+    display_name: Connector Type
+    type: enum
+    values:
+    - usb
+    - header
+    - jst
+    - terminal
+    - rj45
+    - ffc
+    - db9
+    - other
+- id: sensors
+  attributes:
+  - key: voltage_v
+    display_name: Supply Voltage
+    type: float
+    unit: V
+    range:
+    - 0.5
+    - 1000
+  - key: interface
+    display_name: Interface
+    type: enum
+    values:
+    - i2c
+    - spi
+    - uart
+    - analog
+    - onewire
+    - other
+  - key: sensor_type
+    display_name: Sensor Type
+    type: enum
+    values:
+    - temperature
+    - humidity
+    - pressure
+    - light
+    - motion
+    - gas
+    - current
+    - position
+    - other
+- id: displays
+  attributes:
+  - key: screen_size_in
+    display_name: Screen Size
+    type: float
+    unit: in
+    range:
+    - 0.5
+    - 100
+  - key: resolution
+    display_name: Resolution
+    type: string
+  - key: interface
+    display_name: Interface
+    type: enum
+    values:
+    - i2c
+    - spi
+    - uart
+    - hdmi
+    - dsi
+    - parallel
+    - other
+  - key: touch
+    display_name: Touch
+    type: enum
+    values:
+    - 'yes'
+    - 'no'
+- id: leds
+  attributes:
+  - key: forward_voltage_v
+    display_name: Forward Voltage
+    type: float
+    unit: V
+    range:
+    - 0.5
+    - 100
+  - key: package
+    display_name: Package
+    type: enum
+    values:
+    - 3mm
+    - 5mm
+    - '0402'
+    - '0603'
+    - 0805
+    - '1206'
+    - through-hole
+  - key: color
+    display_name: Color
+    type: enum
+    values:
+    - red
+    - green
+    - blue
+    - white
+    - yellow
+    - orange
+    - ir
+    - rgb
+    - other
+- id: relay
+  attributes:
+  - key: coil_voltage_v
+    display_name: Coil Voltage
+    type: float
+    unit: V
+    range:
+    - 1
+    - 1000
+  - key: contact_current_a
+    display_name: Contact Current
+    type: float
+    unit: A
+    range:
+    - 0.001
+    - 1000
+  - key: contact_voltage_v
+    display_name: Contact Voltage
+    type: float
+    unit: V
+    range:
+    - 1
+    - 5000
+- id: fuses
+  attributes:
+  - key: current_a
+    display_name: Rated Current
+    type: float
+    unit: A
+    range:
+    - 0.001
+    - 1000
+  - key: voltage_v
+    display_name: Rated Voltage
+    type: float
+    unit: V
+    range:
+    - 1
+    - 5000
+  - key: fuse_type
+    display_name: Fuse Type
+    type: enum
+    values:
+    - glass
+    - ceramic
+    - blade
+    - resettable
+    - other
+- id: crystals
+  attributes:
+  - key: frequency_mhz
+    display_name: Frequency
+    type: float
+    unit: MHz
+    range:
+    - 0.001
+    - 1000
+  - key: load_capacitance_pf
+    display_name: Load Capacitance
+    type: float
+    unit: pF
+    range:
+    - 1
+    - 1000
+  - key: package
+    display_name: Package
+    type: enum
+    values:
+    - hc-49
+    - '5032'
+    - '3225'
+    - '2520'
+    - '2016'
+    - through-hole
+- id: wires
+  attributes:
+  - key: awg
+    display_name: AWG
+    type: integer
+    unit: AWG
+    range:
+    - 1
+    - 50
+  - key: conductor_area_mm2
+    display_name: Conductor Area
+    type: float
+    unit: mm2
+    range:
+    - 0.001
+    - 1000
+  - key: length_m
+    display_name: Length
+    type: float
+    unit: m
+    range:
+    - 0.01
+    - 10000
+- id: power
+  attributes:
+  - key: output_voltage_v
+    display_name: Output Voltage
+    type: float
+    unit: V
+    range:
+    - 0.1
+    - 10000
+  - key: output_current_a
+    display_name: Output Current
+    type: float
+    unit: A
+    range:
+    - 0.001
+    - 10000
+  - key: power_w
+    display_name: Power
+    type: float
+    unit: W
+    range:
+    - 0.01
+    - 100000
+  - key: input_voltage_v
+    display_name: Input Voltage
+    type: float
+    unit: V
+    range:
+    - 1
+    - 10000
+- id: modules
+  attributes:
+  - key: voltage_v
+    display_name: Supply Voltage
+    type: float
+    unit: V
+    range:
+    - 0.5
+    - 1000
+  - key: interface
+    display_name: Interface
+    type: enum
+    values:
+    - i2c
+    - spi
+    - uart
+    - analog
+    - usb
+    - other
+- id: thermal
+  attributes:
+  - key: power_w
+    display_name: Power
+    type: float
+    unit: W
+    range:
+    - 0.01
+    - 1000
+  - key: voltage_v
+    display_name: Voltage
+    type: float
+    unit: V
+    range:
+    - 1
+    - 1000
+  - key: size_mm
+    display_name: Size
+    type: float
+    unit: mm
+    range:
+    - 1
+    - 1000
+- id: hardware
+  attributes:
+  - key: thread_size
+    display_name: Thread Size
+    type: string
+  - key: length_mm
+    display_name: Length
+    type: float
+    unit: mm
+    range:
+    - 0.1
+    - 5000
