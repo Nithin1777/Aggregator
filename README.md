@@ -428,8 +428,11 @@ python scripts/backfill_descriptions.py --vendors quartzcomponents,makerbazar,re
 # Robokits product pages (one request per product)
 python scripts/backfill_descriptions.py --vendors robokits --limit 100
 
-# Robu is Cloudflare-protected; 403s are skipped, so run it where the IP is allowed
-python scripts/backfill_descriptions.py --vendors robu --limit 50
+# Robu: ProductDetails GraphQL (JSON, no HTML/Cloudflare page fetch)
+python scripts/backfill_descriptions.py --vendors robu --limit 50 --batch-size 25
+
+# Robu fallback: product HTML (403s are skipped, resume from an allowed IP)
+python scripts/backfill_descriptions.py --vendors robu --robu-source html --limit 50
 
 # Inspect without writing
 python scripts/backfill_descriptions.py --vendors quartzcomponents --limit 5 --dry-run
@@ -453,6 +456,17 @@ python scripts/backfill_title_attributes.py --vendors robokits
 
 Current catalog totals: **18,474 descriptions**, **261,085 vendor attribute rows**, and
 **76,002 products with attributes** (Robu contributes 59k of those from titles alone).
+
+**Robu GraphQL path.** Robu's Next.js frontend exposes
+`POST https://robu.in/api/proxy/graphql/` with a `ProductDetails` operation. It returns
+`description`, `short_description`, price and stock as JSON and is not blocked for us. The pipeline
+uses aliased queries to fetch `--batch-size` products per request (default 10), with
+`--update-price-stock` optionally writing the returned price/stock. This replaces 85k HTML page
+fetches with a few thousand JSON calls.
+
+```powershell
+python scripts/backfill_descriptions.py --vendors robu --batch-size 25
+```
 
 ### Keeping the taxonomy current
 

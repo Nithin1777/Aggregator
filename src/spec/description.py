@@ -117,6 +117,10 @@ def _acceptable(key: str, value: str) -> bool:
         return False
     if "http://" in value.lower() or "https://" in value.lower():
         return False
+    if value.startswith("//"):
+        return False
+    if key in {"http", "https", "www", "url", "link"}:
+        return False
     # A key that is mostly digits (a pin number row) is table structure, not a spec.
     if sum(ch.isdigit() for ch in key) > len(key) / 2:
         return False
