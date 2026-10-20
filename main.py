@@ -2,6 +2,7 @@
 Indian Component Aggregator Engine - Main Entry Point (CLI & FastAPI Web Application).
 """
 import asyncio
+import json
 import logging
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -29,6 +30,7 @@ from config import settings
 import db
 from models import ClickFeedback, SearchResponse
 from search_service import AggregatorEngine
+from src.web.render import icon_svg
 
 # Logging configuration
 logging.basicConfig(
@@ -49,6 +51,7 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    db.sync_category_taxonomy()
     get_engine()
     yield
     global engine_instance
@@ -56,14 +59,18 @@ async def lifespan(app: FastAPI):
         await engine_instance.close()
 
 web_app = FastAPI(
-    title="Octopart India - Component Aggregator Engine",
-    description="Multi-vendor electronic component price and stock comparison engine (Robu, QuartzComponents, MakerBazar)",
-    version="1.0.0",
+    title="Aggregate - Component Search",
+    description="Multi-vendor electronic component price and stock comparison engine (Robu, QuartzComponents, MakerBazar, Robokits, REES52)",
+    version="2.0.0",
     lifespan=lifespan
 )
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+templates.env.globals["icon"] = icon_svg
+
+web_app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # Global engine instance for FastAPI
 engine_instance: Optional[AggregatorEngine] = None
@@ -95,54 +102,274 @@ def get_engine() -> AggregatorEngine:
         engine_instance = AggregatorEngine()
     return engine_instance
 
+
+def _normalize_refresh_mode(value) -> str:
+    """Normalizes the refresh mode (direct calls skip FastAPI validation)."""
+    if isinstance(value, str) and value in ("auto", "force", "off"):
+        return value
+    return "auto"
+
+
+def _normalize_optional(value) -> Optional[str]:
+    """Normalizes an optional query parameter (direct calls skip validation)."""
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
+
+
+def _normalize_flag(value) -> bool:
+    """Normalizes a boolean query parameter (direct calls skip validation)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
+def _normalize_limit(value, default: int = 70) -> int:
+    """Normalizes the result limit (direct calls skip FastAPI validation)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return max(1, min(200, value))
+
+
+def _normalize_spec_filters(value) -> Dict[str, Any]:
+    """Parses the `spec_filters` query parameter (a JSON object)."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+# Seed terms shown on the landing page. They are replaced by the live search
+# log once the catalog has seen enough traffic.
+_DEFAULT_POPULAR_SEARCHES = [
+    "esp32", "arduino", "dht11", "resistor", "lm2596", "servo", "bme280",
+]
+
+
+def _popular_searches(limit: int = 8) -> list:
+    """Returns popular queries, topped up with the seeded defaults."""
+    try:
+        popular = db.get_popular_queries(limit=limit, min_count=2)
+    except Exception:  # noqa: BLE001 - the landing page must never fail
+        popular = []
+
+    merged = list(popular)
+    for term in _DEFAULT_POPULAR_SEARCHES:
+        if len(merged) >= limit:
+            break
+        if term not in merged:
+            merged.append(term)
+    return merged[:limit]
+
+
+def _page_context(
+    query: str = "",
+    category: str = "",
+    vendor: str = "",
+    in_stock: bool = False,
+) -> dict:
+    """Shared template context for the public pages."""
+    categories = db.get_categories()
+    vendors = db.get_vendor_counts()
+    stats = db.get_db_stats()
+    return {
+        "query": query,
+        "category": category,
+        "vendor": vendor,
+        "in_stock": in_stock,
+        "has_results": bool(query or category or vendor),
+        "categories": categories,
+        "vendors": vendors,
+        "popular_searches": _popular_searches(),
+        "catalog_stats": {
+            "total_products": stats.get("total_products", 0),
+            "in_stock_products": stats.get("in_stock_products", 0),
+            "vendor_count": len(stats.get("vendors", {})) or len(vendors),
+            "category_count": len([c for c in categories if c["count"] > 0]),
+        },
+    }
+
+
 @web_app.get("/", response_class=HTMLResponse)
 async def web_ui(
     request: Request,
     q: Optional[str] = Query(None, description="Search query string"),
-    source: str = Query("local", description="Search source: 'live' or 'local'")
+    category: Optional[str] = Query(None, description="Canonical category slug"),
+    vendor: Optional[str] = Query(None, description="Vendor slug"),
+    in_stock: bool = Query(False, description="Only show listings that are in stock"),
 ):
-    """Web interface search page with comparison groups."""
-    engine = get_engine()
-    results = []
-    comparison_groups = []
-    total_results = 0
-
-    if q and q.strip():
-        if source == "local":
-            # search_local is synchronous and CPU-bound; keep it off the event loop.
-            resp = await asyncio.to_thread(engine.search_local, q.strip())
-        else:
-            resp = await engine.search_live(query=q.strip())
-
-        results = resp.results
-        comparison_groups = resp.comparison_groups
-        total_results = resp.total_results
-
+    """Search page: type-ahead suggestions, category filters and comparison cards."""
+    context = _page_context(
+        query=(q.strip() if isinstance(q, str) else ""),
+        category=_normalize_optional(category) or "",
+        vendor=_normalize_optional(vendor) or "",
+        in_stock=_normalize_flag(in_stock),
+    )
     return templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={
-            "query": q or "",
-            "source": source,
-            "results": results,
-            "comparison_groups": comparison_groups,
-            "total_results": total_results
-        }
+        context=context,
     )
+
+
+@web_app.get("/categories", response_class=HTMLResponse)
+async def web_categories(request: Request):
+    """Browse page listing every canonical category with live counts."""
+    context = _page_context()
+    return templates.TemplateResponse(
+        request=request,
+        name="categories.html",
+        context={**context, "active_nav": "categories"},
+    )
+
+
+@web_app.get("/vendors", response_class=HTMLResponse)
+async def web_vendors(request: Request):
+    """Browse page listing the compared vendors and their catalog size."""
+    context = _page_context()
+    return templates.TemplateResponse(
+        request=request,
+        name="vendors.html",
+        context={**context, "active_nav": "vendors"},
+    )
+
+
+@web_app.get("/api/categories")
+async def api_categories(
+    vendor: Optional[str] = Query(None, description="Scope counts to one vendor"),
+):
+    """Returns the canonical category taxonomy with live product counts."""
+    categories = db.get_categories(vendor=_normalize_optional(vendor))
+    return {
+        "categories": categories,
+        "total": sum(c["count"] for c in categories),
+    }
+
+
+@web_app.get("/api/suggest")
+async def api_suggest(
+    q: str = Query(..., min_length=1, description="Partially typed query"),
+    limit: int = Query(8, ge=1, le=20, description="Max suggestions"),
+    category: Optional[str] = Query(None, description="Restrict to one category"),
+):
+    """Type-ahead suggestions: part numbers, products and categories."""
+    prefix = q.strip() if isinstance(q, str) else ""
+    if not prefix:
+        return {"query": prefix, "suggestions": [], "corrections": []}
+    return {
+        "query": prefix,
+        "suggestions": db.suggest_products(
+            prefix, limit=_normalize_limit(limit, 8), category=_normalize_optional(category)
+        ),
+        "corrections": db.suggest_mpns(prefix, limit=3),
+    }
+
+
+@web_app.get("/api/popular")
+async def api_popular(limit: int = Query(8, ge=1, le=25)):
+    """Returns the most searched queries so far."""
+    return {"queries": _popular_searches(limit=_normalize_limit(limit, 8))}
+
 
 @web_app.get("/search", response_model=SearchResponse)
 @web_app.get("/api/search", response_model=SearchResponse)
 async def api_search(
-    q: str = Query(..., min_length=1, description="Component name or part number"),
+    q: str = Query("", description="Component name or part number"),
     source: str = Query("local", pattern="^(live|local)$", description="Search source"),
-    limit: int = Query(70, ge=1, le=200, description="Max results limit")
+    limit: int = Query(70, ge=1, le=200, description="Max results limit"),
+    refresh: str = Query(
+        "auto",
+        pattern="^(auto|force|off)$",
+        description="Live price/stock refresh: 'auto' (TTL), 'force', or 'off' (cache only)"
+    ),
+    category: Optional[str] = Query(None, description="Canonical category slug"),
+    vendor: Optional[str] = Query(None, description="Vendor slug"),
+    in_stock: bool = Query(False, description="Only return listings that are in stock"),
+    spec_filters: Optional[str] = Query(
+        None,
+        description='JSON object of spec filters, e.g. {"voltage": {"gte": 12}}',
+    ),
 ):
-    """JSON API endpoint for real-time or local component search."""
+    """
+    JSON API endpoint for real-time or local component search.
+
+    Without a query string the endpoint falls back to browsing the filtered
+    category, so `/?category=resistors` returns real listings.
+    """
     engine = get_engine()
-    if source == "local":
-        resp = await asyncio.to_thread(engine.search_local, q, limit)
+    query = (q or "").strip() if isinstance(q, str) else ""
+    category = _normalize_optional(category)
+    vendor = _normalize_optional(vendor)
+    in_stock = _normalize_flag(in_stock)
+    limit = _normalize_limit(limit)
+    spec_filters = _normalize_spec_filters(spec_filters)
+
+    if spec_filters:
+        # Validate up front so a bad filter is a clean 400, not a 500.
+        try:
+            with db.get_db_connection() as conn:
+                advertised = db.load_catalog_specs(conn)
+            normalized, error = db.parse_and_validate_filters(spec_filters, advertised)
+        except Exception:  # noqa: BLE001 - validation must not break the request
+            normalized, error = None, None
+        if error:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": error["error_code"],
+                    "message": error["message"],
+                    "valid_keys": error.get("valid_keys"),
+                    "suggestions": error.get("suggestions"),
+                },
+            )
+        if normalized is not None:
+            spec_filters = normalized
+
+    if not query and (category or vendor):
+        # Browse mode: list the filtered catalog instead of searching.
+        products = await asyncio.to_thread(
+            db.list_products_by_category,
+            category=category or None,
+            vendor=vendor or None,
+            in_stock_only=bool(in_stock),
+            limit=limit,
+            spec_filters=spec_filters or None,
+        )
+        groups = await asyncio.to_thread(engine.group_and_compare, products, query=None)
+        resp = SearchResponse(
+            query=query,
+            total_results=len(products),
+            source="local_db",
+            results=products,
+            comparison_groups=groups,
+        )
     else:
-        resp = await engine.search_live(query=q, limit_per_vendor=min(limit // 2, 25))
+        if not query:
+            return SearchResponse(query=query, total_results=0, source="local_db")
+        if source == "local":
+            resp = await engine.search_local_refreshed(
+                query,
+                limit,
+                vendor=vendor or None,
+                in_stock_only=bool(in_stock),
+                refresh_mode=_normalize_refresh_mode(refresh),
+                category=category or None,
+                spec_filters=spec_filters or None,
+            )
+        else:
+            resp = await engine.search_live(query=query, limit_per_vendor=min(limit // 2, 25))
+
+        try:
+            db.record_search_query(query)
+        except Exception:  # noqa: BLE001 - telemetry must never break a search
+            pass
 
     for g in resp.comparison_groups:
         seen = []
@@ -169,6 +396,12 @@ async def api_feedback(feedback: ClickFeedback):
 async def api_status():
     """Returns database statistics, product counts per vendor, and scrape checkpoints."""
     return db.get_db_stats()
+
+
+@web_app.get("/health")
+async def api_health():
+    """Lightweight liveness probe used by process supervisors."""
+    return {"status": "ok", "service": "aggregate"}
 
 @web_app.post("/api/ingest")
 async def api_ingest(
@@ -198,7 +431,7 @@ async def api_ingest(
 # CLI Application (Typer & Rich)
 # ---------------------------------------------------------------------------
 cli = typer.Typer(
-    help="Indian Component Aggregator Engine ('Octopart for India')",
+    help="Aggregate - search and compare components across Indian vendors",
     no_args_is_help=True
 )
 
@@ -207,16 +440,24 @@ def cli_search(
     query: str = typer.Argument(..., help="Search query (e.g. 'esp32', 'mpu6050', 'lm2596')"),
     live: bool = typer.Option(True, "--live/--local", help="Query live vendor endpoints vs local SQLite index"),
     limit: int = typer.Option(15, "--limit", "-l", help="Max results per vendor"),
+    refresh: bool = typer.Option(
+        True, "--refresh/--cache-only",
+        help="Local mode: verify price/stock live before display (falls back to cached values offline)"
+    ),
 ):
     """Search and compare electronic components across Robu, QuartzComponents, and MakerBazar."""
     async def _search():
         engine = AggregatorEngine()
         try:
-            with console.status(f"[bold green]Searching for '{query}' ({'Live APIs' if live else 'Local DB'})...[/bold green]"):
+            with console.status(f"[bold green]Searching for '{query}' ({'Live APIs' if live else 'Local DB'}): refreshing price/stock...[/bold green]"):
                 if live:
                     resp = await engine.search_live(query=query, limit_per_vendor=limit)
                 else:
-                    resp = engine.search_local(query=query, limit=limit * 3)
+                    resp = await engine.search_local_refreshed(
+                        query=query,
+                        limit=limit * 3,
+                        refresh_mode="auto" if refresh else "off"
+                    )
 
             if not resp.comparison_groups:
                 console.print(f"[yellow]No components found for '{query}'.[/yellow]")
@@ -230,6 +471,18 @@ def cli_search(
                     border_style="blue"
                 )
             )
+
+            if resp.price_refresh:
+                status_style = {
+                    "live": "bold green",
+                    "partial": "yellow",
+                    "fresh_cache": "cyan",
+                    "cached": "yellow",
+                    "offline_cooldown": "yellow",
+                }.get(resp.price_refresh.status, "dim")
+                console.print(
+                    f"[{status_style}]Price/Stock [{resp.price_refresh.status}]:[/{status_style}] {resp.price_refresh.message}"
+                )
 
             for group in resp.comparison_groups:
                 title_line = f"[bold cyan]{group.canonical_name}[/bold cyan]"
@@ -353,12 +606,16 @@ def cli_status():
     """Display local database statistics and continuable scraping checkpoints."""
     db.init_db()
     stats = db.get_db_stats()
+    ps = stats.get("price_stock", {})
 
     console.print(Panel.fit(
         f"[bold]Total Indexed Products:[/bold] {stats['total_products']:,}\n"
         f"[bold]Total In-Stock Items:[/bold] {stats['in_stock_products']:,}\n"
+        f"[bold]Price/Stock Live-Verified:[/bold] {ps.get('with_live_price_stock', 0):,} "
+        f"(cached fallback only: {ps.get('with_cached_price_stock_only', 0):,})\n"
+        f"[bold]Last Price/Stock Refresh:[/bold] {str(ps.get('last_successful_refresh') or 'Never')[:19]}\n"
         f"[bold]Database Location:[/bold] {settings.db_path}",
-        title="Octopart India Database Status",
+        title="Aggregate Database Status",
         border_style="green"
     ))
 
@@ -410,6 +667,39 @@ def cli_status():
                 border_style="magenta"
             )
         )
+
+@cli.command("categories")
+def cli_categories(
+    vendor: Optional[str] = typer.Option(None, "--vendor", "-v", help="Scope counts to one vendor"),
+):
+    """Show the canonical catalog taxonomy with live part counts."""
+    db.init_db()
+    categories = db.get_categories(vendor=vendor)
+    total = sum(c["count"] for c in categories)
+
+    table = Table(title="Canonical categories", show_header=True, header_style="bold cyan")
+    table.add_column("Slug")
+    table.add_column("Label")
+    table.add_column("Parts", justify="right")
+    table.add_column("In stock", justify="right")
+    table.add_column("Share", justify="right")
+
+    for cat in categories:
+        share = (cat["count"] * 100.0 / total) if total else 0.0
+        table.add_row(
+            cat["slug"],
+            cat["label"],
+            f"{cat['count']:,}",
+            f"{cat['in_stock']:,}",
+            f"{share:.1f}%",
+        )
+
+    console.print(table)
+    console.print(
+        f"[dim]{total:,} products classified into {len(categories)} categories. "
+        f"Re-apply the taxonomy with: python scripts/backfill_categories.py --force[/dim]"
+    )
+
 
 @cli.command("robu-sync")
 def cli_robu_sync(

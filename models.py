@@ -19,11 +19,17 @@ class UnifiedProduct(BaseModel):
     available: bool = Field(default=False, description="True if in stock and available for order")
     product_url: str = Field(..., description="Canonical product detail page URL")
     image_url: Optional[str] = Field(None, description="Direct URL to product thumbnail or image")
-    category: Optional[str] = Field(None, description="Product category or tags")
+    category: Optional[str] = Field(None, description="Raw vendor category string")
+    category_canonical: Optional[str] = Field(
+        None,
+        description="Canonical category slug (see config/taxonomy.yaml), e.g. 'resistors'"
+    )
     is_canonical: bool = Field(default=False, description="True if marked as canonical product for a brand, category, or MPN")
     canonical_for: Optional[str] = Field(None, description="The canonical key this product represents")
     query_ctr: Optional[float] = Field(None, description="Click-through rate for query relevance")
     updated_at: Optional[str] = None
+    price_updated_at: Optional[str] = Field(None, description="UTC timestamp of the last successful live price/stock fetch")
+    price_source: Optional[str] = Field(None, description="'live' if price/stock was fetched from the vendor, 'cache' if never refreshed")
     extra: Dict[str, Any] = Field(default_factory=dict, description="Vendor-specific metadata")
 
 class VendorOffer(BaseModel):
@@ -37,9 +43,15 @@ class VendorOffer(BaseModel):
     product_url: str
     image_url: Optional[str] = None
     sku: Optional[str] = None
+    category: Optional[str] = Field(None, description="Raw vendor category string")
+    category_canonical: Optional[str] = Field(
+        None, description="Canonical category slug (see config/taxonomy.yaml)"
+    )
     merge_reason: Optional[str] = Field(None, description="Rule name or reason that merged this offer")
     variant_key: Optional[str] = Field(None, description="Unique variant identifier based on spec signature")
     source: Optional[str] = Field(default="v2_fallback", description="Source of merge decision: llm_label or v2_fallback")
+    price_updated_at: Optional[str] = Field(None, description="UTC timestamp of the last live price/stock fetch for this offer")
+    price_source: Optional[str] = Field(None, description="'live' if fetched from the vendor, 'cache' if served from the local catalog")
 
 class ComparisonGroup(BaseModel):
     """Side-by-side comparison for identical or matching components across vendors."""
@@ -50,11 +62,41 @@ class ComparisonGroup(BaseModel):
     in_stock_count: int = 0
     total_offers: int = 0
     offers: List[VendorOffer] = Field(default_factory=list)
+    category: Optional[str] = Field(None, description="Raw vendor category string")
+    category_canonical: Optional[str] = Field(
+        None, description="Canonical category slug (see config/taxonomy.yaml)"
+    )
     variant_key: Optional[str] = Field(None, description="Unique variant spec key for this group")
     merge_reason: Optional[str] = Field(None, description="Merge reason rule name")
     variants: List[Dict[str, Any]] = Field(default_factory=list, description="Sibling variants within same family")
     distinct_titles: List[str] = Field(default_factory=list, description="Unique offer titles across vendors")
     source: str = Field(default="v2_fallback", description="Source of merge decision: llm_label or v2_fallback")
+
+
+class PriceStockRefreshInfo(BaseModel):
+    """
+    Outcome of a search-time price/stock refresh.
+
+    status:
+      - 'live'             : price/stock were refreshed from vendors
+      - 'partial'          : refreshed, but some vendors failed or timed out
+      - 'cached'           : live refresh was attempted but unavailable; cached values served
+      - 'fresh_cache'      : cached values were recent enough, no vendor call needed
+      - 'offline_cooldown' : vendors recently unreachable; served cache without retrying
+      - 'timeout'          : refresh bridge exceeded its wall-clock budget; cached values served
+      - 'error'            : unexpected refresh failure; cached values served
+      - 'disabled'         : live refresh turned off via configuration
+    """
+    status: str = "cached"
+    attempted: bool = False
+    candidates: int = 0
+    refreshed_products: int = 0
+    cached_products: int = 0
+    vendors_ok: List[str] = Field(default_factory=list)
+    vendors_failed: List[str] = Field(default_factory=list)
+    queries: List[str] = Field(default_factory=list)
+    fetched_at: Optional[str] = None
+    message: str = ""
 
 
 class SearchResponse(BaseModel):
@@ -64,6 +106,10 @@ class SearchResponse(BaseModel):
     source: str = "live"  # 'live' or 'local_db'
     results: List[UnifiedProduct] = Field(default_factory=list)
     comparison_groups: List[ComparisonGroup] = Field(default_factory=list)
+    price_refresh: Optional[PriceStockRefreshInfo] = Field(
+        None, description="Outcome of the search-time price/stock refresh (live vs cached fallback)"
+    )
+
 
 class ScrapeState(BaseModel):
     """Persistence model tracking continuable ingestion progress per vendor."""

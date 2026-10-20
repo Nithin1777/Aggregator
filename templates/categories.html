@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% set page_title = "All component categories - Aggregate" %}
+{% set page_description = "Browse every electronic component category in the Aggregate catalog, with live part counts." %}
+
+{% block content %}
+<div class="shell">
+
+  <section class="hero" style="padding: 40px 0 24px;">
+    <h1 class="hero__title" style="font-size: 34px;">Component <em>categories</em></h1>
+    <p class="hero__subtitle">
+      {{ catalog_stats.category_count }} categories covering {{ "{:,}".format(catalog_stats.total_products) }}
+      indexed parts. Pick one to narrow every search.
+    </p>
+  </section>
+
+  <section class="section" style="margin-top: 12px;">
+    <div class="cat-grid">
+      {% for cat in categories %}
+      <a class="cat-card" href="/?category={{ cat.slug }}">
+        <span class="cat-card__icon">{{ icon(cat.icon, 19) }}</span>
+        <span class="cat-card__body">
+          <span class="cat-card__label">{{ cat.label }}</span>
+          <span class="cat-card__meta">{{ "{:,}".format(cat.count) }} parts &middot; {{ "{:,}".format(cat.in_stock) }} in stock</span>
+        </span>
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section__head">
+      <h2 class="section__title">{{ icon("info", 17) }} How categories work</h2>
+    </div>
+    <p style="max-width: 760px; color: var(--text-muted); font-size: 14.5px;">
+      Every vendor files its products under its own shelf names &mdash; Robu calls them
+      &ldquo;MLCCs- Multi Layer Ceramic Capacitors&rdquo;, QuartzComponents calls them
+      &ldquo;SMD Capacitors&rdquo;, MakerBazar simply says &ldquo;Capacitors&rdquo;.
+      Aggregate maps all of them onto one shared taxonomy, so a single filter means the same
+      thing no matter which vendor a part came from.
+    </p>
+  </section>
+
+</div>
+{% endblock %}

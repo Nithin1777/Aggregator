@@ -1,0 +1,45 @@
+{#
+  Search input with live type-ahead suggestions.
+
+  Expects: `search_value` (string), `search_variant` ("hero" | "compact"),
+           `search_placeholder` (string).
+#}
+<div class="search {{ 'search--hero' if search_variant|default('compact') == 'hero' else '' }}"
+     data-search-root>
+  <form class="search__form" action="/" method="get" role="search"
+        data-search-form>
+    <div class="search__field">
+      {{ icon("search", 18) }}
+      <input
+        type="search"
+        class="search__input"
+        name="q"
+        value="{{ search_value|default('') }}"
+        placeholder="{{ search_placeholder|default('Search part number, chip or module') }}"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+        aria-label="Search components"
+        aria-autocomplete="list"
+        aria-expanded="false"
+        aria-controls="suggest-list"
+        data-search-input
+      >
+      <button type="button" class="search__clear" aria-label="Clear search" data-search-clear>
+        {{ icon("x", 14) }}
+      </button>
+      <button type="submit" class="search__submit">
+        {{ icon("arrow-right", 15) }}
+        <span>Search</span>
+      </button>
+    </div>
+  </form>
+
+  <div class="suggest" data-suggest role="listbox" aria-label="Search suggestions">
+    <div class="suggest__list" id="suggest-list" data-suggest-list></div>
+    <div class="suggest__footer" data-suggest-footer hidden>
+      <span><span class="kbd">↑</span> <span class="kbd">↓</span> to navigate &middot; <span class="kbd">↵</span> to select</span>
+      <span><span class="kbd">esc</span> to close</span>
+    </div>
+  </div>
+</div>

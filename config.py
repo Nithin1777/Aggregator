@@ -46,12 +46,43 @@ class Settings(BaseModel):
     matcher_audit_logging: bool = True
     matcher_audit_log_path: Path = BASE_DIR / "logs" / "matcher_audit.jsonl"
 
+    # Live Price/Stock Refresh (search-time refresh with cached fallback)
+    price_stock_refresh_enabled: bool = True
+    # Skip live refresh when the cached price/stock was verified more recently than this.
+    price_stock_ttl_seconds: int = 180
+    # Hard wall-clock budget for one refresh pass across all vendors (parallel).
+    price_stock_refresh_timeout_seconds: float = 8.0
+    # Max distinct vendor search queries per refresh pass (user query + derived MPN/title fallbacks).
+    price_stock_max_refresh_queries: int = 2
+    # After a pass where every vendor failed, serve cache without retrying for this long.
+    price_stock_offline_cooldown_seconds: float = 60.0
+    # Per-vendor result limit used for the refresh lookups.
+    price_stock_live_limit_per_vendor: int = 15
+
     def __init__(self, **kwargs):
         import os
         super().__init__(**kwargs)
         env_mode = os.getenv("MATCHER_MODE")
         if env_mode:
             self.matcher_mode = env_mode.lower().strip()
+
+        env_refresh = os.getenv("PRICE_STOCK_REFRESH")
+        if env_refresh is not None:
+            self.price_stock_refresh_enabled = env_refresh.strip().lower() not in (
+                "0", "false", "off", "no"
+            )
+        env_ttl = os.getenv("PRICE_STOCK_TTL")
+        if env_ttl:
+            try:
+                self.price_stock_ttl_seconds = int(float(env_ttl))
+            except ValueError:
+                pass
+        env_timeout = os.getenv("PRICE_STOCK_TIMEOUT")
+        if env_timeout:
+            try:
+                self.price_stock_refresh_timeout_seconds = float(env_timeout)
+            except ValueError:
+                pass
 
     # Server Settings
     host: str = "127.0.0.1"

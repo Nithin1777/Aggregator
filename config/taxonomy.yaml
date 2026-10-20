@@ -1,13 +1,464 @@
-version: 1
+# Aggregate catalog taxonomy
+#
+# This is the single source of truth for every category in the product
+# catalog. Each category carries:
+#
+#   id              canonical slug, stored in products.category_canonical and
+#                   returned by the API / UI / MCP tools
+#   display         human readable label
+#   icon            Lucide icon name used by the web UI
+#   description     one line explanation shown in the UI
+#   detect_keywords matched against the product TITLE and the vendor's own
+#                   category string (token based, plural tolerant)
+#   vendor_only     matched against the vendor's category string ONLY
+#   title_only      matched against the product TITLE only
+#   attributes      the spec attributes that can be filtered on for this
+#                   category. Only categories that carry attributes have specs
+#                   extracted into `product_specs` (see scripts/backfill_specs.py).
+#                   The extractors referenced here must exist in
+#                   config/extractors.yaml.
+#
+# `junk_raw` lists vendor category strings that carry no taxonomic signal
+# ("New Products 5", "Popular Products", ...). Products filed under them fall
+# back to title matching.
+
+version: 2
 advertise_min_fill: 0.4
+
+junk_raw:
+  - new product
+  - new products
+  - popular product
+  - popular products
+  - best price
+  - best prices
+  - collection
+  - default
+  - components
+  - component
+  - general
+  - misc
+  - miscellaneous
+  - all
+  - other
+  - others
+  - triblade
+  - my account
+
 categories:
+  # ---------------------------------------------------------------------
+  # Passive components
+  # ---------------------------------------------------------------------
+  - id: resistors
+    display: Resistors
+    icon: component
+    description: Thin-film, thick-film, SMD and power resistors, potentiometers and LDRs.
+    detect_keywords:
+      - resistor
+      - potentiometer
+      - trimmer
+      - ldr
+      - light dependent resistor
+      - rheostat
+      - resistor network
+      - sense resistor
+
+  - id: capacitors
+    display: Capacitors
+    icon: disc
+    description: Ceramic, electrolytic, tantalum, polymer and film capacitors.
+    detect_keywords:
+      - capacitor
+      - mlcc
+      - mlccs
+      - slcc
+      - slccs
+      - tantalum
+      - electrolytic
+      - supercapacitor
+
+  - id: inductors
+    display: Inductors
+    icon: magnet
+    description: Power, RF, wirewound and toroidal inductors plus ferrite beads.
+    detect_keywords:
+      - inductor
+      - inductance
+      - ferrite bead
+      - ferrite
+      - common mode choke
+
+  # ---------------------------------------------------------------------
+  # Semiconductors
+  # ---------------------------------------------------------------------
+  - id: diodes
+    display: Diodes
+    icon: zap
+    description: Zener, Schottky, rectifier, switching and power diodes.
+    detect_keywords:
+      - diode
+      - rectifier
+      - zener
+      - schottky
+      - uf recovery
+
+  - id: transistors
+    display: Transistors
+    icon: triangle-right
+    description: Bipolar, digital and Darlington transistors.
+    detect_keywords:
+      - transistor
+      - bipolar
+      - darlington
+
+  - id: semiconductors
+    display: MOSFETs & IGBTs
+    icon: waypoints
+    description: Power MOSFETs, IGBTs and other switching semiconductors.
+    detect_keywords:
+      - mosfet
+      - igbt
+      - fet
+
+  - id: thyristors
+    display: Thyristors
+    icon: toggle-right
+    description: SCRs, TRIACs and DIACs for power control.
+    detect_keywords:
+      - thyristor
+      - scr
+      - triac
+      - diac
+
+  # ---------------------------------------------------------------------
+  # Integrated circuits
+  # ---------------------------------------------------------------------
+  - id: microcontrollers
+    display: Microcontrollers
+    icon: microchip
+    description: 8-bit, 16-bit, 32-bit and ARM microcontrollers.
+    detect_keywords:
+      - microcontroller
+      - mcu
+
+  - id: integrated-circuits
+    display: Integrated Circuits
+    icon: cpu
+    description: Logic, amplifiers, regulators, memory, interface and driver ICs.
+    detect_keywords:
+      - integrated circuit
+      - amplifier
+      - comparator
+      - regulator
+      - logic
+      - opamp
+      - op amp
+      - transceiver
+      - buffer
+      - multiplexer
+      - demultiplexer
+      - mux
+      - demux
+      - adc
+      - dac
+      - driver ic
+      - gate driver
+      - drivers and interfaces
+      - interface ic
+      - memory ic
+      - sram
+      - dram
+      - eeprom
+      - frequency management
+      - clock timing
+      - smd ic
+      - switching ic
+      - active filter
+      - optocoupler
+      - photocoupler
+      - ic
+    title_only:
+      - ic
+
+  # ---------------------------------------------------------------------
+  # Electromechanical
+  # ---------------------------------------------------------------------
+  - id: sensors
+    display: Sensors
+    icon: thermometer
+    description: Temperature, humidity, gas, ultrasonic, IMU, light and load sensors.
+    detect_keywords:
+      - sensor
+      - thermocouple
+      - thermistor
+      - pyranometer
+      - ultrasonic
+      - proximity
+      - accelerometer
+      - gyroscope
+      - imu
+      - lidar
+      - radar
+      - barometer
+      - humidity
+      - hall
+      - load cell
+      - fingerprint
+      - photoelectric
+      - soil moisture
+      - air quality
+      - water quality
+      - flow sensor
+      - level sensor
+      - pressure sensor
+      - transducer
+      - ecg
+      - emg
+      - pir
+      - ir sensor
+
+  - id: connectors
+    display: Connectors
+    icon: plug
+    description: Headers, sockets, USB, RF, circular, terminal blocks and jacks.
+    detect_keywords:
+      - connector
+      - receptacle
+      - housing
+      - header
+      - terminal block
+      - terminal
+      - jack
+      - socket
+      - d sub
+      - circular
+      - din
+      - ffc
+      - frc
+      - rf connector
+      - backplane
+      - pin header
+      - jumper wire
+      - dupont
+      - wire to board
+      - usb connector
+      - usb type c
+      - pcb adapter
+    vendor_only:
+      - usb
+
+  - id: switches
+    display: Switches
+    icon: toggle-left
+    description: Tactile, push button, rocker, toggle, slide and rotary switches.
+    detect_keywords:
+      - switch
+      - push button
+      - pushbutton
+      - rocker
+      - toggle
+      - slide switch
+      - rotary switch
+      - microswitch
+      - keypad
+
+  - id: relay
+    display: Relays
+    icon: signal
+    description: Power, signal, automotive, latching, SSR and time-delay relays.
+    detect_keywords:
+      - relay
+      - relays
+    vendor_only:
+      - relay module
+      - optocoupler module
+      - power relay
+      - time delay relay
+    attributes:
+      - key: channels
+        display_name: Channels
+        type: integer
+        range: [1, 32]
+        extract:
+          - channels_regex
+
+  # ---------------------------------------------------------------------
+  # Opto / display
+  # ---------------------------------------------------------------------
+  - id: displays
+    display: Displays
+    icon: monitor
+    description: LCD, OLED, TFT, e-Ink, HMI and segment displays.
+    detect_keywords:
+      - display
+      - lcd
+      - oled
+      - tft
+      - e ink
+      - eink
+      - segment
+      - hmi
+      - 7 inch
+      - 16 2
+
+  - id: leds
+    display: LEDs
+    icon: lightbulb
+    description: SMD and through-hole LEDs, indicators, strips and modules.
+    detect_keywords:
+      - led
+      - indicator light
+      - panel indicator
+      - led strip
+      - strip light
+      - rgb
+      - light emitting
+      - lamp
+
+  # ---------------------------------------------------------------------
+  # Modules and boards
+  # ---------------------------------------------------------------------
+  - id: modules
+    display: Modules & Boards
+    icon: circuit-board
+    description: Arduino, Raspberry Pi, ESP32, IoT, breakout and shield boards.
+    detect_keywords:
+      - module
+      - development board
+      - dev board
+      - board
+      - arduino
+      - raspberry pi
+      - shield
+      - breakout
+      - hat
+      - sbc
+      - single board computer
+      - espressif
+      - esp32
+      - esp8266
+      - node mcu
+      - stm32
+      - teensy
+      - micro bit
+      - beaglebone
+      - jetson
+      - wemos
+      - seeed
+      - df robot
+      - cytron
+      - ai thinker
+      - interface module
+      - usb interface module
+      - breadboard
+      - rotary encoder
+      - antenna
+      - rfid
+      - wireless
+      - transmitter receiver
+      - transmitters and receivers
+      - rf transmitter
+      - ir receiver
+      - remote control
+      - bluetooth
+      - wifi router
+      - wifi module
+
+  # ---------------------------------------------------------------------
+  # Power
+  # ---------------------------------------------------------------------
+  - id: power
+    display: Power & Converters
+    icon: bolt
+    description: SMPS, AC-DC and DC-DC converters, buck/boost modules, adapters and BMS.
+    detect_keywords:
+      - power supply
+      - ac to dc
+      - dc to dc
+      - buck
+      - boost converter
+      - converter
+      - inverter
+      - power adapter
+      - dc adapter
+      - solar
+      - smps
+      - ups
+      - hi link
+      - bms
+      - power bank
+      - power module
+      - power distribution
+      - transformer
+
+  - id: battery
+    display: Batteries & Chargers
+    icon: battery-charging
+    description: Li-ion, LiPo, NiMH cells, packs, holders and chargers.
+    detect_keywords:
+      - battery
+      - batteries
+      - lipo
+      - li-ion
+      - lifepo4
+      - '18650'
+    vendor_only:
+      - battery charger
+      - battery pack
+      - li-ion charger
+    attributes:
+      - key: voltage
+        display_name: Voltage
+        type: enum
+        unit: V
+        # Open enum: battery voltages are open-ended (1.2V, 3.7V, 7.4V, 11.1V,
+        # 22.2V, 51.2V, ...). Stored as a numeric string; ordering operators work
+        # via CAST(value AS REAL).
+        extract:
+          - voltage_regex
+      - key: cells
+        display_name: Cell Count
+        type: enum
+        values: ["1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "10s", "12s", "14s", "16s"]
+        extract:
+          - cells_regex
+      - key: capacity_mah
+        display_name: Capacity
+        type: integer
+        unit: mAh
+        range: [10, 100000]
+        extract:
+          - capacity_mah_regex
+          - capacity_ah_regex
+      - key: discharge_c
+        display_name: Discharge Rate (C)
+        type: integer
+        unit: C
+        range: [1, 300]
+        extract:
+          - c_rate_regex
+      - key: chemistry
+        display_name: Chemistry
+        type: enum
+        values: ["lipo", "liion", "lifepo4", "nimh", "leadacid"]
+        extract:
+          - chemistry_regex
+
   - id: motor
-    display: Motors
+    display: Motors & Drivers
+    icon: cog
+    description: DC, stepper, servo, gear motors and their driver boards.
     detect_keywords:
       - motor
       - motors
       - bldc
       - stepper
+    vendor_only:
+      - geared motor
+      - motor driver
+      - dc motor
+      - servo motor
+      - brushless
     attributes:
       - key: voltage
         display_name: Operating Voltage
@@ -29,47 +480,241 @@ categories:
         unit: A
         extract:
           - current_a_regex
+      - key: torque_kgcm
+        display_name: Holding Torque (kg-cm)
+        type: float
+        unit: kg-cm
+        range: [0.01, 500]
+        extract:
+          - torque_kgcm_regex
 
-  - id: battery
-    display: Batteries
+  # ---------------------------------------------------------------------
+  # Hobby / maker
+  # ---------------------------------------------------------------------
+  - id: drones
+    display: Drones & FPV
+    icon: drone
+    description: Drone frames, motors, ESCs, flight controllers, cameras and FPV gear.
     detect_keywords:
-      - battery
-      - batteries
-      - lipo
-      - li-ion
-      - lifepo4
-      - '18650'
-    attributes:
-      - key: cells
-        display_name: Cell Count
-        type: enum
-        values: ["1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "10s", "12s", "14s", "16s"]
-        extract:
-          - cells_regex
-      - key: capacity_mah
-        display_name: Capacity
-        type: integer
-        unit: mAh
-        range: [10, 100000]
-        extract:
-          - capacity_mah_regex
-          - capacity_ah_regex
-      - key: chemistry
-        display_name: Chemistry
-        type: enum
-        values: ["lipo", "liion", "lifepo4", "nimh", "leadacid"]
-        extract:
-          - chemistry_regex
+      - drone
+      - fpv
+      - fpv camera
+      - quadcopter
+      - propeller
+      - flight controller
+      - esc
+      - telemetry transmitter
+      - gps gnss
+      - aeromodel
+      - rc receiver
 
-  - id: relay
-    display: Relays
+  - id: robotics
+    display: Robotics & Automation
+    icon: robot-arm
+    description: Robot kits, actuators, bearings, couplings, gears and chassis parts.
     detect_keywords:
-      - relay
-      - relays
-    attributes:
-      - key: channels
-        display_name: Channels
-        type: integer
-        range: [1, 32]
-        extract:
-          - channels_regex
+      - robot
+      - actuator
+      - bearing
+      - coupling
+      - mecanum
+      - gear
+      - pulley
+      - timing belt
+      - wheel
+      - chassis
+      - linear motion
+      - rail guide
+      - piston
+      - e bike
+
+  - id: printing
+    display: 3D Printing
+    icon: printer-3d
+    description: 3D printers, filaments, nozzles, extruders and printer spare parts.
+    detect_keywords:
+      - 3d printer
+      - 3d print
+      - 3d printing
+      - filament
+      - nozzle
+      - extruder
+      - printer bed
+      - resin
+      - ender
+      - creality
+      - bambu
+      - prusa
+      - anycubic
+      - sovol
+      - elegoo
+      - atomstack
+
+  - id: kits
+    display: DIY Kits & Education
+    icon: graduation-cap
+    description: Arduino kits, STEM kits, learning kits and robotics bundles.
+    detect_keywords:
+      - kit
+      - stem
+      - educational
+      - learning kit
+      - robot kit
+      - arduino kit
+      - diy kit
+    vendor_only:
+      - diy
+
+  # ---------------------------------------------------------------------
+  # Protection / timing / interconnect
+  # ---------------------------------------------------------------------
+  - id: fuses
+    display: Fuses & Protection
+    icon: shield
+    description: Cartridge, resettable, automotive fuses, holders and circuit breakers.
+    detect_keywords:
+      - fuse
+      - circuit breaker
+      - varistor
+      - ptc
+      - surge protector
+
+  - id: crystals
+    display: Crystals & Timing
+    icon: clock
+    description: Quartz crystals, oscillators and RTC modules.
+    detect_keywords:
+      - quartz crystal
+      - real time clock
+      - rtc
+      - resonator
+    vendor_only:
+      - crystal
+      - oscillator
+
+  - id: wires
+    display: Wires & Cables
+    icon: cable
+    description: Hook-up wire, jumper leads, USB/interfacing cables and harnesses.
+    detect_keywords:
+      - wire
+      - cable
+      - harness
+      - bootlace
+      - ferrules
+      - heat shrink
+      - prototyping
+    vendor_only:
+      - pvc wire
+
+  # ---------------------------------------------------------------------
+  # Thermal / audio / imaging
+  # ---------------------------------------------------------------------
+  - id: thermal
+    display: Thermal & Cooling
+    icon: flame
+    description: Heat sinks, cooling fans, thermoelectric coolers and thermal pads.
+    detect_keywords:
+      - heat sink
+      - heatsink
+      - cooling fan
+      - fan
+      - thermal
+      - pelletier
+      - cooler
+      - cooling plate
+
+  - id: audio
+    display: Audio
+    icon: volume-2
+    description: Amplifiers, speakers, buzzers, microphones and audio modules.
+    detect_keywords:
+      - audio
+      - amplifier
+      - speaker
+      - buzzer
+      - microphone
+      - mic
+      - sound
+      - music
+
+  - id: imaging
+    display: Cameras & Imaging
+    icon: camera
+    description: Cameras, lenses, optical sensors and imaging modules.
+    detect_keywords:
+      - camera
+      - lens
+      - arducam
+      - webcam
+      - thermal camera
+      - thermal imaging
+      - vision camera
+      - optical flow
+      - depth camera
+
+  # ---------------------------------------------------------------------
+  # Tools and hardware
+  # ---------------------------------------------------------------------
+  - id: tools
+    display: Tools & Measurement
+    icon: wrench
+    description: Multimeters, soldering stations, oscilloscopes, hand and power tools.
+    detect_keywords:
+      - tool
+      - multimeter
+      - soldering
+      - solder
+      - screwdriver
+      - pliers
+      - wrench
+      - tweezers
+      - bench
+      - oscilloscope
+      - signal generator
+      - clamp meter
+      - scale
+      - measuring tape
+      - endoscope
+      - microscope
+      - heat gun
+      - drill
+      - programmer
+      - scanner
+      - probe
+      - sound level meter
+    vendor_only:
+      - meter
+
+  - id: hardware
+    display: Hardware & Mechanical
+    icon: nut
+    description: Nuts, bolts, spacers, standoffs, extrusion profiles and craft supplies.
+    detect_keywords:
+      - hardware
+      - mechanical
+      - nut
+      - bolt
+      - screw
+      - spacer
+      - standoff
+      - lug
+      - extrusion
+      - carbon fiber
+      - craft
+      - pc accessories
+      - dowel
+      - rod
+      - container
+      - solid state drive
+    vendor_only:
+      - tape
+
+  # ---------------------------------------------------------------------
+  # Fallback
+  # ---------------------------------------------------------------------
+  - id: other
+    display: Other Components
+    icon: package
+    description: Components that do not fit a more specific category.
+    detect_keywords: []

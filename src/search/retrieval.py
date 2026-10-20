@@ -56,7 +56,9 @@ class EnhancedSQLiteBackend:
         query: str,
         limit: int = 50,
         vendor: Optional[str] = None,
-        in_stock_only: bool = False
+        in_stock_only: bool = False,
+        category: Optional[str] = None,
+        spec_filters: Optional[Dict[str, Any]] = None
     ) -> List[UnifiedProduct]:
         intent_res = get_query_intent(query)
         
@@ -65,7 +67,9 @@ class EnhancedSQLiteBackend:
             query=query,
             limit=max(100, limit * 3),
             vendor=vendor,
-            in_stock_only=in_stock_only
+            in_stock_only=in_stock_only,
+            category=category,
+            spec_filters=spec_filters
         )
 
         if not raw_candidates:
@@ -75,7 +79,9 @@ class EnhancedSQLiteBackend:
                     query=intent_res.matched_key,
                     limit=max(100, limit * 3),
                     vendor=vendor,
-                    in_stock_only=in_stock_only
+                    in_stock_only=in_stock_only,
+                    category=category,
+                    spec_filters=spec_filters
                 )
 
         # Ensure canonical hero product(s) for matched intent key are in candidates pool
@@ -106,6 +112,7 @@ class EnhancedSQLiteBackend:
                             product_url=r["product_url"],
                             image_url=r["image_url"],
                             category=r["category"],
+                            category_canonical=r["category_canonical"] if "category_canonical" in r.keys() else None,
                             is_canonical=bool(r["is_canonical"]) if "is_canonical" in r.keys() and r["is_canonical"] else False,
                             canonical_for=r["canonical_for"] if "canonical_for" in r.keys() else None,
                             query_ctr=float(r["query_ctr"]) if "query_ctr" in r.keys() and r["query_ctr"] is not None else None,
@@ -150,7 +157,9 @@ def search_catalog_ranked(
     query: str,
     limit: int = 50,
     vendor: Optional[str] = None,
-    in_stock_only: bool = False
+    in_stock_only: bool = False,
+    category: Optional[str] = None,
+    spec_filters: Optional[Dict[str, Any]] = None
 ) -> List[UnifiedProduct]:
     """
     Main ranked catalog search function.
@@ -168,5 +177,7 @@ def search_catalog_ranked(
         query=query,
         limit=limit,
         vendor=vendor,
-        in_stock_only=in_stock_only
+        in_stock_only=in_stock_only,
+        category=category,
+        spec_filters=spec_filters
     )

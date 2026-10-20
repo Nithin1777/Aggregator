@@ -3,11 +3,16 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+pytest-of-*/
 
 # Virtual environments
 .venv/
 venv/
 env/
+
+# Node (only used to regenerate the icon pack: scripts/generate_icons.py)
+node_modules/
+package-lock.json
 
 # Runtime logs and telemetry (large and regenerable; see logs/)
 logs/

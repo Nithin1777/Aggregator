@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "aggregate": {
+      "type": "stdio",
+      "command": "C:\\Users\\nithi\\Downloads\\Platfrom Scrapper\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\nithi\\Downloads\\Platfrom Scrapper\\scripts\\run_mcp.py"
+      ],
+      "env": {}
+    }
+  }
+}

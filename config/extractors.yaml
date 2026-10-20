@@ -182,3 +182,41 @@ extractors:
         out: null
       - in: 'Bonka 4S LiPo Battery'
         out: null
+
+  torque_kgcm_regex:
+    kind: regex
+    pattern: '(?<![a-zA-Z0-9])(\d+(?:\.\d+)?)\s*kg[\s-]*cm\b'
+    flags:
+      - IGNORECASE
+    normalize:
+      type: float
+    tests:
+      - in: 'NEMA17 4.2kgcm Stepper Motor'
+        out: 4.2
+      - in: '28HS51-0674JX5.18 NEMA11 1.2 Kg-cm Stepper Motor'
+        out: 1.2
+      - in: '24V 150RPM 100W IG52 Extra Heavy Duty Planetary Geared DC motor 80kgcm'
+        out: 80.0
+      - in: '12V 200RPM DC Motor'
+        out: null
+      - in: 'ESP32 WROOM-32 WiFi Module'
+        out: null
+
+  c_rate_regex:
+    kind: regex
+    pattern: '(?<![a-zA-Z0-9])(\d{1,3})\s*c\b(?![a-zA-Z])'
+    flags:
+      - IGNORECASE
+    normalize:
+      type: integer
+    tests:
+      - in: '11.1V 2200mAh 3S 60C Rechargeable LiPo Battery'
+        out: 60
+      - in: 'Orange 3S 2200mAh 30C Battery 3S1P'
+        out: 30
+      - in: '5000mAh 5C LiPo Battery Pack'
+        out: 5
+      - in: 'Type-C 5V Charging Module'
+        out: null
+      - in: '16 Channel Relay Board'
+        out: null

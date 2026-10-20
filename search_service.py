@@ -7,8 +7,11 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import re
 import sqlite3
+import time
 from typing import AsyncGenerator, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 from adapters.base import BaseAdapter
 from adapters.robu import RobuAdapter
 from adapters.robokits import RobokitsAdapter
@@ -18,6 +21,7 @@ import db
 from models import (
     ComparisonGroup,
     IngestProgress,
+    PriceStockRefreshInfo,
     SearchResponse,
     UnifiedProduct,
     VendorOffer,
@@ -80,6 +84,14 @@ class AggregatorEngine:
         # Audit lines are queued and flushed once per grouping pass. Writing per pair
         # meant ~1200 open/write/close cycles per search (~550ms) and an unbounded log.
         self._pending_decisions: List[str] = []
+        # Search-time price/stock refresh coordination. The plain flag avoids
+        # duplicate vendor traffic when two page views hit at once; the cooldown is
+        # a circuit breaker so an offline catalog serves cache instantly.
+        self._refresh_in_progress = False
+        self._refresh_cooldown_until = 0.0
+        # Tracks which event loop owns the adapters' HTTP sessions. A reused engine
+        # (tests, embedded servers) must not send sessions across loop boundaries.
+        self._active_loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def close(self):
         """Cleanly closes all adapter sessions."""
@@ -289,9 +301,13 @@ class AggregatorEngine:
                     product_url=p.product_url,
                     image_url=p.image_url,
                     sku=p.sku,
+                    category=p.category,
+                    category_canonical=p.category_canonical,
                     merge_reason=merge_reason,
                     variant_key=variant_key,
-                    source=card_source
+                    source=card_source,
+                    price_updated_at=p.price_updated_at,
+                    price_source=p.price_source or "cache"
                 )
                 if p.vendor not in offers_by_vendor:
                     offers_by_vendor[p.vendor] = offer
@@ -327,6 +343,10 @@ class AggregatorEngine:
                 in_stock_count=len(in_stock_offers),
                 total_offers=len(all_offers),
                 offers=all_offers,
+                category=next((p.category for p in items_in_cluster if p.category), None),
+                category_canonical=next(
+                    (p.category_canonical for p in items_in_cluster if p.category_canonical), None
+                ),
                 variant_key=variant_key,
                 merge_reason=merge_reason,
                 variants=[],
@@ -358,6 +378,410 @@ class AggregatorEngine:
         result.sort(key=lambda g: (-g.total_offers, -g.in_stock_count, g.canonical_name))
         return result
 
+    # ------------------------------------------------------------------
+    # Search-time price/stock refresh (live values with cached fallback)
+    # ------------------------------------------------------------------
+
+    async def _ensure_adapter_loop(self) -> None:
+        """Rebuild vendor sessions if the engine is reused on a different event loop."""
+        loop = asyncio.get_running_loop()
+        if self._active_loop is not None and self._active_loop is not loop:
+            for adapter in self.adapters.values():
+                try:
+                    await adapter.close()
+                except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+                    logger.debug("Adapter session cleanup on loop change failed: %s", exc)
+        self._active_loop = loop
+
+    @staticmethod
+    def _offer_url_key(url: Optional[str]) -> str:
+        """Normalizes a product URL so vendor-side variants of one page compare equal."""
+        if not url:
+            return ""
+        try:
+            parts = urlsplit(url.strip().lower())
+            return f"{parts.netloc}{parts.path.rstrip('/')}"
+        except Exception:
+            return url.strip().lower().rstrip("/")
+
+    @staticmethod
+    def _derive_refresh_query(product: UnifiedProduct) -> Optional[str]:
+        """Builds a fallback vendor query from an MPN, else the leading title tokens."""
+        mpn = (product.mpn or "").strip()
+        if len(re.sub(r"[^A-Za-z0-9]", "", mpn)) >= 3:
+            return mpn
+        title = product.normalized_title or product.title or ""
+        tokens = [
+            t for t in re.findall(r"[a-z0-9][a-z0-9\-\.]{2,}", title.lower())
+            if not t.isdigit()
+        ]
+        return " ".join(tokens[:3]) if tokens else None
+
+    @staticmethod
+    def _build_live_index(
+        live_products: List[UnifiedProduct],
+    ) -> Tuple[
+        Dict[Tuple[str, str], UnifiedProduct],
+        Dict[Tuple[str, str], UnifiedProduct],
+        Dict[Tuple[str, str], UnifiedProduct],
+    ]:
+        """Indexes live results for exact matching: (vendor, external_id), URL, then SKU."""
+        by_external: Dict[Tuple[str, str], UnifiedProduct] = {}
+        by_url: Dict[Tuple[str, str], UnifiedProduct] = {}
+        by_sku: Dict[Tuple[str, str], UnifiedProduct] = {}
+        for lp in live_products:
+            if lp.external_id:
+                by_external[(lp.vendor, str(lp.external_id).strip())] = lp
+            url_key = AggregatorEngine._offer_url_key(lp.product_url)
+            if url_key:
+                by_url[(lp.vendor, url_key)] = lp
+            if lp.sku:
+                by_sku[(lp.vendor, str(lp.sku).strip().lower())] = lp
+        return by_external, by_url, by_sku
+
+    @classmethod
+    def _match_live_result(
+        cls,
+        product: UnifiedProduct,
+        by_external: Dict[Tuple[str, str], UnifiedProduct],
+        by_url: Dict[Tuple[str, str], UnifiedProduct],
+        by_sku: Dict[Tuple[str, str], UnifiedProduct],
+    ) -> Optional[UnifiedProduct]:
+        """Finds the live listing that corresponds to a cached product, if any."""
+        match = by_external.get((product.vendor, str(product.external_id).strip()))
+        if match is not None:
+            return match
+        url_key = cls._offer_url_key(product.product_url)
+        if url_key:
+            match = by_url.get((product.vendor, url_key))
+            if match is not None:
+                return match
+        if product.sku:
+            match = by_sku.get((product.vendor, str(product.sku).strip().lower()))
+            if match is not None:
+                return match
+        return None
+
+    async def _search_vendors_for_refresh(
+        self,
+        query: str,
+        limit_per_vendor: int,
+        timeout: float,
+    ) -> Tuple[List[UnifiedProduct], set, set]:
+        """
+        One parallel federated lookup for the refresh pass.
+
+        Returns (live_products, ok_vendor_ids, failed_vendor_ids). A vendor that
+        finishes after the budget is reported as failed rather than blocking the
+        page; results from vendors that did finish in time are salvaged.
+        """
+        if not self.adapters:
+            return [], set(), set()
+
+        tasks: Dict["asyncio.Task", str] = {}
+        for vendor_id, adapter in self.adapters.items():
+            task = asyncio.create_task(adapter.search_live(query, limit=limit_per_vendor))
+            # Consume exceptions in a callback so a late failure is never logged as
+            # "exception was never retrieved" when the budget expires.
+            task.add_done_callback(
+                lambda t: t.cancelled() or t.exception()
+            )
+            tasks[task] = vendor_id
+
+        try:
+            done, pending = await asyncio.wait(set(tasks.keys()), timeout=max(0.5, timeout))
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+        products: List[UnifiedProduct] = []
+        ok: set = set()
+        failed: set = set()
+        for task, vendor_id in tasks.items():
+            if task.cancelled():
+                failed.add(vendor_id)
+                continue
+            try:
+                resp = task.result()
+            except Exception as exc:  # noqa: BLE001 - vendor failures become cache fallback
+                logger.info("[Price/Stock] %s unavailable during refresh: %s", vendor_id, exc)
+                failed.add(vendor_id)
+                continue
+            if isinstance(resp, list):
+                ok.add(vendor_id)
+                products.extend(resp)
+            else:
+                failed.add(vendor_id)
+        return products, ok, failed
+
+    async def refresh_price_stock(
+        self,
+        products: List[UnifiedProduct],
+        query: Optional[str] = None,
+        force: bool = False,
+    ) -> PriceStockRefreshInfo:
+        """
+        Refreshes ONLY price and stock for the given products from live vendors,
+        persists the result into SQLite, and falls back to the cached values when a
+        live fetch is impossible (offline, rate-limited, or timing out).
+
+        Never raises for network problems: callers always receive displayable
+        products plus structured freshness metadata.
+        """
+        if not getattr(settings, "price_stock_refresh_enabled", True):
+            return PriceStockRefreshInfo(
+                status="disabled",
+                cached_products=len(products),
+                message="Live price/stock refresh is disabled (PRICE_STOCK_REFRESH=0).",
+            )
+
+        if not products:
+            return PriceStockRefreshInfo(status="fresh_cache", message="No products to refresh.")
+
+        now_mono = time.monotonic()
+        if not force and now_mono < self._refresh_cooldown_until:
+            remaining = int(self._refresh_cooldown_until - now_mono)
+            return PriceStockRefreshInfo(
+                status="offline_cooldown",
+                cached_products=len(products),
+                message=(
+                    "Vendors were unreachable moments ago; serving price/stock from the local "
+                    f"catalog (retrying in ~{remaining}s)."
+                ),
+            )
+
+        if self._refresh_in_progress:
+            return PriceStockRefreshInfo(
+                status="fresh_cache",
+                cached_products=len(products),
+                message="Another price/stock refresh is already running; serving cached values.",
+            )
+
+        await self._ensure_adapter_loop()
+        self._refresh_in_progress = True
+        try:
+            return await self._refresh_price_stock_inner(products, query=query, force=force)
+        except Exception as exc:  # noqa: BLE001 - cache fallback must survive any failure
+            logger.warning("[Price/Stock] Refresh failed unexpectedly: %s", exc)
+            self._refresh_cooldown_until = time.monotonic() + float(
+                getattr(settings, "price_stock_offline_cooldown_seconds", 60.0)
+            )
+            return PriceStockRefreshInfo(
+                status="error",
+                attempted=True,
+                cached_products=len(products),
+                message=f"Live price/stock refresh failed ({exc}); serving cached values.",
+            )
+        finally:
+            self._refresh_in_progress = False
+
+    async def _refresh_price_stock_inner(
+        self,
+        products: List[UnifiedProduct],
+        query: Optional[str],
+        force: bool,
+    ) -> PriceStockRefreshInfo:
+        candidates = [p for p in products if p.id is not None]
+        info = PriceStockRefreshInfo(
+            candidates=len(candidates),
+            cached_products=len(products) - len(candidates),
+        )
+        if not candidates:
+            info.status = "fresh_cache"
+            info.message = "Products carry no database IDs; serving cached price/stock."
+            return info
+
+        ttl = int(getattr(settings, "price_stock_ttl_seconds", 180))
+        stale_ids = set(
+            db.get_stale_price_stock_ids([p.id for p in candidates], ttl, force=force)
+        )
+        pending = [p for p in candidates if p.id in stale_ids]
+
+        if not pending:
+            info.status = "fresh_cache"
+            info.cached_products = len(products)
+            info.message = f"Cached price/stock is fresh (verified within the last {ttl}s)."
+            return info
+
+        max_queries = max(1, int(getattr(settings, "price_stock_max_refresh_queries", 2)))
+        budget = float(getattr(settings, "price_stock_refresh_timeout_seconds", 8.0))
+        limit_per_vendor = max(1, int(getattr(settings, "price_stock_live_limit_per_vendor", 15)))
+
+        # The user's own query is the best lookup key; products it misses fall back
+        # to their MPN (or leading title tokens), bounded by the query budget.
+        text_query = (query or "").strip()
+        queries: List[str] = []
+        if text_query:
+            queries.append(text_query)
+        seen = {q.lower() for q in queries}
+        for p in pending:
+            if len(queries) >= max_queries:
+                break
+            derived = self._derive_refresh_query(p)
+            if derived and derived.lower() not in seen:
+                seen.add(derived.lower())
+                queries.append(derived)
+
+        if not queries:
+            info.status = "cached"
+            info.cached_products = len(products)
+            info.message = "No usable query to refresh price/stock; serving cached values."
+            return info
+
+        vendors_ok: set = set()
+        vendors_failed: set = set()
+        matched: Dict[int, UnifiedProduct] = {}
+        used_queries: List[str] = []
+        deadline = time.monotonic() + budget
+
+        for q in queries:
+            if not pending:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.5:
+                logger.info("[Price/Stock] Refresh budget exhausted before lookup %r", q)
+                break
+
+            live_products, ok, failed = await self._search_vendors_for_refresh(
+                q, limit_per_vendor, remaining
+            )
+            used_queries.append(q)
+            vendors_ok |= ok
+            vendors_failed |= failed
+
+            if live_products:
+                by_external, by_url, by_sku = self._build_live_index(live_products)
+                still_pending: List[UnifiedProduct] = []
+                for p in pending:
+                    match = self._match_live_result(p, by_external, by_url, by_sku)
+                    if match is not None:
+                        matched[p.id] = match
+                    else:
+                        still_pending.append(p)
+                pending = still_pending
+
+            if not ok:
+                # Every vendor failed for this lookup: stop retrying and serve cache.
+                break
+
+        fetched_at = db.utc_now_iso()
+        updates: List[Dict[str, Any]] = []
+        for p in candidates:
+            live = matched.get(p.id)
+            if live is None:
+                continue
+            p.price = float(live.price)
+            p.available = bool(live.available)
+            p.price_source = "live"
+            p.price_updated_at = fetched_at
+            updates.append(
+                {
+                    "id": p.id,
+                    "price": p.price,
+                    "available": p.available,
+                    "fetched_at": fetched_at,
+                }
+            )
+
+        applied = db.update_price_stock_batch(updates)
+        if updates and applied < len(updates):
+            logger.warning(
+                "[Price/Stock] %d refresh(es) could not be persisted (products missing?)",
+                len(updates) - applied,
+            )
+
+        unmatched_ids = [p.id for p in candidates if p.id not in matched]
+        if unmatched_ids:
+            # Record the attempt even when it failed, so an offline catalog is not
+            # hammered on every page view until the TTL elapses.
+            db.mark_price_stock_attempted(unmatched_ids, attempted_at=fetched_at)
+
+        info.attempted = True
+        info.queries = used_queries
+        info.vendors_ok = sorted(vendors_ok)
+        info.vendors_failed = sorted(vendors_failed)
+        info.refreshed_products = applied
+        info.cached_products = max(len(products) - applied, 0)
+
+        if applied > 0:
+            info.fetched_at = fetched_at
+            if vendors_failed:
+                info.status = "partial"
+                info.message = (
+                    f"Refreshed price/stock for {applied} listing(s); unreachable vendors: "
+                    f"{', '.join(sorted(vendors_failed))}. Remaining listings use cached values."
+                )
+            else:
+                info.status = "live"
+                info.message = (
+                    f"Refreshed price/stock for {applied} listing(s) from live vendor data "
+                    f"(cached in the local catalog for offline fallback)."
+                )
+        else:
+            info.status = "cached"
+            if vendors_ok:
+                info.message = (
+                    "Live vendors responded but no listing matched the refresh lookups; "
+                    "serving cached price/stock."
+                )
+            else:
+                self._refresh_cooldown_until = time.monotonic() + float(
+                    getattr(settings, "price_stock_offline_cooldown_seconds", 60.0)
+                )
+                info.message = (
+                    "Live vendors are unreachable; serving the latest price/stock cached in the "
+                    "local catalog."
+                )
+        return info
+
+    async def search_local_refreshed(
+        self,
+        query: str,
+        limit: int = 50,
+        vendor: Optional[str] = None,
+        in_stock_only: bool = False,
+        refresh_mode: str = "auto",
+        category: Optional[str] = None,
+        spec_filters: Optional[Dict[str, Any]] = None,
+    ) -> SearchResponse:
+        """
+        Local catalog search that refreshes price/stock for the matched listings
+        before building the response, falling back to cached values when offline.
+
+        refresh_mode: 'auto' (respect the TTL), 'force' (bypass the TTL), 'off'.
+        category: optional canonical category slug to filter on.
+        """
+        products = await asyncio.to_thread(
+            search_catalog_ranked,
+            query=query,
+            limit=limit,
+            vendor=vendor,
+            in_stock_only=in_stock_only,
+            category=category,
+            spec_filters=spec_filters,
+        )
+
+        price_refresh: Optional[PriceStockRefreshInfo] = None
+        if products and refresh_mode != "off":
+            price_refresh = await self.refresh_price_stock(
+                products, query=query, force=(refresh_mode == "force")
+            )
+            if in_stock_only:
+                # Availability may have flipped during the refresh; an explicit
+                # in-stock filter must stay truthful.
+                products = [p for p in products if p.available]
+
+        comparison_groups = await asyncio.to_thread(self.group_and_compare, products, query=query)
+        return SearchResponse(
+            query=query,
+            total_results=len(products),
+            source="local_db",
+            results=products,
+            comparison_groups=comparison_groups,
+            price_refresh=price_refresh,
+        )
+
     async def search_live(self, query: str, limit_per_vendor: int = 15) -> SearchResponse:
         """
         Federated search across Robu, QuartzComponents, and MakerBazar in parallel.
@@ -367,6 +791,8 @@ class AggregatorEngine:
         if not clean_q:
             return SearchResponse(query=query, total_results=0, source="live")
 
+        await self._ensure_adapter_loop()
+
         tasks = [
             adapter.search_live(clean_q, limit=limit_per_vendor)
             for adapter in self.adapters.values()
@@ -375,11 +801,20 @@ class AggregatorEngine:
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_products: List[UnifiedProduct] = []
+        vendors_ok: List[str] = []
+        vendors_failed: List[str] = []
         for (name, adapter), resp in zip(self.adapters.items(), responses):
             if isinstance(resp, Exception):
                 logger.error(f"Error querying {name} live: {resp}")
+                vendors_failed.append(name)
             elif isinstance(resp, list):
+                vendors_ok.append(name)
                 all_products.extend(resp)
+
+        fetched_at = db.utc_now_iso()
+        for p in all_products:
+            p.price_source = "live"
+            p.price_updated_at = fetched_at
 
         # Upsert newly fetched live items to local DB in background
         if all_products:
@@ -390,12 +825,39 @@ class AggregatorEngine:
 
         comparison_groups = self.group_and_compare(all_products)
 
+        if all_products:
+            refresh_status = "partial" if vendors_failed else "live"
+            refresh_message = (
+                f"Live vendor search returned {len(all_products)} listing(s); "
+                f"price/stock cached in the local catalog."
+            )
+        elif vendors_ok:
+            refresh_status = "live"
+            refresh_message = "Live vendors responded but returned no matching listings."
+        else:
+            refresh_status = "cached"
+            refresh_message = "No vendor could be reached; no live listings to compare."
+
+        price_refresh = PriceStockRefreshInfo(
+            status=refresh_status,
+            attempted=True,
+            candidates=len(all_products),
+            refreshed_products=len(all_products),
+            cached_products=0,
+            vendors_ok=sorted(vendors_ok),
+            vendors_failed=sorted(vendors_failed),
+            queries=[clean_q],
+            fetched_at=fetched_at if all_products else None,
+            message=refresh_message,
+        )
+
         return SearchResponse(
             query=clean_q,
             total_results=len(all_products),
             source="live",
             results=all_products,
-            comparison_groups=comparison_groups
+            comparison_groups=comparison_groups,
+            price_refresh=price_refresh
         )
 
     def search_local(
@@ -403,16 +865,23 @@ class AggregatorEngine:
         query: str,
         limit: int = 50,
         vendor: Optional[str] = None,
-        in_stock_only: bool = False
+        in_stock_only: bool = False,
+        category: Optional[str] = None,
+        spec_filters: Optional[Dict[str, Any]] = None
     ) -> SearchResponse:
         """
         Queries indexed database using Enhanced SQLite BM25 + RRF and intent-gated ranking.
+
+        Synchronous and cache-only: use `search_local_refreshed` (async) when the
+        response should carry freshly verified price/stock with fallback.
         """
         products = search_catalog_ranked(
             query=query,
             limit=limit,
             vendor=vendor,
-            in_stock_only=in_stock_only
+            in_stock_only=in_stock_only,
+            category=category,
+            spec_filters=spec_filters
         )
         comparison_groups = self.group_and_compare(products, query=query)
         return SearchResponse(

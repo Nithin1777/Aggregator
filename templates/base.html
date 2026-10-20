@@ -1,0 +1,81 @@
+{#
+  Shared shell for every Aggregate page.
+
+  Expects: `page_title`, `page_description`, `active_nav` (optional),
+           `header_search` (bool, default true).
+#}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}{{ page_title|default("Aggregate") }}{% endblock %}</title>
+  <meta name="description" content="{{ page_description|default('Compare prices and stock for electronic components across India''s leading distributors.') }}">
+  <meta name="theme-color" content="#4338ca">
+  <link rel="icon" href="{{ url_for('static', path='icons/favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', path='css/aggregate.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body class="{% if has_results|default(false) %}has-results{% endif %}">
+<div class="page">
+
+  <header class="header">
+    <div class="shell header__inner">
+      <a class="brand" href="/">
+        <span class="brand__mark">{{ icon("boxes", 17) }}</span>
+        <span class="brand__text">Aggregate</span>
+      </a>
+
+      {% if header_search|default(true) %}
+      <div class="header__search">
+        {% include "partials/search_box.html" %}
+      </div>
+      {% endif %}
+
+      <nav class="nav">
+        <a class="nav__link {{ 'is-active' if active_nav == 'categories' else '' }}"
+           href="/categories">Categories</a>
+        <a class="nav__link nav__link--optional {{ 'is-active' if active_nav == 'vendors' else '' }}"
+           href="/vendors">Vendors</a>
+        <a class="nav__link nav__link--optional" href="/api/status" target="_blank" rel="noopener">API</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="main">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <div class="shell footer__inner">
+      <div class="footer__stats">
+        {% if catalog_stats %}
+          <span class="footer__stat">{{ icon("database", 14) }} {{ "{:,}".format(catalog_stats.total_products) }} parts indexed</span>
+          <span class="footer__stat">{{ icon("store", 14) }} {{ catalog_stats.vendor_count }} vendors</span>
+          <span class="footer__stat">{{ icon("layers", 14) }} {{ catalog_stats.category_count }} categories</span>
+        {% endif %}
+      </div>
+      <div class="footer__links">
+        <a href="/categories">Browse categories</a>
+        <a href="/api/status" target="_blank" rel="noopener">Catalog status</a>
+        <span>Aggregate &middot; component comparison for India</span>
+      </div>
+    </div>
+  </footer>
+
+</div>
+
+<div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label="Product image">
+  <figure class="lightbox__figure">
+    <button type="button" class="lightbox__close" data-lightbox-close aria-label="Close">
+      {{ icon("x", 16) }}
+    </button>
+    <img id="lightbox-img" src="" alt="">
+    <figcaption class="lightbox__caption" id="lightbox-caption"></figcaption>
+  </figure>
+</div>
+
+<script src="{{ url_for('static', path='js/aggregate.js') }}" defer></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

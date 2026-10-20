@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -46,12 +46,21 @@ class TaxonomyCategory:
     display: str
     detect_keywords: List[str]
     attributes: Dict[str, TaxonomyAttribute]
+    icon: str = "package"
+    description: str = ""
+    vendor_only: List[str] = field(default_factory=list)
+    title_only: List[str] = field(default_factory=list)
 
 @dataclass
 class Taxonomy:
     version: int
     advertise_min_fill: float
     categories: Dict[str, TaxonomyCategory]
+    junk_raw: Tuple[str, ...] = ()
+
+    def categories_with_attributes(self) -> List[str]:
+        """Category ids that carry filterable spec attributes."""
+        return [cid for cid, cat in self.categories.items() if cat.attributes]
 
 # Module-level cache
 _CACHED_TAXONOMY: Optional[Taxonomy] = None
@@ -232,14 +241,19 @@ def _load_and_validate_taxonomy(taxonomy_path: Path, extractors: Dict[str, Extra
         categories[cat_id] = TaxonomyCategory(
             id=cat_id,
             display=display,
-            detect_keywords=detect_keywords,
-            attributes=attributes
+            detect_keywords=[str(k) for k in detect_keywords],
+            attributes=attributes,
+            icon=str(cat_dict.get("icon") or "package"),
+            description=str(cat_dict.get("description") or ""),
+            vendor_only=[str(k) for k in cat_dict.get("vendor_only") or []],
+            title_only=[str(k) for k in cat_dict.get("title_only") or []],
         )
 
     return Taxonomy(
         version=version,
         advertise_min_fill=advertise_min_fill,
-        categories=categories
+        categories=categories,
+        junk_raw=tuple(str(k) for k in raw_data.get("junk_raw") or []),
     )
 
 def load_taxonomy(
@@ -274,3 +288,154 @@ def get_extractors() -> Dict[str, ExtractorDef]:
     """Returns the cached extractors, loading if necessary."""
     _, ext = load_taxonomy()
     return ext
+
+
+# ---------------------------------------------------------------------------
+# Product classification
+#
+# `classify_product()` is the single classifier for the whole catalog. It maps
+# a product onto exactly one canonical category id, using:
+#
+#   1. the vendor's own category string (`products.category`) - the strongest
+#      signal, because it is what the vendor filed the part under,
+#   2. the product title, when the vendor category carries no signal.
+#
+# Matching is token based and plural tolerant, so "Resistors" matches the
+# keyword "resistor" and "switches" matches "switch" without every plural
+# having to be listed by hand.
+# ---------------------------------------------------------------------------
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def tokenize(text: Optional[str]) -> List[str]:
+    """Lower-cases and splits text into alphanumeric tokens."""
+    if not text:
+        return []
+    return _TOKEN_RE.findall(str(text).lower())
+
+
+def _stem_forms(token: str) -> frozenset:
+    """All plausible surface forms of a token (plural / gerund variants)."""
+    forms = {token}
+    if len(token) > 2 and token.endswith("s") and not token.endswith("ss"):
+        forms.add(token[:-1])
+    if len(token) > 3 and token.endswith("es"):
+        forms.add(token[:-2])
+    if len(token) > 3 and token.endswith("ies"):
+        forms.add(token[:-3] + "y")
+    if len(token) > 5 and token.endswith("ing"):
+        forms.add(token[:-3])
+    return frozenset(forms)
+
+
+def tokens_equivalent(a: str, b: str) -> bool:
+    """Token equality that tolerates simple plurals / gerunds on either side."""
+    if a == b:
+        return True
+    return bool(_stem_forms(a) & _stem_forms(b))
+
+
+def contains_phrase(haystack: Sequence[str], phrase: Sequence[str]) -> bool:
+    """True when `phrase` appears as a contiguous (plural tolerant) token run."""
+    n = len(phrase)
+    if n == 0 or len(haystack) < n:
+        return False
+    for i in range(len(haystack) - n + 1):
+        if all(tokens_equivalent(haystack[i + j], phrase[j]) for j in range(n)):
+            return True
+    return False
+
+
+def _phrase_tokens(values: Sequence[str]) -> List[Tuple[str, ...]]:
+    out: List[Tuple[str, ...]] = []
+    for value in values or []:
+        tokens = tuple(tokenize(value))
+        if tokens:
+            out.append(tokens)
+    return out
+
+
+def _best_phrase_match(
+    haystack: Sequence[str], phrases: Sequence[Tuple[str, ...]]
+) -> Optional[Tuple[str, int]]:
+    """Returns the longest matching phrase and its character length."""
+    best: Optional[Tuple[str, int]] = None
+    for phrase in phrases:
+        if contains_phrase(haystack, phrase):
+            weight = len(" ".join(phrase))
+            if best is None or weight > best[1]:
+                best = (" ".join(phrase), weight)
+    return best
+
+
+def is_junk_raw(raw_category: Optional[str], taxonomy: Optional[Taxonomy] = None) -> bool:
+    """True when the vendor category carries no taxonomic signal."""
+    if not raw_category:
+        return True
+    if taxonomy is None:
+        taxonomy = get_taxonomy()
+    tokens = tokenize(raw_category)
+    for phrase in _phrase_tokens(taxonomy.junk_raw):
+        if contains_phrase(tokens, phrase):
+            return True
+    return False
+
+
+def classify_product(
+    raw_category: Optional[str] = None,
+    title: Optional[str] = None,
+    taxonomy: Optional[Taxonomy] = None,
+    spec_category: Optional[str] = None,
+) -> Tuple[Optional[str], str, float]:
+    """
+    Classifies a product into exactly one canonical category id.
+
+    Returns `(category_id, source, confidence)` where `source` is one of
+    "vendor", "title", "spec" or "none". `confidence` is the character length
+    of the keyword that matched, which doubles as a specificity score: the most
+    specific match wins, so "USB Interface Module" is a module and not a
+    connector.
+
+    `spec_category` (the spec-extraction scope, e.g. "motor") is the last
+    resort for products whose vendor category and title carry no signal.
+    """
+    if taxonomy is None:
+        taxonomy = get_taxonomy()
+
+    best_id: Optional[str] = None
+    best_weight = 0
+    best_source = "none"
+
+    raw_tokens = tokenize(raw_category)
+    if raw_tokens and not is_junk_raw(raw_category, taxonomy):
+        for cat_id, cat in taxonomy.categories.items():
+            if cat_id == "other":
+                continue
+            phrases = _phrase_tokens(cat.detect_keywords) + _phrase_tokens(cat.vendor_only)
+            hit = _best_phrase_match(raw_tokens, phrases)
+            if hit is None:
+                continue
+            if hit[1] > best_weight:
+                best_id, best_weight, best_source = cat_id, hit[1], "vendor"
+
+    if best_id is None:
+        title_tokens = tokenize(title)
+        for cat_id, cat in taxonomy.categories.items():
+            if cat_id == "other":
+                continue
+            phrases = _phrase_tokens(cat.detect_keywords) + _phrase_tokens(cat.title_only)
+            hit = _best_phrase_match(title_tokens, phrases)
+            if hit is None:
+                continue
+            if hit[1] > best_weight:
+                best_id, best_weight, best_source = cat_id, hit[1], "title"
+
+    if best_id is None and spec_category:
+        spec_id = str(spec_category).strip().lower()
+        if spec_id in taxonomy.categories:
+            return spec_id, "spec", 0.0
+
+    if best_id is None:
+        return None, "none", 0.0
+    return best_id, best_source, float(best_weight)

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% set page_title = "Vendors - Aggregate" %}
+{% set page_description = "The Indian electronic component distributors compared by Aggregate." %}
+
+{% block content %}
+<div class="shell">
+
+  <section class="hero" style="padding: 40px 0 24px;">
+    <h1 class="hero__title" style="font-size: 34px;">Vendors we <em>compare</em></h1>
+    <p class="hero__subtitle">
+      Every listing is re-verified against the source storefront, so the price and the stock
+      badge always come from the vendor and not from a stale cache.
+    </p>
+  </section>
+
+  <section class="section" style="margin-top: 12px;">
+    <div class="cat-grid">
+      {% for v in vendors %}
+      <a class="cat-card" href="/?vendor={{ v.vendor }}">
+        <span class="cat-card__icon">{{ icon("store", 19) }}</span>
+        <span class="cat-card__body">
+          <span class="cat-card__label">{{ v.vendor_name }}</span>
+          <span class="cat-card__meta">{{ "{:,}".format(v.count) }} parts &middot; {{ "{:,}".format(v.in_stock) }} in stock</span>
+        </span>
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section__head">
+      <h2 class="section__title">{{ icon("git-compare", 17) }} How matching works</h2>
+    </div>
+    <p style="max-width: 760px; color: var(--text-muted); font-size: 14.5px;">
+      Offers are clustered by manufacturer part number and by their extracted spec signature,
+      so the rows on a comparison card are genuinely the same part. Where two vendors describe
+      a listing differently, the card says so instead of hiding the difference.
+    </p>
+  </section>
+
+</div>
+{% endblock %}

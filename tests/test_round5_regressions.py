@@ -129,11 +129,17 @@ def test_blank_query_is_rejected_instead_of_returning_the_catalog():
 
 
 def test_unmatched_enum_suggestions_are_distance_ranked():
-    res = search_components(filters={"voltage": "99"})
+    # 98765V is impossible for the catalog but the enum is open-ended (battery
+    # voltages are arbitrary), so it must be treated as unmatched-with-suggestions.
+    requested = 98765
+    res = search_components(filters={"voltage": str(requested)})
     assert res.ok is True and res.total_matches == 0
     vals = [float(s["value"]) for s in res.data["suggestions"]]
     assert vals, "expected suggestions"
-    assert vals[0] == max(vals), f"nearest voltage should rank first, got {vals}"
+    # The voltage vocabulary is global (motors + batteries), so values can sit on
+    # both sides of the request. Distance ranking is the actual contract.
+    distances = [abs(v - requested) for v in vals]
+    assert distances == sorted(distances), f"suggestions must be distance-ranked, got {vals}"
 
 
 # ---------------------------------------------------------------- P2: envelope

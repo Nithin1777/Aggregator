@@ -1,17 +1,41 @@
 """
 SQLite storage layer with Full-Text Search (FTS5) and continuable scraping checkpointing.
 """
+import difflib
 import json
 import logging
 import re
 import sqlite3
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from config import settings
+from src.search.query_terms import (
+    QueryPlan,
+    content_tokens,
+    correctable,
+    fts_variations,
+    relaxed_fts_expr,
+    strict_fts_expr,
+)
 from models import ScrapeState, UnifiedProduct
+from src.spec.filters import (
+    build_spec_clauses,
+    load_catalog_specs,
+    parse_and_validate_filters,
+)
+from src.spec.taxonomy_loader import (
+    classify_product,
+    get_taxonomy,
+    is_junk_raw,
+    tokenize,
+)
 
 logger = logging.getLogger(__name__)
+
+# SQLite caps host parameters at 999 per statement; stay well below it for IN clauses.
+_SQL_CHUNK = 500
 
 def get_db_connection() -> sqlite3.Connection:
     """Creates a configured SQLite connection."""
@@ -20,7 +44,143 @@ def get_db_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
+    # Keep SQLite's temporary b-trees (index builds, GROUP BY sorts) in RAM.
+    # The default is to spill them to the OS temp directory, which is not
+    # always writable (sandboxes, locked-down CI) and makes SQLite fail with
+    # "unable to open database file" on perfectly valid statements.
+    conn.execute("PRAGMA temp_store = MEMORY;")
     return conn
+
+
+def utc_now_iso() -> str:
+    """Single timestamp format used for all refresh bookkeeping.
+
+    UTC ISO-8601 strings written in this exact format sort lexicographically,
+    which lets stale-cache queries compare them directly in SQL.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Short-lived in-process caches
+#
+# Aggregate aggregates the whole catalog on every page render (category and
+# vendor counts, catalog stats). Those numbers only change when the catalog is
+# re-ingested, so they are cached for a few seconds instead of re-scanning
+# 100k+ rows on every request.
+# ---------------------------------------------------------------------------
+_CACHE_TTL_SECONDS = 30
+_categories_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+_vendor_counts_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+_stats_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def _cache_get(cache: Dict[str, Any]) -> Any:
+    """Returns a cached value when it is still fresh, otherwise None."""
+    if cache["value"] is None:
+        return None
+    if (time.monotonic() - cache["at"]) >= _CACHE_TTL_SECONDS:
+        return None
+    return cache["value"]
+
+
+def _cache_set(cache: Dict[str, Any], value: Any) -> None:
+    """Stores a value in the cache with a fresh timestamp."""
+    cache["at"] = time.monotonic()
+    cache["value"] = value
+
+
+def invalidate_counts_cache() -> None:
+    """Drops the cached catalog aggregates (after an ingest or a refresh)."""
+    for cache in (_categories_cache, _vendor_counts_cache, _stats_cache):
+        cache["at"] = 0.0
+        cache["value"] = None
+
+
+def _ensure_price_stock_schema(conn: sqlite3.Connection) -> None:
+    """
+    Idempotently adds the price/stock refresh cache columns to `products`.
+
+    - price_stock_updated_at  : last successful live price/stock fetch
+    - price_stock_attempted_at: last refresh attempt (success or failure); drives the TTL
+    - price_stock_source      : 'live' (fetched from vendor) or 'cache' (never refreshed)
+    """
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(products);")
+    existing = {row[1] for row in cur.fetchall()}
+    if "price_stock_updated_at" not in existing:
+        conn.execute("ALTER TABLE products ADD COLUMN price_stock_updated_at TIMESTAMP;")
+    if "price_stock_attempted_at" not in existing:
+        conn.execute("ALTER TABLE products ADD COLUMN price_stock_attempted_at TIMESTAMP;")
+    if "price_stock_source" not in existing:
+        conn.execute("ALTER TABLE products ADD COLUMN price_stock_source TEXT DEFAULT 'cache';")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_products_price_stock_attempted "
+        "ON products(price_stock_attempted_at);"
+    )
+
+
+def _ensure_category_schema(conn: sqlite3.Connection) -> None:
+    """
+    Idempotently adds the canonical category layer.
+
+    * products.category_canonical - slug from `config/taxonomy.yaml`
+      (the raw `products.category` column holds 3,181 vendor specific strings
+      and cannot be filtered on directly).
+    * category_map                - raw vendor category -> canonical slug,
+      kept so the mapping stays auditable and can be re-tuned without a full
+      re-scan.
+    * category_taxonomy           - cached taxonomy metadata for the UI.
+    * search_queries              - search log powering popular-search hints.
+    """
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(products);")
+    existing = {row[1] for row in cur.fetchall()}
+    if "category_canonical" not in existing:
+        conn.execute("ALTER TABLE products ADD COLUMN category_canonical TEXT;")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_products_category_canonical "
+        "ON products(category_canonical);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_products_category_vendor "
+        "ON products(category_canonical, vendor);"
+    )
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS category_map (
+            raw_category TEXT PRIMARY KEY,
+            category_slug TEXT NOT NULL,
+            matched_keyword TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_category_map_slug ON category_map(category_slug);"
+    )
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS category_taxonomy (
+            slug TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            icon TEXT NOT NULL DEFAULT 'package',
+            description TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS search_queries (
+            query TEXT PRIMARY KEY,
+            count INTEGER NOT NULL DEFAULT 0,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_queries_count ON search_queries(count DESC);"
+    )
+
 
 def init_db():
     """Initializes schema, indexes, FTS5 virtual table, and checkpoint tracking."""
@@ -60,6 +220,12 @@ def init_db():
             conn.execute("CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_products_available ON products(available);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_products_canonical ON products(is_canonical, canonical_for);")
+
+            # 2a. Price/Stock refresh cache columns (search-time refresh + cached fallback)
+            _ensure_price_stock_schema(conn)
+
+            # 2b. Canonical category layer (user facing taxonomy + facets)
+            _ensure_category_schema(conn)
 
             # 2b. Variant families table for Option B
             conn.execute("""
@@ -230,8 +396,9 @@ def upsert_products(products: List[UnifiedProduct]) -> int:
                     INSERT INTO products (
                         vendor, vendor_name, external_id, title, normalized_title,
                         mpn, sku, price, available, product_url, image_url,
-                        category, raw_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        category, raw_json, updated_at,
+                        price_stock_updated_at, price_stock_attempted_at, price_stock_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(vendor, external_id) DO UPDATE SET
                         vendor_name = excluded.vendor_name,
                         title = excluded.title,
@@ -244,7 +411,10 @@ def upsert_products(products: List[UnifiedProduct]) -> int:
                         image_url = excluded.image_url,
                         category = excluded.category,
                         raw_json = excluded.raw_json,
-                        updated_at = excluded.updated_at;
+                        updated_at = excluded.updated_at,
+                        price_stock_updated_at = excluded.price_stock_updated_at,
+                        price_stock_attempted_at = excluded.price_stock_attempted_at,
+                        price_stock_source = excluded.price_stock_source;
                 """, (
                     p.vendor,
                     p.vendor_name,
@@ -259,7 +429,10 @@ def upsert_products(products: List[UnifiedProduct]) -> int:
                     p.image_url,
                     p.category,
                     raw,
-                    now_str
+                    now_str,
+                    now_str,
+                    now_str,
+                    "live"
                 ))
                 if p.vendor == "robu" and p.extra and p.extra.get("slug"):
                     conn.execute("""
@@ -268,9 +441,205 @@ def upsert_products(products: List[UnifiedProduct]) -> int:
                         ON CONFLICT(slug) DO UPDATE SET status = 'indexed', updated_at = excluded.updated_at;
                     """, (p.extra["slug"], p.product_url, now_str))
                 count += 1
+        invalidate_counts_cache()
     finally:
         conn.close()
     return count
+
+def row_to_unified_product(row: sqlite3.Row) -> UnifiedProduct:
+    """Maps a `products` row (including optional refresh columns) to UnifiedProduct."""
+    keys = row.keys()
+
+    def _get(name: str, default: Any = None) -> Any:
+        return row[name] if name in keys else default
+
+    price_updated_at = _get("price_stock_updated_at")
+    price_source = _get("price_stock_source")
+    return UnifiedProduct(
+        id=row["id"],
+        vendor=row["vendor"],
+        vendor_name=row["vendor_name"],
+        external_id=row["external_id"],
+        title=row["title"],
+        normalized_title=row["normalized_title"],
+        mpn=row["mpn"],
+        sku=row["sku"],
+        price=float(row["price"]),
+        available=bool(row["available"]),
+        product_url=row["product_url"],
+        image_url=row["image_url"],
+        category=row["category"],
+        category_canonical=_get("category_canonical"),
+        is_canonical=bool(_get("is_canonical")),
+        canonical_for=_get("canonical_for"),
+        query_ctr=float(_get("query_ctr")) if _get("query_ctr") is not None else None,
+        updated_at=str(row["updated_at"]) if row["updated_at"] else None,
+        price_updated_at=str(price_updated_at) if price_updated_at else None,
+        price_source=price_source if price_source else None,
+        extra=json.loads(row["raw_json"]) if _get("raw_json") else {},
+    )
+
+
+def get_products_by_ids(product_ids: List[int]) -> List[UnifiedProduct]:
+    """Loads full product models for the given IDs (chunked for SQLite parameter limits)."""
+    ids = [int(i) for i in product_ids if i is not None]
+    if not ids:
+        return []
+
+    conn = get_db_connection()
+    results: List[UnifiedProduct] = []
+    try:
+        for start in range(0, len(ids), _SQL_CHUNK):
+            chunk = ids[start:start + _SQL_CHUNK]
+            placeholders = ", ".join(["?"] * len(chunk))
+            rows = conn.execute(
+                f"SELECT * FROM products WHERE id IN ({placeholders});", chunk
+            ).fetchall()
+            results.extend(row_to_unified_product(r) for r in rows)
+    finally:
+        conn.close()
+    return results
+
+
+def get_stale_price_stock_ids(
+    product_ids: List[int],
+    ttl_seconds: int,
+    force: bool = False,
+) -> List[int]:
+    """
+    Returns the subset of product IDs whose price/stock cache is stale.
+
+    A product is stale when it has never been attempted, or when the last attempt
+    is older than `ttl_seconds` (or `force=True`). Failed attempts also refresh
+    this marker, so an offline catalog is not hammered on every page view.
+    """
+    ids = [int(i) for i in product_ids if i is not None]
+    if not ids:
+        return []
+
+    conn = get_db_connection()
+    stale: List[int] = []
+    try:
+        for start in range(0, len(ids), _SQL_CHUNK):
+            chunk = ids[start:start + _SQL_CHUNK]
+            placeholders = ", ".join(["?"] * len(chunk))
+            if force:
+                rows = conn.execute(
+                    f"SELECT id FROM products WHERE id IN ({placeholders});", chunk
+                ).fetchall()
+            else:
+                cutoff = (
+                    datetime.now(timezone.utc) - timedelta(seconds=max(0, int(ttl_seconds)))
+                ).isoformat()
+                rows = conn.execute(
+                    f"""
+                    SELECT id FROM products
+                    WHERE id IN ({placeholders})
+                      AND (price_stock_attempted_at IS NULL OR price_stock_attempted_at <= ?);
+                    """,
+                    chunk + [cutoff],
+                ).fetchall()
+            stale.extend(int(r["id"]) for r in rows)
+    finally:
+        conn.close()
+    return stale
+
+
+def update_price_stock_batch(updates: List[Dict[str, Any]]) -> int:
+    """
+    Persists refreshed price/availability for existing products.
+
+    Deliberately touches ONLY price, stock and the refresh-cache metadata: titles,
+    specs, descriptions, URLs and any other catalog fields stay exactly as ingested.
+
+    Each update dict: {id, price, available, fetched_at}.
+    Returns the number of rows updated.
+    """
+    if not updates:
+        return 0
+
+    conn = get_db_connection()
+    updated = 0
+    try:
+        with conn:
+            for u in updates:
+                if u.get("id") is None:
+                    continue
+                fetched_at = u.get("fetched_at") or utc_now_iso()
+                cur = conn.execute(
+                    """
+                    UPDATE products
+                    SET price = ?,
+                        available = ?,
+                        price_stock_updated_at = ?,
+                        price_stock_attempted_at = ?,
+                        price_stock_source = 'live'
+                    WHERE id = ?;
+                    """,
+                    (
+                        float(u.get("price") or 0.0),
+                        1 if u.get("available") else 0,
+                        fetched_at,
+                        fetched_at,
+                        int(u["id"]),
+                    ),
+                )
+                updated += cur.rowcount
+        if updated:
+            invalidate_counts_cache()
+    finally:
+        conn.close()
+    return updated
+
+
+def mark_price_stock_attempted(product_ids: List[int], attempted_at: Optional[str] = None) -> int:
+    """Records a refresh attempt (including failures) so the TTL can serve cache calmly."""
+    ids = [int(i) for i in product_ids if i is not None]
+    if not ids:
+        return 0
+
+    attempted_at = attempted_at or utc_now_iso()
+    conn = get_db_connection()
+    updated = 0
+    try:
+        with conn:
+            for start in range(0, len(ids), _SQL_CHUNK):
+                chunk = ids[start:start + _SQL_CHUNK]
+                placeholders = ", ".join(["?"] * len(chunk))
+                cur = conn.execute(
+                    f"UPDATE products SET price_stock_attempted_at = ? WHERE id IN ({placeholders});",
+                    [attempted_at] + chunk,
+                )
+                updated += cur.rowcount
+    finally:
+        conn.close()
+    return updated
+
+
+def get_price_stock_stats() -> Dict[str, Any]:
+    """Summarises how many products carry live-refreshed price/stock and when."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS total FROM products;")
+        total = cur.fetchone()["total"]
+        cur.execute(
+            "SELECT COUNT(*) AS refreshed FROM products WHERE price_stock_updated_at IS NOT NULL;"
+        )
+        refreshed = cur.fetchone()["refreshed"]
+        cur.execute(
+            "SELECT MAX(price_stock_updated_at) AS last_refresh FROM products;"
+        )
+        last_refresh = cur.fetchone()["last_refresh"]
+        return {
+            "total_products": total,
+            "with_live_price_stock": refreshed,
+            "with_cached_price_stock_only": max(total - refreshed, 0),
+            "last_successful_refresh": str(last_refresh) if last_refresh else None,
+        }
+    finally:
+        conn.close()
+
 
 def populate_robu_registry(slug_url_tuples: List[tuple]) -> int:
     """Populates Robu ground-truth registry from sitemap URLs."""
@@ -409,122 +778,502 @@ def reset_checkpoint(vendor: str):
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# Agent-friendly query recovery: stop words, AND -> OR relaxation, spell fixes
+# ---------------------------------------------------------------------------
+
+
+def _ensure_fts_vocab(conn: sqlite3.Connection) -> bool:
+    """
+    Lazily creates the FTS5 vocabulary table used for spelling suggestions.
+
+    fts5vocab is a view over the FTS index and costs nothing to keep; creation
+    is skipped silently on SQLite builds without the module (results still work,
+    only typo suggestions are lost).
+    """
+    try:
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS products_fts_vocab "
+            "USING fts5vocab('products_fts', 'row')"
+        )
+        return True
+    except sqlite3.Error as exc:  # noqa: BLE001 - suggestions are best-effort
+        logger.debug("FTS vocabulary unavailable (%s); typo suggestions disabled.", exc)
+        return False
+
+
+def _fts_match_count(conn: sqlite3.Connection, expr: str) -> int:
+    """Number of indexed rows matching an FTS5 expression."""
+    if not expr:
+        return 0
+    row = conn.execute(
+        "SELECT COUNT(1) FROM products_fts WHERE products_fts MATCH ?;", (expr,)
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _vocab_has_term(conn: sqlite3.Connection, term: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM products_fts_vocab WHERE term = ? LIMIT 1;", (term,)
+    ).fetchone()
+    return row is not None
+
+
+def suggest_query_token(conn: sqlite3.Connection, token: str, limit: int = 3) -> List[str]:
+    """Closest index vocabulary terms to a mistyped word-like token."""
+    if not correctable(token):
+        return []
+    lowered = token.lower()
+    if _vocab_has_term(conn, lowered):
+        return []
+
+    candidates: List[str] = []
+    for prefix_len in (3, 2):
+        prefix = lowered[:prefix_len]
+        if len(prefix) < 2:
+            break
+        rows = conn.execute(
+            "SELECT DISTINCT term FROM products_fts_vocab WHERE term LIKE ? LIMIT 4000;",
+            (prefix + "%",),
+        ).fetchall()
+        candidates = [str(r[0]) for r in rows]
+        if len(candidates) >= 5:
+            break
+    if not candidates:
+        return []
+    return difflib.get_close_matches(lowered, candidates, n=limit, cutoff=0.75)
+
+
+def resolve_query_plan(query: Optional[str], conn: Optional[sqlite3.Connection] = None) -> QueryPlan:
+    """
+    Resolves how a free-text query should hit the FTS index.
+
+    Order of preference (first that matches wins):
+      1. strict    - every content token matches (precision)
+      2. corrected - spell-corrected tokens match (typo recovery)
+      3. corrected_relaxed / relaxed - any token matches (recall)
+    The returned plan carries explicit warnings so callers can tell the agent
+    what was actually searched.
+    """
+    plan = QueryPlan(original=query or "")
+    tokens, ignored = content_tokens(query)
+    plan.tokens = tokens
+    plan.ignored = ignored
+    if not tokens:
+        return plan
+
+    own_conn = conn is None
+    if own_conn:
+        conn = get_db_connection()
+    try:
+        if _fts_match_count(conn, strict_fts_expr(tokens)) > 0:
+            plan.mode = "strict"
+            plan.effective_tokens = tokens
+            return plan
+
+        if not _ensure_fts_vocab(conn):
+            # No vocabulary: relax token-wise so natural-language queries still work.
+            if len(tokens) > 1 and _fts_match_count(conn, relaxed_fts_expr(tokens)) > 0:
+                plan.mode = "relaxed"
+                plan.effective_tokens = tokens
+                plan.warnings.append(_relaxed_warning(plan))
+                return plan
+            plan.mode = "unresolved"
+            plan.effective_tokens = tokens
+            return plan
+
+        corrections: Dict[str, str] = {}
+        for token in tokens:
+            fixes = suggest_query_token(conn, token, limit=1)
+            if fixes:
+                corrections[token] = fixes[0]
+
+        if corrections:
+            corrected = [corrections.get(t, t) for t in tokens]
+            plan.corrections = corrections
+            if _fts_match_count(conn, strict_fts_expr(corrected)) > 0:
+                plan.mode = "corrected"
+                plan.effective_tokens = corrected
+                plan.warnings.append(_corrected_warning(plan))
+                return plan
+            if len(corrected) > 1 and _fts_match_count(conn, relaxed_fts_expr(corrected)) > 0:
+                plan.mode = "corrected_relaxed"
+                plan.effective_tokens = corrected
+                plan.warnings.append(_corrected_warning(plan))
+                plan.warnings.append(_relaxed_warning(plan))
+                return plan
+
+        if len(tokens) > 1 and _fts_match_count(conn, relaxed_fts_expr(tokens)) > 0:
+            plan.mode = "relaxed"
+            plan.effective_tokens = tokens
+            plan.warnings.append(_relaxed_warning(plan))
+            return plan
+
+        plan.mode = "unresolved"
+        plan.effective_tokens = tokens
+        for token, fix in corrections.items():
+            variant = [fix if t == token else t for t in tokens]
+            candidate = " ".join(variant)
+            if candidate not in plan.suggestions:
+                plan.suggestions.append(candidate)
+        plan.warnings.append({
+            "code": "query_unresolved",
+            "message": (
+                "None of the query terms matched the catalog index. Check the spelling or "
+                "broaden the query; data.query_suggestions lists close alternatives when known."
+            ),
+            "suggestions": list(plan.suggestions),
+        })
+        return plan
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def _corrected_warning(plan: QueryPlan) -> Dict[str, Any]:
+    fixes = ", ".join(f"'{src}' -> '{dst}'" for src, dst in plan.corrections.items())
+    return {
+        "code": "query_spelling_corrected",
+        "message": f"No listing matched the query spelling; corrected {fixes}.",
+        "corrections": dict(plan.corrections),
+        "query_effective": plan.effective_query,
+    }
+
+
+def _relaxed_warning(plan: QueryPlan) -> Dict[str, Any]:
+    return {
+        "code": "query_relaxed",
+        "message": (
+            "No listing matched every query term; results match any term and are ranked by "
+            "relevance. Narrow the query or add spec filters for exact matches."
+        ),
+        "query_effective": plan.effective_query,
+    }
+
+
+# ---------------------------------------------------------------------------
+# MPN / SKU resolution (separator-insensitive, with did-you-mean suggestions)
+# ---------------------------------------------------------------------------
+
+_IDENT_SEPARATORS = re.compile(r"[^A-Za-z0-9]")
+
+# SQL expression that normalizes stored identifiers the same way as
+# normalize_identifier() for separator-insensitive equality lookups.
+_NORM_COL_TEMPLATE = (
+    "replace(replace(replace(upper(trim(coalesce({col}, ''))), '-', ''), ' ', ''), '_', '')"
+)
+
+
+def normalize_identifier(value: Optional[str]) -> str:
+    """Uppercases and removes separators so 'MPU-6050' == 'mpu 6050' == 'MPU6050'."""
+    return _IDENT_SEPARATORS.sub("", value or "").upper()
+
+
+def find_products_by_mpn(needle: str, limit: int = 20, offset: int = 0) -> Tuple[List[sqlite3.Row], int]:
+    """
+    Exact MPN/vendor-SKU lookup ignoring case, spaces, hyphens and underscores.
+
+    Returns (rows, total) where rows carry the same columns as the old
+    search_by_mpn listing query.
+    """
+    normalized = normalize_identifier(needle)
+    if not normalized:
+        return [], 0
+
+    mpn_expr = _NORM_COL_TEMPLATE.format(col="mpn")
+    sku_expr = _NORM_COL_TEMPLATE.format(col="sku")
+    where_sql = f"({mpn_expr} = ? OR {sku_expr} = ?)"
+
+    conn = get_db_connection()
+    try:
+        total = int(conn.execute(
+            f"SELECT COUNT(1) FROM products WHERE {where_sql};", (normalized, normalized)
+        ).fetchone()[0])
+        rows = conn.execute(
+            f"""
+            SELECT id, vendor, vendor_name, title, price, available, product_url, sku, mpn,
+                   category, price_stock_source, price_stock_updated_at
+            FROM products
+            WHERE {where_sql}
+            ORDER BY available DESC, price ASC
+            LIMIT ? OFFSET ?;
+            """,
+            (normalized, normalized, max(1, int(limit)), max(0, int(offset))),
+        ).fetchall()
+        return rows, total
+    finally:
+        conn.close()
+
+
+def suggest_mpns(needle: str, limit: int = 5, cutoff: float = 0.72) -> List[str]:
+    """Closest catalog MPNs to a mistyped/partial part number (separator-insensitive)."""
+    normalized = normalize_identifier(needle)
+    if len(normalized) < 3:
+        return []
+
+    mpn_expr = _NORM_COL_TEMPLATE.format(col="mpn")
+    conn = get_db_connection()
+    try:
+        candidates: List[str] = []
+        for prefix_len in (3, 2):
+            prefix = normalized[:prefix_len]
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT mpn FROM products
+                WHERE mpn IS NOT NULL AND mpn != '' AND {mpn_expr} LIKE ?
+                LIMIT 4000;
+                """,
+                (prefix + "%",),
+            ).fetchall()
+            candidates = [str(r[0]) for r in rows]
+            if len(candidates) >= 5:
+                break
+        if not candidates:
+            return []
+
+        scored: List[Tuple[float, str]] = []
+        for candidate in candidates:
+            cand_norm = normalize_identifier(candidate)
+            if not cand_norm:
+                continue
+            ratio = difflib.SequenceMatcher(None, normalized, cand_norm).ratio()
+            if ratio >= cutoff:
+                scored.append((ratio, candidate))
+        scored.sort(key=lambda item: -item[0])
+
+        suggestions: List[str] = []
+        for _, candidate in scored:
+            if candidate not in suggestions:
+                suggestions.append(candidate)
+            if len(suggestions) >= limit:
+                break
+        return suggestions
+    finally:
+        conn.close()
+
+
+def list_products_by_category(
+    category: Optional[str] = None,
+    vendor: Optional[str] = None,
+    in_stock_only: bool = False,
+    limit: int = 70,
+    spec_filters: Optional[Dict[str, Any]] = None,
+) -> List[UnifiedProduct]:
+    """
+    Lists catalog entries for browsing (no text query).
+
+    Used by the category pages: the most relevant, best-priced listings of a
+    category so a user can browse without typing anything. `spec_filters`
+    applies the same shared spec-attribute filters as the search path.
+    """
+    clauses: List[str] = []
+    where_params: List[Any] = []
+
+    if category:
+        clauses.append("category_canonical = ?")
+        where_params.append(category)
+    if vendor:
+        clauses.append("vendor = ?")
+        where_params.append(vendor)
+    if in_stock_only:
+        clauses.append("available = 1")
+
+    joins: List[str] = []
+    join_params: List[Any] = []
+    if spec_filters:
+        conn = get_db_connection()
+        try:
+            advertised = load_catalog_specs(conn)
+        finally:
+            conn.close()
+        norm_filters, error = parse_and_validate_filters(spec_filters, advertised)
+        if error:
+            raise ValueError(error["message"])
+        joins, join_params, spec_where, spec_where_params = build_spec_clauses(
+            norm_filters, advertised
+        )
+        clauses.extend(spec_where)
+        where_params.extend(spec_where_params)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params: List[Any] = join_params + where_params
+    params.append(max(1, int(limit)))
+
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT p.* FROM products p
+            {" ".join(joins)}
+            {where}
+            ORDER BY p.available DESC, p.price ASC, p.id ASC
+            LIMIT ?;
+            """,
+            params,
+        ).fetchall()
+        return [row_to_unified_product(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def search_products(
     query: str,
     limit: int = 50,
     offset: int = 0,
     vendor: Optional[str] = None,
-    in_stock_only: bool = False
+    in_stock_only: bool = False,
+    category: Optional[str] = None,
+    spec_filters: Optional[Dict[str, Any]] = None
 ) -> List[UnifiedProduct]:
     """
     Performs search using FTS5 with fallback to LIKE pattern matching.
+
+    Text queries go through `resolve_query_plan` first: stop words are dropped,
+    natural-language requests fall back from AND to OR matching, and mistyped
+    terms are spell-corrected against the index vocabulary. When even that
+    fails the search returns [] instead of the whole catalog.
+
+    `category` filters on the canonical category slug (see
+    `config/taxonomy.yaml`). `spec_filters` applies the shared spec-attribute
+    filters (voltage, rpm, capacity_mah, ...) from `src/spec/filters.py`.
     """
     conn = get_db_connection()
     results: List[UnifiedProduct] = []
-    clean_q = query.strip()
+    clean_q = query.strip() if query else ""
     if not clean_q:
         return []
 
     try:
         cursor = conn.cursor()
-        # Attempt FTS5 query with compounding expansion
-        sanitized = re.sub(r'["\*\(\)\:]', '', clean_q).strip()
-        tokens = sanitized.split()
-        variations = []
-        if tokens:
-            primary = " ".join([f'"{t}"*' for t in tokens])
-            variations.append(f"({primary})")
-            if len(tokens) > 1:
-                full_concat = "".join(tokens)
-                if len(full_concat) >= 3:
-                    variations.append(f'("{full_concat}"*)')
-                if len(tokens) > 2:
-                    for i in range(len(tokens) - 1):
-                        merged_bigram = tokens[i] + tokens[i+1]
-                        sub_tokens = tokens[:i] + [merged_bigram] + tokens[i+2:]
-                        var_q = " ".join([f'"{t}"*' for t in sub_tokens])
-                        variations.append(f"({var_q})")
-            else:
-                m_split = re.match(r'^([a-zA-Z]{2,})(\d+)$', tokens[0])
-                if m_split:
-                    variations.append(f'("{m_split.group(1)}"* "{m_split.group(2)}"*)')
+        plan = resolve_query_plan(clean_q, conn=conn)
+        if not plan.resolved or not plan.effective_tokens:
+            return []
 
-        seen_vars = set()
-        deduped_vars = [v for v in variations if not (v in seen_vars or seen_vars.add(v))]
-        fts_query = " OR ".join(deduped_vars) if deduped_vars else f'"{clean_q}"*'
+        # Relaxed/corrected plans match any term; strict plans use the wider
+        # variation set (all terms, concatenation, bigram merges).
+        if plan.is_relaxed:
+            fts_query = relaxed_fts_expr(plan.effective_tokens)
+        else:
+            fts_query = " OR ".join(fts_variations(plan.effective_tokens))
+
+        # Spec-attribute filters (voltage, rpm, capacity_mah, ...) reuse the
+        # exact same builder the MCP server uses, so a filter means the same
+        # thing in both places.
+        spec_joins: List[str] = []
+        spec_join_params: List[Any] = []
+        spec_where: List[str] = []
+        spec_where_params: List[Any] = []
+        if spec_filters:
+            advertised = load_catalog_specs(conn)
+            norm_filters, error = parse_and_validate_filters(spec_filters, advertised)
+            if error:
+                raise ValueError(error["message"])
+            (
+                spec_joins,
+                spec_join_params,
+                spec_where,
+                spec_where_params,
+            ) = build_spec_clauses(norm_filters, advertised)
 
         where_clauses = ["products_fts MATCH ?"]
-        params: List[Any] = [fts_query]
-
+        where_params: List[Any] = [fts_query]
 
         if vendor:
             where_clauses.append("p.vendor = ?")
-            params.append(vendor)
+            where_params.append(vendor)
         if in_stock_only:
             where_clauses.append("p.available = 1")
+        if category:
+            where_clauses.append("p.category_canonical = ?")
+            where_params.append(category)
+
+        where_clauses.extend(spec_where)
 
         sql = f"""
             SELECT p.* FROM products p
             JOIN products_fts fts ON p.id = fts.rowid
+            {" ".join(spec_joins)}
             WHERE {" AND ".join(where_clauses)}
             ORDER BY rank
             LIMIT ? OFFSET ?;
         """
+        # Parameter order follows the SQL text: join params, then WHERE params.
+        params: List[Any] = spec_join_params + where_params + spec_where_params
         params.extend([limit, offset])
 
         try:
             cursor.execute(sql, params)
             rows = cursor.fetchall()
         except sqlite3.OperationalError:
-            # Fallback to standard LIKE if FTS fails
-            like_clauses = ["(p.title LIKE ? OR p.normalized_title LIKE ? OR p.mpn LIKE ? OR p.sku LIKE ?)"]
-            like_pat = f"%{clean_q}%"
-            params = [like_pat, like_pat, like_pat, like_pat]
-            if vendor:
-                like_clauses.append("p.vendor = ?")
-                params.append(vendor)
-            if in_stock_only:
-                like_clauses.append("p.available = 1")
-
-            sql_like = f"""
-                SELECT p.* FROM products p
-                WHERE {" AND ".join(like_clauses)}
-                ORDER BY p.available DESC, p.price ASC
-                LIMIT ? OFFSET ?;
-            """
-            params.extend([limit, offset])
-            cursor.execute(sql_like, params)
-            rows = cursor.fetchall()
+            rows = _search_products_like(
+                cursor,
+                clean_q,
+                (limit, offset),
+                vendor,
+                in_stock_only,
+                category,
+                spec_joins=spec_joins,
+                spec_join_params=spec_join_params,
+                spec_where=spec_where,
+                spec_where_params=spec_where_params,
+            )
 
         for r in rows:
-            results.append(UnifiedProduct(
-                id=r["id"],
-                vendor=r["vendor"],
-                vendor_name=r["vendor_name"],
-                external_id=r["external_id"],
-                title=r["title"],
-                normalized_title=r["normalized_title"],
-                mpn=r["mpn"],
-                sku=r["sku"],
-                price=float(r["price"]),
-                available=bool(r["available"]),
-                product_url=r["product_url"],
-                image_url=r["image_url"],
-                category=r["category"],
-                is_canonical=bool(r["is_canonical"]) if "is_canonical" in r.keys() and r["is_canonical"] else False,
-                canonical_for=r["canonical_for"] if "canonical_for" in r.keys() else None,
-                query_ctr=float(r["query_ctr"]) if "query_ctr" in r.keys() and r["query_ctr"] is not None else None,
-                updated_at=str(r["updated_at"]) if r["updated_at"] else None,
-                extra=json.loads(r["raw_json"]) if r["raw_json"] else {}
-            ))
+            results.append(row_to_unified_product(r))
 
     finally:
         conn.close()
 
     return results
 
+
+def _search_products_like(
+    cursor: sqlite3.Cursor,
+    clean_q: str,
+    page: Tuple[int, int],
+    vendor: Optional[str],
+    in_stock_only: bool,
+    category: Optional[str] = None,
+    spec_joins: Optional[List[str]] = None,
+    spec_join_params: Optional[List[Any]] = None,
+    spec_where: Optional[List[str]] = None,
+    spec_where_params: Optional[List[Any]] = None,
+) -> List[sqlite3.Row]:
+    """LIKE fallback used when FTS5 rejects a query (malformed token, etc.)."""
+    like_clauses = ["(p.title LIKE ? OR p.normalized_title LIKE ? OR p.mpn LIKE ? OR p.sku LIKE ?)"]
+    like_pat = f"%{clean_q}%"
+    where_params: List[Any] = [like_pat, like_pat, like_pat, like_pat]
+    if vendor:
+        like_clauses.append("p.vendor = ?")
+        where_params.append(vendor)
+    if in_stock_only:
+        like_clauses.append("p.available = 1")
+    if category:
+        like_clauses.append("p.category_canonical = ?")
+        where_params.append(category)
+
+    where_clauses = list(spec_where or [])
+    where_params.extend(spec_where_params or [])
+
+    sql_like = f"""
+        SELECT p.* FROM products p
+        {" ".join(spec_joins or [])}
+        WHERE {" AND ".join(like_clauses + where_clauses)}
+        ORDER BY p.available DESC, p.price ASC
+        LIMIT ? OFFSET ?;
+    """
+    params: List[Any] = list(spec_join_params or []) + where_params
+    params.extend(list(page))
+    cursor.execute(sql_like, params)
+    return cursor.fetchall()
+
 def get_db_stats() -> Dict[str, Any]:
     """Returns database summary statistics and vendor checkpoints."""
+    cached = _cache_get(_stats_cache)
+    if cached is not None:
+        return cached
+
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -557,12 +1306,516 @@ def get_db_stats() -> Dict[str, Any]:
             } for row in cursor.fetchall()
         }
 
-        return {
+        stats = {
             "total_products": total_products,
             "in_stock_products": in_stock_products,
             "vendors": vendors,
             "checkpoints": checkpoints,
-            "robu_registry": get_robu_registry_stats()
+            "robu_registry": get_robu_registry_stats(),
+            "price_stock": get_price_stock_stats()
         }
+        _cache_set(_stats_cache, stats)
+        return stats
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Canonical categories: taxonomy metadata, facets and filtering
+# ---------------------------------------------------------------------------
+
+# The category/vendor counts are read on every page render but only change
+# when the catalog is re-ingested, so they are cached for a short while.
+_COUNTS_CACHE_TTL_SECONDS = 30
+_counts_cache: Dict[str, Any] = {"at": 0.0, "categories": None, "vendors": None}
+
+
+def _catalog_counts(vendor: Optional[str] = None) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    """Returns (category_counts, vendor_counts) using a short-lived cache."""
+    now = time.monotonic()
+    if (
+        vendor is None
+        and _counts_cache["categories"] is not None
+        and (now - _counts_cache["at"]) < _COUNTS_CACHE_TTL_SECONDS
+    ):
+        return _counts_cache["categories"], _counts_cache["vendors"]
+
+    categories = get_category_counts(vendor=vendor)
+    vendors = get_vendor_counts(category=None)
+    if vendor is None:
+        _counts_cache["at"] = now
+        _counts_cache["categories"] = categories
+        _counts_cache["vendors"] = vendors
+    return categories, vendors
+
+
+def sync_category_taxonomy(conn: Optional[sqlite3.Connection] = None) -> int:
+    """Writes the taxonomy definition into `category_taxonomy`.
+
+    Keeps the UI's labels/icons in the database so the web layer does not need
+    to load the YAML on every request. Returns the number of categories written.
+    """
+    taxonomy = get_taxonomy()
+    own = conn is None
+    conn = conn or get_db_connection()
+    try:
+        with conn:
+            conn.executemany(
+                """
+                INSERT INTO category_taxonomy (slug, label, icon, description, sort_order, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                    label = excluded.label,
+                    icon = excluded.icon,
+                    description = excluded.description,
+                    sort_order = excluded.sort_order,
+                    updated_at = excluded.updated_at;
+                """,
+                [
+                    (c.id, c.display, c.icon, c.description, order, utc_now_iso())
+                    for order, c in enumerate(taxonomy.categories.values())
+                ],
+            )
+        return len(taxonomy.categories)
+    finally:
+        if own:
+            conn.close()
+
+
+def get_categories(vendor: Optional[str] = None, with_counts: bool = True) -> List[Dict[str, Any]]:
+    """
+    Returns the canonical taxonomy, optionally with live product counts.
+
+    Counts come from `products.category_canonical`, so they always reflect what
+    is actually in the catalog rather than a hard-coded list.
+    """
+    taxonomy = get_taxonomy()
+    if with_counts and vendor is None:
+        cached = _cache_get(_categories_cache)
+        if cached is not None:
+            return cached
+
+    counts: Dict[str, Dict[str, int]] = {}
+    if with_counts:
+        conn = get_db_connection()
+        try:
+            if vendor:
+                rows = conn.execute(
+                    """
+                    SELECT category_canonical AS slug,
+                           COUNT(*) AS total,
+                           SUM(CASE WHEN available = 1 THEN 1 ELSE 0 END) AS in_stock
+                    FROM products
+                    WHERE category_canonical IS NOT NULL AND vendor = ?
+                    GROUP BY category_canonical;
+                    """,
+                    (vendor,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT category_canonical AS slug,
+                           COUNT(*) AS total,
+                           SUM(CASE WHEN available = 1 THEN 1 ELSE 0 END) AS in_stock
+                    FROM products
+                    WHERE category_canonical IS NOT NULL
+                    GROUP BY category_canonical;
+                    """
+                ).fetchall()
+            counts = {
+                r["slug"]: {"total": r["total"], "in_stock": r["in_stock"] or 0}
+                for r in rows
+            }
+        finally:
+            conn.close()
+
+    out: List[Dict[str, Any]] = []
+    for cat in taxonomy.categories.values():
+        stats = counts.get(cat.id, {"total": 0, "in_stock": 0})
+        out.append(
+            {
+                "slug": cat.id,
+                "label": cat.display,
+                "icon": cat.icon,
+                "description": cat.description,
+                "count": stats["total"],
+                "in_stock": stats["in_stock"],
+                # The spec attributes that can be filtered on for this category
+                # (config/taxonomy.yaml -> attributes).
+                "filters": [
+                    {
+                        "key": attr.key,
+                        "display_name": attr.display_name,
+                        "type": attr.type,
+                        "unit": attr.unit,
+                        "values": attr.values,
+                        "range": list(attr.range) if attr.range else None,
+                    }
+                    for attr in cat.attributes.values()
+                ],
+            }
+        )
+    if with_counts and vendor is None:
+        _cache_set(_categories_cache, out)
+    return out
+
+
+def get_category_counts(vendor: Optional[str] = None) -> Dict[str, int]:
+    """Returns {category_slug: product_count} for the whole catalog."""
+    conn = get_db_connection()
+    try:
+        if vendor:
+            rows = conn.execute(
+                """
+                SELECT category_canonical AS slug, COUNT(*) AS c
+                FROM products
+                WHERE category_canonical IS NOT NULL AND vendor = ?
+                GROUP BY category_canonical;
+                """,
+                (vendor,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT category_canonical AS slug, COUNT(*) AS c
+                FROM products
+                WHERE category_canonical IS NOT NULL
+                GROUP BY category_canonical;
+                """
+            ).fetchall()
+        return {r["slug"]: r["c"] for r in rows}
+    finally:
+        conn.close()
+
+
+def get_vendor_counts(category: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Returns per-vendor counts, optionally scoped to one category."""
+    if category is None:
+        cached = _cache_get(_vendor_counts_cache)
+        if cached is not None:
+            return cached
+
+    conn = get_db_connection()
+    try:
+        if category:
+            rows = conn.execute(
+                """
+                SELECT vendor, vendor_name, COUNT(*) AS total,
+                       SUM(CASE WHEN available = 1 THEN 1 ELSE 0 END) AS in_stock
+                FROM products
+                WHERE category_canonical = ?
+                GROUP BY vendor, vendor_name
+                ORDER BY total DESC;
+                """,
+                (category,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT vendor, vendor_name, COUNT(*) AS total,
+                       SUM(CASE WHEN available = 1 THEN 1 ELSE 0 END) AS in_stock
+                FROM products
+                GROUP BY vendor, vendor_name
+                ORDER BY total DESC;
+                """
+            ).fetchall()
+        result = [
+            {
+                "vendor": r["vendor"],
+                "vendor_name": r["vendor_name"],
+                "count": r["total"],
+                "in_stock": r["in_stock"] or 0,
+            }
+            for r in rows
+        ]
+        if category is None:
+            _cache_set(_vendor_counts_cache, result)
+        return result
+    finally:
+        conn.close()
+
+def backfill_categories(conn: Optional[sqlite3.Connection] = None, batch_size: int = 5000) -> Dict[str, int]:
+    """
+    Maps every product onto a canonical category and stores the result.
+
+    Uses `products.category` (vendor string) first and the product title as a
+    fallback. Idempotent: rerunning it simply re-applies the current taxonomy.
+    """
+    from src.spec.taxonomy_loader import classify_product
+
+    own = conn is None
+    conn = conn or get_db_connection()
+    stats = {"scanned": 0, "updated": 0, "unmatched": 0}
+    try:
+        cursor = conn.cursor()
+        last_id = 0
+        while True:
+            rows = cursor.execute(
+                """
+                SELECT id, category, title, spec_category
+                FROM products
+                WHERE id > ?
+                ORDER BY id
+                LIMIT ?;
+                """,
+                (last_id, batch_size),
+            ).fetchall()
+            if not rows:
+                break
+            last_id = rows[-1]["id"]
+
+            updates: List[Tuple[str, int]] = []
+            mapping: Dict[str, Tuple[str, str]] = {}
+            for r in rows:
+                slug, source, _score = classify_product(
+                    r["category"], r["title"], spec_category=r["spec_category"]
+                )
+                slug = slug or "other"
+                updates.append((slug, r["id"]))
+                mapping.setdefault(r["category"] or "", (slug, source))
+                stats["scanned"] += 1
+                if slug == "other":
+                    stats["unmatched"] += 1
+
+            with conn:
+                conn.executemany(
+                    "UPDATE products SET category_canonical = ? WHERE id = ?;",
+                    updates,
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO category_map (raw_category, category_slug, matched_keyword, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(raw_category) DO UPDATE SET
+                        category_slug = excluded.category_slug,
+                        matched_keyword = excluded.matched_keyword,
+                        updated_at = excluded.updated_at;
+                    """,
+                    [
+                        (raw, slug, keyword, utc_now_iso())
+                        for raw, (slug, keyword) in mapping.items()
+                    ],
+                )
+            stats["updated"] += len(rows)
+        sync_category_taxonomy(conn)
+        return stats
+    finally:
+        if own:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Search suggestions
+# ---------------------------------------------------------------------------
+
+def _suggest_prefix_expr(prefix: str) -> Optional[str]:
+    """Builds a safe FTS5 prefix expression for a single token."""
+    token = re.sub(r"[^A-Za-z0-9]", "", prefix or "").lower()
+    if len(token) < 2:
+        return None
+    return f'"{token}"*'
+
+
+def suggest_products(
+    prefix: str,
+    limit: int = 8,
+    category: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Type-ahead suggestions for a partially typed query.
+
+    Combines three signals into one ranked list:
+      * part numbers (MPN) that start with the prefix,
+      * product titles that contain a prefix-matching token,
+      * canonical categories whose label matches.
+
+    Uses the FTS5 prefix index, so it stays fast on the 100k+ row catalog.
+    """
+    taxonomy = get_taxonomy()
+    expr = _suggest_prefix_expr(prefix)
+    if expr is None:
+        return []
+
+    conn = get_db_connection()
+    try:
+        params: List[Any] = [expr]
+        cat_clause = ""
+        if category:
+            cat_clause = "AND p.category_canonical = ?"
+            params.append(category)
+
+        rows = conn.execute(
+            f"""
+            SELECT p.mpn, p.title, p.normalized_title, p.vendor, p.vendor_name,
+                   p.price, p.available, p.category_canonical, p.product_url
+            FROM products_fts f
+            JOIN products p ON p.id = f.rowid
+            WHERE products_fts MATCH ? {cat_clause}
+            LIMIT 1200;
+            """,
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    prefix_lc = re.sub(r"[^A-Za-z0-9]", "", prefix or "").lower()
+    if not prefix_lc:
+        return []
+
+    suggestions: List[Dict[str, Any]] = []
+    seen_mpn = set()
+    seen_title = set()
+
+    # Part numbers first: users usually search by MPN.
+    for r in rows:
+        mpn = (r["mpn"] or "").strip()
+        if not mpn or mpn in seen_mpn:
+            continue
+        normalized = re.sub(r"[^A-Za-z0-9]", "", mpn).lower()
+        if not normalized.startswith(prefix_lc):
+            continue
+        seen_mpn.add(mpn)
+        suggestions.append(
+            {
+                "type": "mpn",
+                "value": mpn,
+                "label": mpn,
+                "hint": r["title"] if r["title"] else None,
+                "vendor": r["vendor_name"] or r["vendor"],
+                "price": r["price"],
+                "available": bool(r["available"]),
+                "category": r["category_canonical"],
+                "url": r["product_url"],
+            }
+        )
+        if len(suggestions) >= min(4, limit):
+            break
+
+    # Then representative product titles, best match first.
+    title_hits = []
+    for r in rows:
+        title = (r["title"] or "").strip()
+        if not title or title in seen_title:
+            continue
+        seen_title.add(title)
+        title_hits.append((_title_relevance(title, prefix_lc), title, r))
+
+    title_hits.sort(key=lambda item: (-item[0], len(item[1])))
+
+    for score, title, r in title_hits:
+        suggestions.append(
+            {
+                "type": "product",
+                "value": title,
+                "label": title,
+                "hint": r["mpn"],
+                "vendor": r["vendor_name"] or r["vendor"],
+                "price": r["price"],
+                "available": bool(r["available"]),
+                "category": r["category_canonical"],
+                "url": r["product_url"],
+            }
+        )
+        if len(suggestions) >= max(1, limit - 2):
+            break
+
+    # Finally category labels, so "res" also offers the Resistors category.
+    if len(suggestions) < limit:
+        for cat in taxonomy.categories.values():
+            if cat.id in (category,):
+                continue
+            if prefix_lc and prefix_lc not in re.sub(r"[^a-z0-9]", "", cat.display.lower()):
+                continue
+            suggestions.append(
+                {
+                    "type": "category",
+                    "value": cat.id,
+                    "label": cat.display,
+                    "hint": cat.description,
+                    "vendor": None,
+                    "price": None,
+                    "available": None,
+                    "category": cat.id,
+                    "url": None,
+                }
+            )
+            if len(suggestions) >= limit:
+                break
+
+    return suggestions
+
+
+def _title_relevance(title: str, prefix_lc: str) -> float:
+    """Heuristic score for how well a title matches the typed prefix."""
+    tokens = re.findall(r"[A-Za-z0-9]+", title.lower())
+    score = 0.0
+    for index, token in enumerate(tokens):
+        if token.startswith(prefix_lc):
+            # Earlier matches are stronger; a whole-word match is stronger still.
+            score += max(0.0, 3.0 - index * 0.4)
+            if token == prefix_lc:
+                score += 1.5
+            if index == 0:
+                score += 1.5
+    # Prefer titles that are short and start with the match.
+    score -= len(title) / 400.0
+    return score
+
+
+def record_search_query(query: str) -> None:
+    """Logs a search so the UI can surface popular queries."""
+    clean = (query or "").strip().lower()
+    if len(clean) < 3:
+        return
+    conn = get_db_connection()
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO search_queries (query, count, last_seen)
+                VALUES (?, 1, ?)
+                ON CONFLICT(query) DO UPDATE SET
+                    count = count + 1,
+                    last_seen = excluded.last_seen;
+                """,
+                (clean, utc_now_iso()),
+            )
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+
+def get_popular_queries(limit: int = 8, min_count: int = 2, max_length: int = 28) -> List[str]:
+    """Returns the most searched queries, most popular first.
+
+    Long natural-language queries are skipped: they make terrible chips in the
+    "popular searches" row.
+    """
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT query FROM search_queries
+            WHERE count >= ? AND LENGTH(query) <= ?
+            ORDER BY count DESC, last_seen DESC
+            LIMIT ?;
+            """,
+            (min_count, max_length, limit),
+        ).fetchall()
+        return [r["query"] for r in rows]
+    finally:
+        conn.close()
+
+
+def get_category_map(raw_category: str) -> Optional[str]:
+    """Returns the canonical slug a vendor category maps to (if known)."""
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT category_slug FROM category_map WHERE raw_category = ?;",
+            (raw_category or "",),
+        ).fetchone()
+        return row["category_slug"] if row else None
     finally:
         conn.close()
