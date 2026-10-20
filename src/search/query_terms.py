@@ -40,6 +40,46 @@ _FTS_UNSAFE = re.compile(r'["\*\(\)\:\^~]')
 _ALNUM = re.compile(r"[A-Za-z0-9]")
 _WORDLIKE = re.compile(r"^[a-z][a-z0-9]{2,}$")
 
+# FTS5 boolean syntax. The server does not implement a boolean parser, so an
+# operator must never be silently folded into an AND/OR search: "esp32 OR
+# esp8266" used to become "esp32 esp8266" (11 rows instead of 768).
+_BOOLEAN_OPERATOR = re.compile(r"(?<![A-Za-z0-9])(OR|AND|NOT|NEAR)(?![A-Za-z0-9])")
+_UNSUPPORTED_CHARS = re.compile(r'["*()]')
+
+_SUPERLATIVE = re.compile(
+    r"\b(cheapest|lowest(?:\s+price)?|least\s+expensive|budget|most\s+affordable)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_unsupported_syntax(query: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    Returns details when the query uses FTS5 boolean/phrase syntax we do not implement.
+
+    Rejecting is deliberate. Honouring `OR`/quotes silently is worse than an
+    explicit error because the caller gets a plausible but wrong row count.
+    """
+    text = query or ""
+    operators = [m.group(0) for m in _BOOLEAN_OPERATOR.finditer(text)]
+    characters = sorted(set(_UNSUPPORTED_CHARS.findall(text)))
+    if not operators and not characters:
+        return None
+    return {
+        "operators": operators,
+        "characters": characters,
+        "message": (
+            "This server does not implement FTS5 boolean/phrase syntax. "
+            "Remove OR/AND/NOT/NEAR and quotes, or issue separate searches."
+        ),
+    }
+
+
+def detect_sort_intent(query: Optional[str]) -> Optional[str]:
+    """Returns 'price_asc' when the query asks for the cheapest/lowest-priced item."""
+    if _SUPERLATIVE.search(query or ""):
+        return "price_asc"
+    return None
+
 
 def sanitize_query_text(query: Optional[str]) -> str:
     """Removes FTS5 operator characters while keeping part-number punctuation."""
@@ -76,14 +116,27 @@ def correctable(token: str) -> bool:
     return bool(_WORDLIKE.match(token.lower()))
 
 
+def _fts_term(token: str) -> str:
+    """
+    One FTS term. Very short tokens ("4", "5v") are matched exactly.
+
+    Prefix-matching a one-character token ("4"*) turns "4 channel relay" into
+    "anything containing 4, 40, 4k, ...", which is how a 1-channel timer relay
+    became the top "4 channel relay" result.
+    """
+    if len(token) <= 2:
+        return f'"{token}"'
+    return f'"{token}"*'
+
+
 def strict_fts_expr(tokens: Sequence[str]) -> str:
     """All tokens must match (implicit AND), each as a prefix phrase."""
-    return " ".join(f'"{t}"*' for t in tokens)
+    return " ".join(_fts_term(t) for t in tokens)
 
 
 def relaxed_fts_expr(tokens: Sequence[str]) -> str:
     """Any token may match; BM25 `rank` still orders by coverage/relevance."""
-    return " OR ".join(f'"{t}"*' for t in tokens)
+    return " OR ".join(_fts_term(t) for t in tokens)
 
 
 def fts_variations(tokens: Sequence[str]) -> List[str]:
@@ -198,6 +251,13 @@ class QueryPlan:
     corrections: Dict[str, str] = field(default_factory=dict)
     suggestions: List[str] = field(default_factory=list)
     warnings: List[Dict[str, object]] = field(default_factory=list)
+    # Tokens removed by progressive relaxation, and whether the final query
+    # requires all remaining tokens or any token.
+    dropped_tokens: List[str] = field(default_factory=list)
+    match_mode: str = "all_terms"  # all_terms | any_terms
+    operator_tokens: List[str] = field(default_factory=list)
+    head_token: str = ""
+    head_match_count: int = 0
 
     @property
     def effective_query(self) -> str:

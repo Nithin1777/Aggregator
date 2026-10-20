@@ -28,8 +28,18 @@ from mcp.server.fastmcp import FastMCP
 from config import settings
 import db
 from models import PriceStockRefreshInfo, UnifiedProduct
+from normalizer import extract_pack_quantity
 from search_service import AggregatorEngine
-from src.search.query_terms import QueryPlan, relaxed_fts_expr, strict_fts_expr
+from src.llm.bucketing import get_family_tokens
+from src.search.product_prior import coverage as query_title_coverage
+from src.search.query_terms import (
+    QueryPlan,
+    detect_sort_intent,
+    detect_unsupported_syntax,
+    parse_price_constraints,
+    relaxed_fts_expr,
+    strict_fts_expr,
+)
 from src.search.retrieval import rank_products
 from src.spec.filters import (
     _nearest_keys,
@@ -46,8 +56,8 @@ from src.spec.taxonomy_loader import get_taxonomy
 
 logger = logging.getLogger(__name__)
 
-SERVER_VERSION = "1.8.0"
-SCHEMA_VERSION = "1.7.0"
+SERVER_VERSION = "2.0.0"
+SCHEMA_VERSION = "2.0.0"
 
 # Hard ceiling on page size. An agent asking for 1000 rows is almost always
 # paginating by accident, and a negative limit becomes SQL `LIMIT -1` (= no limit).
@@ -350,13 +360,12 @@ def _build_coverage_and_warnings(
         meta = catalog_specs[fk]
         present = meta["count"]
         pct = round(present / max(total_products, 1) * 100, 2)
-        entry: Dict[str, Any] = {"present": present, "of": total_products, "pct": pct}
-        if result_spec_counts is not None:
-            rp = result_spec_counts.get(fk, 0)
-            entry["result_present"] = rp
-            entry["result_of"] = total_matches
-            entry["result_pct"] = round(rp / max(total_matches, 1) * 100, 2) if total_matches else 0.0
-        coverage[fk] = entry
+        # Two explicit denominators: the whole catalog, and the page actually
+        # returned. The old result_present/result_of pair divided a page count
+        # by total_matches, which made every filtered key look 100% covered.
+        coverage[fk] = {
+            "catalog": {"present": present, "of": total_products, "pct": pct},
+        }
 
         # Sparse extraction only distorts the answer when the result set is small
         # enough that a coverage gap could be mistaken for "no such part exists".
@@ -487,6 +496,70 @@ def _category_filter_support(conn: sqlite3.Connection, category: Optional[str]) 
     return "partial" if _category_spec_keys(conn, category) else "none"
 
 
+def _unsupported_query_error(query: Optional[str]) -> Optional[ToolResponseEnvelope]:
+    """Rejects FTS5 boolean/phrase syntax instead of silently rewriting it."""
+    syntax = detect_unsupported_syntax(query)
+    if not syntax:
+        return None
+    return make_error(
+        error_code="unsupported_query_syntax",
+        message=syntax["message"],
+        suggestions=[
+            {"query": "esp32"},
+            {"query": "esp8266"},
+            {"hint": "Run one query per alternative, or use filters/category to narrow."},
+        ],
+        details={
+            "operators": syntax["operators"],
+            "characters": syntax["characters"],
+        },
+        diagnosis={
+            "reason": "unsupported_query_syntax",
+            "operators": syntax["operators"],
+            "characters": syntax["characters"],
+        },
+    )
+
+
+def _query_status(plan: Optional[QueryPlan]) -> str:
+    """Coarse search-mode label exposed to agents."""
+    if plan is None:
+        return "filters_only"
+    if plan.mode in ("strict", "corrected"):
+        return "exact"
+    if plan.mode in ("relaxed", "corrected_relaxed"):
+        return "relaxed" if plan.match_mode == "all_terms" else "low_confidence"
+    if plan.mode == "unresolved":
+        return "unresolved"
+    return plan.mode
+
+
+def _match_ratio(query: str, title: str) -> float:
+    """Fraction of content query tokens present in a title (prefix aware)."""
+    try:
+        return float(query_title_coverage(query, title))
+    except Exception:  # noqa: BLE001 - diagnostics must never break a search
+        return 0.0
+
+
+def _price_basis_fields(title: str, price: float) -> Dict[str, Any]:
+    """Pack quantity / unit price / quote flag for one listing."""
+    quantity = extract_pack_quantity(title)
+    is_quote = float(price) <= 0
+    unit_price = None
+    if quantity and quantity > 1 and not is_quote:
+        unit_price = round(float(price) / quantity, 4)
+    return {
+        "price_is_quote": is_quote,
+        "pack_quantity": quantity,
+        "unit_price": unit_price,
+        "price_basis": (
+            "per_pack" if quantity and quantity > 1 else ("quote" if is_quote else "per_unit")
+        ),
+        "price_comparable": bool(not is_quote and (quantity is None or quantity == 1)),
+    }
+
+
 def _applicable_spec_keys(conn: sqlite3.Connection) -> Dict[str, List[str]]:
     """category -> spec keys map, for scoping 'not extracted' lists to fields that apply."""
     mapping: Dict[str, List[str]] = {}
@@ -533,7 +606,8 @@ def _build_sql_query(
     require_spec_scope: bool = False,
     sort: str = "relevance",
     limit: int = 10,
-    offset: int = 0
+    offset: int = 0,
+    head_token: Optional[str] = None,
 ) -> Tuple[str, List[Any], str, List[Any]]:
     """Builds parameterized SQL for count and select queries.
 
@@ -558,20 +632,27 @@ def _build_sql_query(
         where_clauses.append("p.price <= ?")
         where_params.append(float(price_max))
 
+    if sort in ("price_asc", "price_desc"):
+        # Price 0 rows are quote/fabrication services, not components. Sorting
+        # them first makes "cheapest X" return a service, not the part.
+        where_clauses.append("p.price > 0")
+
+    if head_token and sort == "price_asc":
+        # A compatibility clause ("... for Arduino ESP32") is not the product.
+        # For a single-term query, require the term to appear in the first ~30
+        # characters rather than anywhere in the title.
+        where_clauses.append("instr(lower(p.title), lower(?)) BETWEEN 1 AND 30")
+        where_params.append(head_token)
+
     if in_stock_only:
         where_clauses.append("p.available = 1")
 
     if category:
-        # One namespace: the canonical catalog category.
-        #
-        # Categories that carry filterable spec attributes keep their original
-        # scope (products whose specs were actually extracted for that
-        # category), so `category="battery"` still means "batteries with
-        # usable specs". Categories without attributes use the catalog bucket.
-        if require_spec_scope:
-            where_clauses.append("p.spec_category = ?")
-        else:
-            where_clauses.append("p.category_canonical = ?")
+        # Always use the canonical catalog category. `spec_category` is the
+        # extraction scope, and it contains accessories filed by vendors under
+        # "Battery Accessories" (a 9V snap connector is not a battery). Spec
+        # joins still require extracted values when filters are supplied.
+        where_clauses.append("p.category_canonical = ?")
         where_params.append(category)
 
     if fts_tokens:
@@ -720,6 +801,7 @@ def describe_catalog() -> ToolResponseEnvelope:
                 "display": cat.display,
                 "description": cat.description,
                 "products": products_by_category.get(cat.id, 0),
+                "filter_support": "partial" if cat.attributes else "none",
                 "filterable_attributes": [
                     {
                         "key": attr.key,
@@ -902,9 +984,43 @@ def count_components(
                 suggestions=[{"query": "motor"}],
             )
 
+        syntax_error = _unsupported_query_error(query)
+        if syntax_error:
+            return syntax_error
+
+        query_original = (query or "").strip() or None
+        price_max_source = "argument" if price_max_norm is not None else None
+        category_source = "argument" if category_norm else None
+        if query is not None:
+            cleaned_query, _price_min, query_price_max = parse_price_constraints(str(query))
+            if price_max_norm is None and query_price_max is not None:
+                price_max_norm = query_price_max
+                price_max_source = "query"
+            query = cleaned_query or None
+
         query_plan: Optional[QueryPlan] = None
         if query is not None:
             query_plan = db.resolve_query_plan(query, conn=conn)
+
+        # Natural-language queries often name the category in the head term
+        # ("battery to power an arduino"). Infer the category only when the
+        # caller did not supply one and no explicit spec filters are in play,
+        # so inferred scoping can never override deliberate constraints.
+        if (
+            category_norm is None
+            and not norm_filters
+            and query_plan is not None
+            and query_plan.resolved
+            and query_plan.head_token
+        ):
+            inferred_category, _ = resolve_category(
+                query_plan.head_token, _valid_categories(conn)
+            )
+            if inferred_category:
+                category_norm = inferred_category
+                category_source = "query_head"
+                category_keys = _category_spec_keys(conn, category_norm)
+                require_spec_scope = bool(category_keys)
 
         if query_plan is not None and not query_plan.resolved:
             coverage, warnings = _build_coverage_and_warnings(
@@ -924,14 +1040,17 @@ def count_components(
                     "count": 0,
                     "suggestions": suggestions,
                     "query_suggestions": query_plan.suggestions,
+                    "query_status": "unresolved",
+                    "match_mode": query_plan.match_mode,
                 },
                 total_matches=0,
                 returned=0,
                 filters_applied={
                     "filters": norm_filters or {},
-                    "query": (query or "").strip() or None,
+                    "query": query_original,
                     "query_effective": query_plan.effective_query,
                     "price_max": price_max_norm,
+                    "price_max_source": price_max_source,
                     "in_stock_only": bool(in_stock_only),
                     "category": category_norm,
                     "filter_support": _category_filter_support(conn, category_norm),
@@ -940,7 +1059,7 @@ def count_components(
                 warnings=warnings,
                 diagnosis={
                     "reason": "query_unresolved",
-                    "query": (query or "").strip(),
+                    "query": query_original,
                     "query_suggestions": query_plan.suggestions,
                 },
             )
@@ -993,7 +1112,7 @@ def count_components(
         elif total_count == 0:
             diagnosis = {
                 "reason": "no_catalog_match",
-                "query": (query or "").strip() or None,
+                "query": query_original,
                 "filters": norm_filters or {},
                 "category": category_norm,
             }
@@ -1003,19 +1122,32 @@ def count_components(
 
         filters_applied = {
             "filters": norm_filters or {},
-            "query": (query or "").strip() or None,
+            "query": query_original,
             "price_max": price_max_norm,
+            "price_max_source": price_max_source,
             "in_stock_only": bool(in_stock_only),
             "category": category_norm,
+            "category_source": category_source,
             "filter_support": _category_filter_support(conn, category_norm),
+            "filter_scope": "extracted_only" if norm_filters else "all_products",
+            "query_status": _query_status(query_plan),
+            "match_mode": query_plan.match_mode if query_plan else "all_terms",
         }
         if query_plan is not None and query_plan.resolved:
-            original = (query or "").strip()
+            original = (query_original or "")
             if query_plan.effective_query.lower() != original.lower():
                 filters_applied["query_effective"] = query_plan.effective_query
+            if query_plan.dropped_tokens:
+                filters_applied["query_tokens_dropped"] = list(query_plan.dropped_tokens)
 
         return make_response(
-            data={"count": total_count, "suggestions": suggestions},
+            data={
+                "count": total_count,
+                "suggestions": suggestions,
+                "query_status": _query_status(query_plan),
+                "match_mode": query_plan.match_mode if query_plan else "all_terms",
+                "query_tokens_dropped": list(query_plan.dropped_tokens) if query_plan else [],
+            },
             total_matches=total_count,
             returned=0,
             filters_applied=filters_applied,
@@ -1045,11 +1177,12 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
 
     Example Invocation: get_product(product_id=4395)
 
-    Spec Fields: 'extracted_specs' holds the taxonomy attributes found for this product (with
-    evidence and confidence). 'spec_category' is the taxonomy category and 'spec_extraction_scope'
-    is "unclassified" when the product is outside the taxonomy — in that case specs are not
-    extracted and 'raw_attributes' / 'description' are the authoritative details.
-    'specs_not_extracted' lists applicable keys that were not found (never fabricated as null).
+    Spec Fields: 'specs' is the flat {key: value} map (same shape as search results);
+    'spec_details' adds value_num/type/confidence/evidence; 'extracted_specs' is retained as an
+    alias. 'spec_category' is the extraction scope and 'spec_extraction_scope' is
+    "category_scoped", "category_no_attributes" or "unclassified". For unclassified or
+    attribute-less categories, 'specs_not_extracted' is empty (never every catalog key), and
+    'raw_attributes' / 'description' are the authoritative details.
 
     Behavior When No Matches: Returns ok:false with error_code='product_not_found' if the product ID does not exist in the catalog.
     """
@@ -1107,7 +1240,10 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
                 "vendor": o[2] or o[1],
                 "title": o[3],
                 "price": float(o[4]),
+                **_price_basis_fields(o[3], float(o[4])),
                 "available": bool(o[5]),
+                "stock_status": "in_stock" if o[5] else "out_of_stock",
+                "product_url": o[6],
                 "url": o[6],
                 "vendor_sku": o[7],
                 "mpn": o[8]
@@ -1138,10 +1274,19 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
 
         catalog_keys = sorted(_load_catalog_specs(conn).keys())
         spec_category = p.get("spec_category")
-        # Scope the "not extracted" list to keys that apply to this product's
-        # category: a battery missing rpm would otherwise look like a data gap.
-        applicable_keys = _applicable_spec_keys(conn).get(spec_category or "", catalog_keys)
-        specs_not_extracted = [k for k in applicable_keys if k not in extracted_specs]
+        # Scope "not extracted" to the product's category. An unclassified product
+        # has no applicable taxonomy keys at all; listing all nine catalog keys
+        # made an Arduino Uno look like it was missing battery chemistry.
+        if spec_category:
+            applicable_keys = _applicable_spec_keys(conn).get(spec_category, [])
+            spec_extraction_scope = (
+                "category_scoped" if applicable_keys else "category_no_attributes"
+            )
+            specs_not_extracted = [k for k in applicable_keys if k not in extracted_specs]
+        else:
+            applicable_keys = []
+            spec_extraction_scope = "unclassified"
+            specs_not_extracted = []
 
         if raw_meta.get("body"):
             description, description_source = raw_meta["body"], "vendor_page"
@@ -1158,7 +1303,7 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
             "mpn": p.get("mpn"),
             "sku": p.get("sku"),
             "spec_category": spec_category,
-            "spec_extraction_scope": "category_scoped" if spec_category else "unclassified",
+            "spec_extraction_scope": spec_extraction_scope,
             "price": float(p["price"]),
             "currency": "INR",
             "available": bool(p["available"]),
@@ -1176,6 +1321,8 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
                     "rather than a fabricated date."
                 )
             },
+            "specs": {key: str(value["value"]) for key, value in extracted_specs.items()},
+            "spec_details": extracted_specs,
             "extracted_specs": extracted_specs,
             "specs_not_extracted": specs_not_extracted,
             "spec_extraction_method": spec_extraction_method,
@@ -1252,6 +1399,13 @@ def search_components(
     Errors: unknown_filter_key, unknown_category, unsupported_operator, operator_not_supported_for_type,
     invalid_filter_value, filter_not_applicable_to_category, empty_query, invalid_cursor, stale_cursor.
     """
+    sort_intent = detect_sort_intent(query)
+    sort_inferred = bool(sort_intent and sort == "relevance")
+    if sort_inferred:
+        # "cheapest relay" is a price request, not a relevance request. Applying
+        # relevance order here produced top hits up to 162x above the cheapest item.
+        sort = sort_intent
+
     if sort not in ("relevance", "price_asc", "price_desc"):
         return make_error(
             error_code="invalid_filter_value",
@@ -1279,6 +1433,24 @@ def search_components(
         )
 
     warnings: List[Dict[str, Any]] = []
+    if sort_inferred:
+        warnings.append({
+            "code": "sort_inferred",
+            "message": (
+                "The query asks for the cheapest/lowest-priced item, so results are sorted by "
+                "price ascending. Pass sort explicitly to override."
+            ),
+            "sort": sort,
+        })
+    elif sort_intent:
+        warnings.append({
+            "code": "superlative_ignored",
+            "message": (
+                f"The query asks for the cheapest item, but sort={sort!r} was requested explicitly; "
+                "the explicit sort wins."
+            ),
+            "sort": sort,
+        })
     effective_limit = min(limit_int, MAX_PAGE_SIZE)
     if effective_limit != limit_int:
         warnings.append({
@@ -1332,11 +1504,48 @@ def search_components(
 
         require_spec_scope = bool(category_keys)
 
+        syntax_error = _unsupported_query_error(query)
+        if syntax_error:
+            return syntax_error
+
+        query_original = (query or "").strip() or None
+        price_max_source = "argument" if price_max_norm is not None else None
+        category_source = "argument" if category_norm else None
+        if query is not None:
+            cleaned_query, _price_min, query_price_max = parse_price_constraints(str(query))
+            if price_max_norm is None and query_price_max is not None:
+                price_max_norm = query_price_max
+                price_max_source = "query"
+            query = cleaned_query or None
+
         # --- query understanding: stop words, typo correction, AND -> OR relaxation ---
         query_plan: Optional[QueryPlan] = None
         if query is not None:
             query_plan = db.resolve_query_plan(query, conn=conn)
         effective_query = query_plan.effective_query if query_plan else (query or "").strip()
+        head_token = (
+            effective_query
+            if query_plan is not None and len(query_plan.effective_tokens) == 1
+            else None
+        )
+
+        # Infer the component category from the query's head term only when no
+        # category and no explicit spec filters were supplied.
+        if (
+            category_norm is None
+            and not norm_filters
+            and query_plan is not None
+            and query_plan.resolved
+            and query_plan.head_token
+        ):
+            inferred_category, _ = resolve_category(
+                query_plan.head_token, _valid_categories(conn)
+            )
+            if inferred_category:
+                category_norm = inferred_category
+                category_source = "query_head"
+                category_keys = _category_spec_keys(conn, category_norm)
+                require_spec_scope = bool(category_keys)
 
         # --- cursor is bound to the query that produced it ---
         fingerprint = _query_fingerprint(
@@ -1372,21 +1581,30 @@ def search_components(
 
         filters_applied = {
             "filters": norm_filters or {},
-            "query": (query or "").strip() or None,
+            "query": query_original,
             "price_max": price_max_norm,
+            "price_max_source": price_max_source,
             "in_stock_only": bool(in_stock_only),
             "category": category_norm,
+            "category_source": category_source,
             "filter_support": _category_filter_support(conn, category_norm),
             "sort": sort,
+            "sort_source": "query_intent" if sort_inferred else "argument",
             "limit": effective_limit,
             "offset": offset,
             "refresh": bool(refresh),
             "force_refresh": bool(force_refresh),
+            "price_zero_excluded": sort in ("price_asc", "price_desc"),
+            "filter_scope": "extracted_only" if norm_filters else "all_products",
         }
         if query_plan is not None and query_plan.resolved:
-            original = (query or "").strip()
+            original = (query_original or "")
             if query_plan.effective_query.lower() != original.lower():
                 filters_applied["query_effective"] = query_plan.effective_query
+            filters_applied["query_status"] = _query_status(query_plan)
+            filters_applied["match_mode"] = query_plan.match_mode
+            if query_plan.dropped_tokens:
+                filters_applied["query_tokens_dropped"] = list(query_plan.dropped_tokens)
 
         if query_plan is not None and not query_plan.resolved:
             # Nothing in the index resembles the query: do NOT silently drop the
@@ -1402,9 +1620,12 @@ def search_components(
                 })
             return make_response(
                 data={
+                    "items": [],
                     "results": [],
                     "suggestions": suggestions,
                     "query_suggestions": query_plan.suggestions,
+                    "query_status": "unresolved",
+                    "match_mode": query_plan.match_mode,
                     "price_stock_refresh": None,
                 },
                 total_matches=0,
@@ -1436,11 +1657,64 @@ def search_components(
             require_spec_scope=require_spec_scope,
             sort=sort,
             limit=effective_limit,
-            offset=offset
+            offset=offset,
+            head_token=head_token,
         )
 
         cur.execute(count_sql, count_params)
         total_matches = cur.fetchone()[0]
+
+        filter_recall: Optional[Dict[str, Any]] = None
+        if norm_filters:
+            # How many matching products were excluded only because the filtered
+            # attribute was never extracted? Without this, `servo + torque>=1`
+            # looks like "only 70 servos exist" rather than "634 were dropped".
+            base_count_sql, base_params, _, _ = _build_sql_query(
+                {},
+                catalog_specs,
+                fts_tokens=(query_plan.effective_tokens if query_plan else None),
+                fts_relaxed=(query_plan.is_relaxed if query_plan else False),
+                price_max=price_max_norm,
+                in_stock_only=in_stock_only,
+                category=category_norm,
+                category_spec_keys=active_category_keys,
+                require_spec_scope=require_spec_scope,
+                sort=sort,
+            )
+            inner_sql = base_count_sql.replace(
+                "SELECT COUNT(DISTINCT p.id)", "SELECT p.id", 1
+            ).rstrip().rstrip(";")
+            cur.execute(f"SELECT COUNT(*) FROM ({inner_sql}) base;", base_params)
+            base_total = int(cur.fetchone()[0])
+            missing_sql = " OR ".join(
+                "NOT EXISTS (SELECT 1 FROM product_specs ps "
+                "WHERE ps.product_id = base.id AND ps.key = ?)"
+                for _ in norm_filters
+            )
+            cur.execute(
+                f"SELECT COUNT(*) FROM ({inner_sql}) base WHERE {missing_sql};",
+                base_params + list(norm_filters.keys()),
+            )
+            missing_spec = int(cur.fetchone()[0])
+            filtered_out_value = max(0, base_total - total_matches - missing_spec)
+            filter_recall = {
+                "scope": "extracted_only",
+                "keys": list(norm_filters.keys()),
+                "base_matches": base_total,
+                "missing_spec": missing_spec,
+                "filtered_out_for_value": filtered_out_value,
+            }
+            if missing_spec:
+                warnings.append({
+                    "code": "filter_recall_gap",
+                    "message": (
+                        f"{missing_spec} matching product(s) have no extracted value for "
+                        f"{list(norm_filters.keys())} and are excluded from this result. "
+                        "Treat the count as 'products with extracted specs', not all products."
+                    ),
+                    "missing_spec": missing_spec,
+                    "base_matches": base_total,
+                })
 
         coverage, cov_warnings = _build_coverage_and_warnings(
             catalog_specs, total_products, norm_filters or {}, total_matches
@@ -1470,13 +1744,16 @@ def search_components(
             else:
                 diagnosis = {
                     "reason": "no_catalog_match",
-                    "query": (query or "").strip() or None,
+                    "query": query_original,
                     "filters": norm_filters or {},
                     "category": category_norm,
                 }
             zero_data: Dict[str, Any] = {
+                "items": [],
                 "results": [],
                 "suggestions": suggestions,
+                "query_status": _query_status(query_plan),
+                "match_mode": query_plan.match_mode if query_plan else "all_terms",
                 "price_stock_refresh": None,
             }
             if query_plan is not None and query_plan.suggestions:
@@ -1519,6 +1796,7 @@ def search_components(
                 sort=sort,
                 limit=pool_limit,
                 offset=0,
+                head_token=head_token,
             )
             cur.execute(rank_sql, rank_params)
             candidate_rows = cur.fetchall()
@@ -1576,7 +1854,7 @@ def search_components(
 
         # Spec presence across the returned page: tells the caller whether a field
         # is genuinely absent from the part or simply never extracted for it.
-        result_coverage = {
+        page_coverage = {
             k: {
                 "present": result_spec_counts.get(k, 0),
                 "of": len(ids),
@@ -1585,9 +1863,11 @@ def search_components(
             for k in all_catalog_keys
         }
         for fk, entry in coverage.items():
-            entry["result_present"] = result_spec_counts.get(fk, 0)
-            entry["result_of"] = total_matches
-            entry["result_pct"] = round(result_spec_counts.get(fk, 0) / max(total_matches, 1) * 100, 2) if total_matches else 0.0
+            entry["page"] = {
+                "present": result_spec_counts.get(fk, 0),
+                "of": len(ids),
+                "pct": round(result_spec_counts.get(fk, 0) / max(len(ids), 1) * 100, 1),
+            }
 
         results = []
         category_keys_map = _applicable_spec_keys(conn)
@@ -1608,10 +1888,16 @@ def search_components(
 
             row_keys = r.keys()
             row_category = r["spec_category"] if "spec_category" in row_keys else None
-            applicable_keys = category_keys_map.get(row_category or "", all_catalog_keys)
-            # unknown != absent != null: missing keys are enumerated, never filled
-            # with null — scoped to keys that apply to this product's category.
-            specs_not_extracted = [k for k in applicable_keys if k not in specs]
+            if row_category:
+                applicable_keys = category_keys_map.get(row_category, [])
+                row_scope = (
+                    "category_scoped" if applicable_keys else "category_no_attributes"
+                )
+                # unknown != absent != null: scoped to keys that apply to this category.
+                specs_not_extracted = [k for k in applicable_keys if k not in specs]
+            else:
+                row_scope = "unclassified"
+                specs_not_extracted = []
 
             stock_status = "in_stock" if r["available"] else "out_of_stock"
             results.append({
@@ -1620,6 +1906,7 @@ def search_components(
                 "vendor": r["vendor_name"] or r["vendor"],
                 "price": float(r["price"]),
                 "currency": "INR",
+                **_price_basis_fields(r["title"], float(r["price"])),
                 "available": bool(r["available"]),
                 "stock_status": stock_status,
                 "price_source": (r["price_stock_source"] if "price_stock_source" in row_keys else None) or "cache",
@@ -1628,8 +1915,11 @@ def search_components(
                     if "price_stock_updated_at" in row_keys and r["price_stock_updated_at"] else None
                 ),
                 "category": r["category"],
+                "category_canonical": (
+                    r["category_canonical"] if "category_canonical" in row_keys else None
+                ),
                 "spec_category": row_category,
-                "spec_extraction_scope": "category_scoped" if row_category else "unclassified",
+                "spec_extraction_scope": row_scope,
                 "mpn": r["mpn"],
                 "vendor_sku": r["sku"],
                 "product_url": r["product_url"],
@@ -1646,15 +1936,64 @@ def search_components(
                 f"{offset + returned}:{fingerprint}".encode("utf-8")
             ).decode("ascii")
 
+        query_status = _query_status(query_plan)
+        match_ratios = [_match_ratio(effective_query, r["title"]) for r in results] if results else []
+        match_ratio_top = match_ratios[0] if match_ratios else None
+        match_ratio_avg = round(sum(match_ratios) / len(match_ratios), 3) if match_ratios else None
+        low_confidence_reason = None
+        if (
+            query_plan is not None
+            and query_plan.mode in ("relaxed", "corrected_relaxed")
+            and match_ratio_top is not None
+            and match_ratio_top < 0.5
+        ):
+            low_confidence_reason = (
+                f"The best result covers only {match_ratio_top:.0%} of the query terms; "
+                "these results are a broad match."
+            )
+        elif (
+            query_plan is not None
+            and query_plan.mode in ("relaxed", "corrected_relaxed")
+            and len(query_plan.effective_tokens) == 1
+            and total_matches >= 1000
+        ):
+            low_confidence_reason = (
+                f"Relaxation reduced the query to the single generic term "
+                f"'{effective_query}', which matches {total_matches:,} listings."
+            )
+
+        if low_confidence_reason:
+            query_status = "low_confidence"
+            warnings.append({
+                "code": "query_low_confidence",
+                "message": (
+                    f"{low_confidence_reason} Add a category or spec filters before quoting "
+                    "these results as the answer."
+                ),
+                "match_ratio_top": match_ratio_top,
+                "match_ratio_avg": match_ratio_avg,
+                "query_effective": effective_query,
+                "total_matches": total_matches,
+            })
+
         return make_response(
             data={
+                "items": results,
                 "results": results,
                 "items_are": "listings",
+                "total_listings": total_matches,
+                "query_status": query_status,
+                "match_mode": query_plan.match_mode if query_plan else "all_terms",
+                "match_ratio_top": match_ratio_top,
+                "match_ratio_avg": match_ratio_avg,
+                "query_tokens_used": list(query_plan.effective_tokens) if query_plan else [],
+                "query_tokens_dropped": list(query_plan.dropped_tokens) if query_plan else [],
                 "note": (
                     "Each result is one vendor listing. The same physical part can appear once per vendor; "
                     "compare on mpn/specs rather than assuming one row per part."
                 ),
-                "result_coverage": result_coverage,
+                "page_coverage": page_coverage,
+                "filter_recall": filter_recall,
                 "price_stock_refresh": refresh_info.model_dump() if refresh_info else None,
             },
             total_matches=total_matches,
@@ -1790,7 +2129,8 @@ def search_by_mpn(
     limit: int = 20,
     cursor: Optional[str] = None,
     refresh: bool = True,
-    force_refresh: bool = False
+    force_refresh: bool = False,
+    allow_ambiguous: bool = False,
 ) -> ToolResponseEnvelope:
     """
     Resolve a manufacturer part number (or vendor SKU) to its vendor listings, without fuzzy text matching.
@@ -1803,9 +2143,15 @@ def search_by_mpn(
       - cursor: str (opaque cursor from a previous page's next_cursor; bound to this mpn)
       - refresh: bool (default: true; verify these listings' price/stock live, TTL-aware)
       - force_refresh: bool (default: false; bypass the refresh TTL to re-verify now)
+      - allow_ambiguous: bool (default: false; return listings even when the "MPN" is a family
+        token or is shared by dozens of unrelated titles, with an mpn_ambiguous warning)
 
     Matching: 'MPU6050', 'mpu-6050' and 'MPU 6050' resolve to the same listings; each listing
     carries its extracted specs so fit questions can be answered without a second call.
+
+    Ambiguity: family tokens (ESP32, ESP8266, STM32, ...) are not part numbers. When one MPN
+    value maps to dozens of distinct titles, the tool returns error_code='mpn_family_token' or
+    'mpn_ambiguous' instead of presenting 429 unrelated listings as an exact match.
 
     Price/Stock Freshness: price and stock for the returned listings are re-verified against
     live vendors before the response is built, and cached in the local catalog. When vendors
@@ -1813,6 +2159,10 @@ def search_by_mpn(
 
     Behavior When No Matches: Returns ok:true with total_matches:0 and data.suggested_mpns
     (closest catalog part numbers) rather than an error, plus a hint to fall back to free-text search.
+
+    Errors: mpn_family_token (ESP32, ESP8266, ... are chip families, not part numbers),
+    mpn_ambiguous (one identifier shared by dozens of distinct titles), stale_cursor,
+    invalid_filter_value.
 
     Example Invocation: search_by_mpn(mpn="RMCS-2077")
     """
@@ -1850,6 +2200,24 @@ def search_by_mpn(
         })
 
     normalized = db.normalize_identifier(needle)
+    family_token = normalized in get_family_tokens()
+    if family_token and not allow_ambiguous:
+        return make_error(
+            error_code="mpn_family_token",
+            message=(
+                f"'{needle}' is a chip/platform family token, not a manufacturer part number. "
+                "It is shared by many unrelated products, so an exact MPN lookup would return "
+                "a misleading list. Use search_components with a text query instead."
+            ),
+            suggestions=[{"tool": "search_components", "query": needle}],
+            details={"mpn_normalized": normalized, "family_tokens": sorted(get_family_tokens())},
+            diagnosis={
+                "reason": "mpn_family_token",
+                "mpn": needle,
+                "mpn_normalized": normalized,
+            },
+        )
+
     fingerprint = _query_fingerprint({"mpn": normalized}, None, None, False, "relevance")
 
     offset = 0
@@ -1881,6 +2249,53 @@ def search_by_mpn(
     try:
         rows, total = db.find_products_by_mpn(needle, limit=effective_limit, offset=offset)
 
+        mpn_stats = db.mpn_match_stats(needle)
+        ambiguous = bool(
+            mpn_stats["total"] >= 30
+            and mpn_stats["distinct_titles"] >= 25
+            and mpn_stats["distinct_titles"] / max(mpn_stats["total"], 1) >= 0.8
+        )
+        if ambiguous and not allow_ambiguous:
+            return make_error(
+                error_code="mpn_ambiguous",
+                message=(
+                    f"'{needle}' matches {mpn_stats['total']} listings across "
+                    f"{mpn_stats['distinct_titles']} distinct titles. That is a shared/family "
+                    "identifier, not an exact part number. Use search_components or pass "
+                    "allow_ambiguous=True if you really want these listings."
+                ),
+                suggestions=[
+                    {"tool": "search_components", "query": needle},
+                    {"allow_ambiguous": True},
+                ],
+                details={
+                    "mpn_normalized": normalized,
+                    "total": mpn_stats["total"],
+                    "distinct_titles": mpn_stats["distinct_titles"],
+                    "distinct_vendors": mpn_stats["distinct_vendors"],
+                    "sample_titles": mpn_stats["sample_titles"],
+                },
+                diagnosis={
+                    "reason": "mpn_ambiguous",
+                    "mpn": needle,
+                    **mpn_stats,
+                },
+            )
+
+        ambiguity_warning: Optional[Dict[str, Any]] = None
+        if ambiguous or family_token:
+            ambiguity_warning = {
+                "code": "mpn_ambiguous",
+                "message": (
+                    f"'{needle}' is a shared/family identifier ({mpn_stats['total']} listings, "
+                    f"{mpn_stats['distinct_titles']} distinct titles). These are not one part."
+                ),
+                "total": mpn_stats["total"],
+                "distinct_titles": mpn_stats["distinct_titles"],
+                "distinct_vendors": mpn_stats["distinct_vendors"],
+            }
+            warnings.append(ambiguity_warning)
+
         refresh_info: Optional[PriceStockRefreshInfo] = None
         if refresh and rows:
             refresh_info = refresh_price_stock_for_products(
@@ -1911,6 +2326,7 @@ def search_by_mpn(
                 "title": r["title"],
                 "price": float(r["price"]),
                 "currency": "INR",
+                **_price_basis_fields(r["title"], float(r["price"])),
                 "available": bool(r["available"]),
                 "stock_status": "in_stock" if r["available"] else "out_of_stock",
                 "price_source": r["price_stock_source"] or "cache",
@@ -1955,7 +2371,9 @@ def search_by_mpn(
             data={
                 "mpn": needle,
                 "mpn_normalized": normalized,
+                "items": listings,
                 "listings": listings,
+                "total_listings": total,
                 "items_are": "listings",
                 "suggested_mpns": suggested_mpns,
                 "note": (

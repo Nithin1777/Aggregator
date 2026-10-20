@@ -102,9 +102,9 @@ def test_missing_spec_is_enumerated_not_nulled():
     assert all(v is not None for v in row["specs"].values())
 
 
-def test_result_coverage_reports_spec_presence_for_the_page():
+def test_page_coverage_reports_spec_presence_for_the_page():
     res = search_components(filters={"voltage": "24"}, limit=5)
-    cov = res.data["result_coverage"]
+    cov = res.data["page_coverage"]
     assert cov["voltage"]["present"] == len(res.data["results"])
     assert 0 <= cov["rpm"]["pct"] <= 100
 

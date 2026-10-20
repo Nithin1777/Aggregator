@@ -74,8 +74,12 @@ def test_4_unknown_not_absent_low_coverage_warning():
     assert res.ok is True
     assert "current_a" in res.coverage
     cov = res.coverage["current_a"]
-    assert "present" in cov and "of" in cov and "pct" in cov
-    assert cov["pct"] < 1.0, f"Expected low coverage (<1.0%), got {cov['pct']}%"
+    assert "catalog" in cov and "page" in cov
+    assert {"present", "of", "pct"} <= set(cov["catalog"])
+    assert {"present", "of", "pct"} <= set(cov["page"])
+    assert cov["catalog"]["pct"] < 1.0, (
+        f"Expected low coverage (<1.0%), got {cov['catalog']['pct']}%"
+    )
     
     # Must contain low coverage or advisory warning
     warning_codes = [w["code"] for w in (res.warnings or [])]

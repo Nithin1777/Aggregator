@@ -317,12 +317,29 @@ the **MCP tools**, the **web UI**, and `GET /api/search?source=local`, driven by
 `filters_applied.query` always echoes what the caller typed; `filters_applied.query_effective`
 shows what was actually searched.
 
+**Booleans and quotes are not silently rewritten.** `esp32 OR esp8266` returns
+`error_code: "unsupported_query_syntax"`; run one query per alternative instead. Lowercase
+`or`/`and` are reported as `query_operator_dropped`.
+
+**Relaxation is progressive, not all-or-nothing.** When a strict query is empty, generic
+modifiers are dropped before the head term; the response exposes `query_tokens_dropped`,
+`query_status` (`exact`, `relaxed`, `low_confidence`, `unresolved`) and `match_ratio_top`.
+A query that matches only a handful of rows while the head term matches thousands also gets a
+`query_narrowed` warning, so a plausible-looking small count is not mistaken for the full answer.
+
+**Price intent is honoured.** “cheapest X” sets `sort=price_asc` (`sort_inferred`), price-zero
+quote/fabrication rows are excluded from price sorts, and “under ₹500” is parsed into
+`price_max` when the caller did not pass one.
+
 ### Component categories
 
 `search_components`, `count_components` (and the web search) accept a `category` filter —
 `battery`, `motor`, `relay`, or any taxonomy category (see `describe_catalog` → `data.taxonomy`).
 The name is case-insensitive and plural tolerant (`Motor`, `motors` → `motor`); a typo returns
-`error_code: "unknown_category"` with ranked nearest categories (`motr` → `motor`).
+`error_code: "unknown_category"` with ranked nearest categories (`motr` → `motor`). Category
+filters use `products.category_canonical`, not the spec-extraction scope, so a 9V battery snap
+connector filed under “Battery Accessories” cannot enter a `category="battery"` result through
+its extracted voltage.
 
 A filter key must be valid **for that category**. Asking for `chemistry` under `category="motor"`
 is not an empty result — it returns `error_code: "filter_not_applicable_to_category"` with the
@@ -367,8 +384,25 @@ search_components(filters={"chemistry": "lipo", "voltage": "3.7",
 ```
 
 Per-product `specs_not_extracted` is scoped to keys that apply to that product's category, so a
-battery is never reported as “missing rpm”. The web equivalents are the same filters through
-`source=local`.
+battery is never reported as “missing rpm”; an unclassified product reports an empty list instead
+of all nine catalog keys. The web equivalents are the same filters through `source=local`.
+
+### Response contract (schema 2.0)
+
+- List tools return `data.items` (with `items_are: "listings"` and `total_listings`); `results` /
+  `listings` remain as aliases for older clients.
+- Specifications use one shape: `specs` is `{key: value}` everywhere; `get_product` adds
+  `spec_details` with value/type/confidence/evidence and keeps `extracted_specs` as an alias.
+- `coverage[key]` has two explicit denominators: `catalog` and `page`. There is no longer a
+  `result_present / result_of` pair computed from different populations.
+- Filters report `filter_scope: "extracted_only"` and `data.filter_recall` with
+  `base_matches`, `missing_spec` and `filtered_out_for_value`, plus a `filter_recall_gap`
+  warning. The count is “products with extracted specs”, not “all products”.
+- Price/stock freshness reports `status="live"` only when every returned candidate was refreshed;
+  otherwise `partial`, with `refreshed_products`, `cached_products` and `verified_pct`.
+- `search_by_mpn` rejects family tokens (`mpn_family_token`) and shared identifiers
+  (`mpn_ambiguous`) unless `allow_ambiguous=True`; listings carry pack quantity, unit price and
+  `price_is_quote`.
 
 ### MPN resolution
 
