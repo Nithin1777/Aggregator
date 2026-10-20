@@ -192,22 +192,33 @@ class RobuGraphQLClient:
 
         raise RobuGraphQLTransientError(f"Robu GraphQL failed: {last_error}")
 
-    def _fetch_chunk(self, chunk: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _fetch_chunk(
+        self,
+        chunk: List[str],
+        failures: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
         try:
             body = self._post(build_batch_query(chunk))
-        except RobuGraphQLTransientError:
-            if len(chunk) > 1:
+        except RobuGraphQLTransientError as exc:
+            if len(chunk) > 5:
                 # One slow/oversized product must not discard the whole batch.
                 middle = len(chunk) // 2
                 logger.warning(
-                    "Robu GraphQL batch of %s failed; splitting into %s + %s",
-                    len(chunk), middle, len(chunk) - middle,
+                    "Robu GraphQL batch of %s failed (%s); splitting into %s + %s",
+                    len(chunk), exc, middle, len(chunk) - middle,
                 )
                 merged: Dict[str, Dict[str, Any]] = {}
-                merged.update(self._fetch_chunk(chunk[:middle]))
-                merged.update(self._fetch_chunk(chunk[middle:]))
+                merged.update(self._fetch_chunk(chunk[:middle], failures))
+                merged.update(self._fetch_chunk(chunk[middle:], failures))
                 return merged
-            raise
+            # Do not split down to single requests when the endpoint is down:
+            # that turns one timeout into dozens of 60s retries.
+            failures.extend(chunk)
+            logger.warning(
+                "Robu GraphQL chunk of %s failed after retries (%s); keeping the run alive",
+                len(chunk), exc,
+            )
+            return {}
 
         results: Dict[str, Dict[str, Any]] = {}
         for index, slug in enumerate(chunk):
@@ -229,16 +240,7 @@ class RobuGraphQLClient:
         unique = list(dict.fromkeys(str(s) for s in slugs if s))
         for start in range(0, len(unique), max(1, batch_size)):
             chunk = unique[start:start + max(1, batch_size)]
-            try:
-                results.update(self._fetch_chunk(chunk))
-            except RobuGraphQLSchemaError:
-                raise
-            except RobuGraphQLTransientError as exc:
-                logger.warning(
-                    "Robu GraphQL skipped %s slug(s) after retries: %s",
-                    len(chunk), exc,
-                )
-                self.failures.extend(chunk)
+            results.update(self._fetch_chunk(chunk, self.failures))
         return results
 
     def fetch_one(self, slug: str) -> Optional[Dict[str, Any]]:

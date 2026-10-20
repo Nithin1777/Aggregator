@@ -38,7 +38,7 @@ class _RetrySession:
 
 
 class _SplitSession:
-    """Fails for multi-alias queries, succeeds for single-alias queries."""
+    """Fails for the full batch, succeeds for each split half."""
 
     def __init__(self):
         self.calls = 0
@@ -47,12 +47,12 @@ class _SplitSession:
         self.calls += 1
         payload = kwargs["json"]
         count = len(payload["variables"])
-        if count > 1:
+        if count > 6:
             raise TimeoutError("batch too large")
-        slug = next(iter(payload["variables"].values()))
-        return _Response({
-            "data": {"p0": {"status": True, "data": {"name": slug}}}
-        })
+        data = {}
+        for index, slug in enumerate(payload["variables"].values()):
+            data[f"p{index}"] = {"status": True, "data": {"name": slug}}
+        return _Response({"data": data})
 
     def close(self):
         pass
@@ -107,8 +107,9 @@ def test_client_retries_a_transient_timeout():
 def test_client_splits_a_failing_batch_and_keeps_partial_results():
     client = RobuGraphQLClient(retries=2, backoff=0)
     client.session = _SplitSession()
+    slugs = [f"s{i}" for i in range(12)]
 
-    result = client.fetch_batch(["a", "b"], batch_size=2)
+    result = client.fetch_batch(slugs, batch_size=12)
 
-    assert set(result) == {"a", "b"}
+    assert set(result) == set(slugs)
     assert client.failures == []
