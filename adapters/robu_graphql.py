@@ -41,6 +41,8 @@ PRODUCT_FIELDS = """
       price { regular final special discount }
       in_stock
       available_quantity
+      categories { id name url_path }
+      images { url }
     }
 """
 

@@ -923,15 +923,20 @@ def get_pending_robu_slugs(limit: int = 100) -> List[Dict[str, str]]:
 
 def mark_robu_slug_indexed(slug: str) -> None:
     """Marks a slug as indexed or checked in the registry."""
+    mark_robu_slug_status(slug, "indexed")
+
+
+def mark_robu_slug_status(slug: str, status: str) -> None:
+    """Sets a registry status (indexed, pending, missing) for one slug."""
     conn = get_db_connection()
     now_str = datetime.now(timezone.utc).isoformat()
     try:
         with conn:
             conn.execute("""
                 UPDATE robu_catalog_registry
-                SET status = 'indexed', updated_at = ?
+                SET status = ?, updated_at = ?
                 WHERE slug = ?;
-            """, (now_str, slug))
+            """, (status, now_str, slug))
     finally:
         conn.close()
 

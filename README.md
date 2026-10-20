@@ -468,6 +468,16 @@ fetches with a few thousand JSON calls.
 python scripts/backfill_descriptions.py --vendors robu --batch-size 25
 ```
 
+**Completing the Robu catalog without the search API.** The sitemap registry still has pending
+slugs after the 403-interrupted catalog run. `scripts/ingest_robu_graphql.py` fetches those slugs by
+slug through ProductDetails, upserts the product, stores its description/attributes, and marks the
+registry entry indexed. It is resumable and idempotent; rerunning continues with the next pending
+slugs.
+
+```powershell
+python scripts/ingest_robu_graphql.py --limit 100 --batch-size 25
+```
+
 ### Keeping the taxonomy current
 
 Filterable attributes are defined in `config/taxonomy.yaml` and `config/extractors.yaml`. After
