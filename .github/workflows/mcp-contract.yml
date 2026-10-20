@@ -30,4 +30,4 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run agent contract gate
-        run: pytest tests/test_mcp_agent_contract.py tests/test_description_specs.py tests/test_title_attributes.py tests/test_robu_graphql.py tests/test_robu_catalog.py tests/test_vendor_specs.py -q
+        run: pytest tests/test_mcp_agent_contract.py tests/test_agent_usability_contract.py tests/test_description_specs.py tests/test_title_attributes.py tests/test_robu_graphql.py tests/test_robu_catalog.py tests/test_vendor_specs.py -q

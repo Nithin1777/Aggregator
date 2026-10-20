@@ -10,7 +10,7 @@ categories:
     type: float
     unit: ohm
     range:
-    - 0.0001
+    - 0.001
     - 1000000000
   - key: power_w
     display_name: Power Rating

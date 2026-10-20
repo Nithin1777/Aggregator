@@ -1052,18 +1052,26 @@ def _fts_match_count(conn: sqlite3.Connection, expr: str) -> int:
 
 
 def _vocab_has_term(conn: sqlite3.Connection, term: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM products_fts_vocab WHERE term = ? LIMIT 1;", (term,)
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM products_fts_vocab WHERE term = ? LIMIT 1;", (term,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
     return row is not None
 
 
-def suggest_query_token(conn: sqlite3.Connection, token: str, limit: int = 3) -> List[str]:
+def suggest_query_token(
+    conn: sqlite3.Connection,
+    token: str,
+    limit: int = 3,
+    allow_existing: bool = False,
+) -> List[str]:
     """Closest index vocabulary terms to a mistyped word-like token."""
     if not correctable(token):
         return []
     lowered = token.lower()
-    if _vocab_has_term(conn, lowered):
+    if _vocab_has_term(conn, lowered) and not allow_existing:
         return []
 
     candidates: List[str] = []
@@ -1080,7 +1088,8 @@ def suggest_query_token(conn: sqlite3.Connection, token: str, limit: int = 3) ->
             break
     if not candidates:
         return []
-    return difflib.get_close_matches(lowered, candidates, n=limit, cutoff=0.75)
+    matches = difflib.get_close_matches(lowered, candidates, n=limit + 1, cutoff=0.75)
+    return [m for m in matches if m.lower() != lowered][:limit]
 
 
 def _fts_term_doc_count(conn: sqlite3.Connection, token: str) -> int:
@@ -1202,6 +1211,26 @@ def resolve_query_plan(query: Optional[str], conn: Optional[sqlite3.Connection] 
     try:
         strict_count = _fts_match_count(conn, strict_fts_expr(tokens))
         if strict_count > 0:
+            # Single-token typo rescue: one stray title containing "ardunio"
+            # must not hide the hundreds of "arduino" listings. Only override a
+            # strict hit when the corrected spelling is at least 10x more common.
+            if len(tokens) == 1 and correctable(tokens[0]) and _ensure_fts_vocab(conn):
+                fixes = suggest_query_token(conn, tokens[0], limit=1, allow_existing=True)
+                if fixes and fixes[0].lower() != tokens[0].lower():
+                    corrected_count = _fts_match_count(conn, strict_fts_expr([fixes[0]]))
+                    if corrected_count >= max(10, strict_count * 10):
+                        plan.mode = "corrected"
+                        plan.corrections = {tokens[0]: fixes[0]}
+                        plan.effective_tokens = [fixes[0]]
+                        warning = _corrected_warning(plan)
+                        warning["original_count"] = strict_count
+                        warning["corrected_count"] = corrected_count
+                        warning["message"] = (
+                            f"'{tokens[0]}' matched only {strict_count} listing(s); corrected to "
+                            f"'{fixes[0]}' ({corrected_count} listings)."
+                        )
+                        plan.warnings.append(warning)
+                        return plan
             plan.mode = "strict"
             plan.effective_tokens = tokens
             if operator_tokens:

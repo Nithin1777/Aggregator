@@ -343,25 +343,63 @@ its extracted voltage.
 
 A filter key must be valid **for that category**. Asking for `chemistry` under `category="motor"`
 is not an empty result — it returns `error_code: "filter_not_applicable_to_category"` with the
-keys that do apply. Categories with no attributes (for example `resistors` today) return
+keys that do apply. Categories with no attributes (for example `drones`) return
 `filter_support: "none"` instead of silently returning zero rows.
+
+### Engineering values and enums
+
+Numeric keys accept engineering strings in the key's declared unit. The parser also handles
+RKM notation (`4k7` = 4.7 kΩ), `ohm`/`Ω` suffixes, and case-sensitive multipliers
+(`m` = milli, `M` = mega):
+
+```python
+count_components(category="resistors", filters={"resistance_ohm": "10k"})      # 10000
+count_components(category="resistors", filters={"resistance_ohm": "4k7"})     # 4700
+count_components(category="capacitors", filters={"capacitance_uf": "100nF"})  # 0.1
+count_components(category="inductors", filters={"inductance_uh": "2.2mH"})    # 2200
+```
+
+Enum values are canonicalized (lowercase, dashes normalized, parenthetical variants collapsed)
+and two unambiguous numeric coercions are applied: `cells: 3` → `"3s"` and `package: 603` →
+`"0603"`. Both are disclosed as `filters_applied.filter_value_coerced`. `package:"through-hole"`
+is an umbrella over the concrete leaded packages for the requested category (for resistors,
+`axial` + `radial`), so it is a real filter instead of an advertised-but-empty value.
+
+`voltage` and `voltage_v` are equivalent aliases. With a category, the key is routed to the one
+that applies and disclosed as `filters_applied.filter_alias_applied`. Without a category, both
+keys are unioned (duplicate products counted once) and disclosed as
+`filters_applied.filter_expanded` with per-key counts. The same `aliases` map is in
+`describe_catalog` for discovery; distinct currents remain distinct keys.
 
 ### Request validation and diagnosis
 
-Every empty/rejected result carries a single `diagnosis` object, so an agent branches on
-`diagnosis.reason` instead of inferring intent from a warning string:
+Every empty/rejected result carries a single `diagnosis` object with a `severity`
+(`error` / `warning` / `info`), so an agent branches on `diagnosis.reason` instead of inferring
+intent from a warning string:
 
 ```json
 {"ok": false, "error_code": "filter_not_applicable_to_category",
- "diagnosis": {"reason": "filter_not_applicable_to_category", "category": "motor",
-               "not_applicable_keys": ["chemistry"],
+ "diagnosis": {"reason": "filter_not_applicable_to_category", "severity": "error",
+               "category": "motor", "not_applicable_keys": ["chemistry"],
                "applicable_keys": ["current_a", "rpm", "torque_kgcm", "voltage"],
                "filter_support": "partial"}}
 ```
 
-Numeric keys reject non-numeric values (`rpm: "abc"` → `invalid_filter_value`) instead of
-returning a confident zero. `tolerance` is a fraction of `eq` (`0.05` = ±5%) and must be
-`0 < tolerance <= 1`; `tolerance: 5` is rejected. `price_max` must be `>= 0`.
+The precedence is fixed: input/type → syntax → taxonomy → applicability →
+`filter_key_not_extracted` (the attribute is absent from every candidate) →
+`filter_value_not_present` (the key exists on some candidates) →
+`no_matching_combination` (each filter is valid, their intersection is empty) →
+`query_unresolved` → `query_relaxed` → `filter_recall_gap` → `null`.
+`filter_key_not_extracted` and `filter_recall_gap` carry `missing_spec` and `base_matches`;
+`query_relaxed` carries `dropped_tokens` and `query_effective`; `mpn_not_found` carries
+`suggested_mpns`. `count_components` now emits the same `filter_recall_gap` as search and scopes
+`coverage[key].category` to the requested category (`present`/`of`/`pct`).
+
+Numeric keys reject non-numeric values (`rpm: "abc"` → `invalid_filter_value` with a base-unit
+example) instead of returning a confident zero. `tolerance` is a fraction of `eq`
+(`0.05` = ±5%) and must be `0 < tolerance <= 1`; `tolerance: 5` is rejected.
+`price_max` must be `>= 0`. A `count_components` result includes zero-price quote rows and says
+so; a price-sorted search excludes them.
 
 ### Fit filtering (will this part work for my need?)
 
@@ -418,20 +456,29 @@ of all nine catalog keys. The web equivalents are the same filters through `sour
 
 ### Response contract (schema 2.0)
 
-- List tools return `data.items` (with `items_are: "listings"` and `total_listings`); `results` /
-  `listings` remain as aliases for older clients.
+- List tools return `data.results` (with `items_are: "listings"` and `total_listings`);
+  `data.items` remains an alias and `search_by_mpn` keeps `data.listings` as a deprecated alias.
+- `search_components(compact=True)` returns only `product_id`, `title`, `vendor`, `price`,
+  `currency`, `stock_status`, `mpn`, `specs` and `product_url` per row; 50 rows stay under 25 KB.
+  Omit the flag to keep the full response.
+- `describe_catalog(summary=True)` returns 49 keys in a compact columnar payload under 6 KB
+  (`key`, `type`, `unit`, `coverage_pct`, `backfill_pct`, `values`, `category_coverage`) plus the
+  alias map. `list_spec_keys` is retained but marked deprecated.
 - Specifications use one shape: `specs` is `{key: value}` everywhere; `get_product` adds
   `spec_details` with value/type/confidence/evidence and keeps `extracted_specs` as an alias.
-- `coverage[key]` has two explicit denominators: `catalog` and `page`. There is no longer a
-  `result_present / result_of` pair computed from different populations.
+- `coverage[key]` has explicit denominators: `catalog`, `category` (when a category is set), and
+  `page`. There is no longer a `result_present / result_of` pair computed from different
+  populations.
 - Filters report `filter_scope: "extracted_only"` and `data.filter_recall` with
   `base_matches`, `missing_spec` and `filtered_out_for_value`, plus a `filter_recall_gap`
-  warning. The count is “products with extracted specs”, not “all products”.
+  warning in both `count_components` and `search_components`.
 - Price/stock freshness reports `status="live"` only when every returned candidate was refreshed;
   otherwise `partial`, with `refreshed_products`, `cached_products` and `verified_pct`.
 - `search_by_mpn` rejects family tokens (`mpn_family_token`) and shared identifiers
   (`mpn_ambiguous`) unless `allow_ambiguous=True`; listings carry pack quantity, unit price and
-  `price_is_quote`.
+  `price_is_quote`. A miss returns `diagnosis.reason="mpn_not_found"` and `suggested_mpns`.
+- `health` and `describe_catalog` expose `spec_index_updated_at` and per-key `backfill_pct` so a
+  moving filtered count can be distinguished from a query error.
 
 ### MPN resolution
 
@@ -612,11 +659,11 @@ The MCP server lives in `mcp_server/server.py` and exposes **8 tools**:
 
 | Tool | What it does |
 |---|---|
-| `describe_catalog` | Catalog size, vendor/category distribution, the full taxonomy with filterable attributes, data freshness |
+| `describe_catalog` | Catalog size, taxonomy, freshness, alias map; `summary=True` for a sub-6 KB key catalog |
 | `describe_spec` | Value distribution, range and coverage for one spec attribute |
-| `list_spec_keys` | Every queryable spec attribute with fill counts |
-| `count_components` | Size a query without fetching rows + filter coverage |
-| `search_components` | Search by text and/or spec filters, side-by-side vendor offers, cursor pagination |
+| `list_spec_keys` | Deprecated alias for `describe_catalog(summary=True)`; still returns fill counts |
+| `count_components` | Size a query without fetching rows, with the same recall/diagnosis as search |
+| `search_components` | Search by text and/or spec filters, side-by-side vendor offers, cursor pagination; `compact=True` for small pages |
 | `search_by_mpn` | Resolve a part number (or vendor SKU) to its listings, with typo suggestions |
 | `get_product` | Full record for one product: specs, offers, confidence |
 | `health` | Liveness, dependency versions, database path |
@@ -680,10 +727,11 @@ the agent is talking to the same catalog you are.
 Once connected, the agent can discover the catalog first and then query it:
 
 ```
-describe_catalog()                                  # taxonomy, counts, filterable attributes
-search_components(category="motor", filters={"voltage": {"gte": 12}, "rpm": {"lte": 1000}})
-search_components(query="0805", category="resistors")
-count_components(category="battery", filters={"chemistry": {"eq": "lipo"}})
+describe_catalog(summary=True)                      # compact key/type/unit/coverage catalog
+count_components(category="resistors", filters={"resistance_ohm": "10k"})
+search_components(category="motor", filters={"voltage": "12", "rpm": {"lte": 1000}})
+search_components(query="0805", category="resistors", limit=50, compact=True)
+count_components(category="battery", filters={"cells": 3})
 search_by_mpn(mpn="MPU6050")
 ```
 

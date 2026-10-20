@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from src.spec.filters import canonical_enum_value
 from src.spec.taxonomy_loader import Taxonomy, TaxonomyAttribute
 from src.spec.title_attributes import extract_title_attributes
 
@@ -206,11 +207,12 @@ def _package(value: str, allowed: Optional[List[str]]) -> Optional[str]:
         if raw.startswith(prefix):
             raw = prefix
             break
-    if allowed and raw and raw.lower() not in {str(v).lower() for v in allowed}:
-        # A known family with an unknown suffix is still useful for equality
-        # filters; keep the canonical family name.
-        return raw.lower()
-    return raw.lower() or None
+    canonical = canonical_enum_value(raw)
+    if not canonical:
+        return None
+    # Preserve a real pin-count suffix (sot-23-5 is a different package from
+    # sot-23); the package family remains the equality-filter value otherwise.
+    return canonical
 
 
 def _detect(text: str, patterns: Dict[str, str]) -> Optional[str]:

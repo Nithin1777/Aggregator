@@ -42,22 +42,28 @@ from src.search.query_terms import (
 )
 from src.search.retrieval import rank_products
 from src.spec.filters import (
+    ALIAS_GROUPS,
     _nearest_keys,
+    alias_catalog_payload,
+    build_alias_clauses,
+    build_alias_expansion,
     build_spec_clauses,
+    canonical_enum_value,
     enum_is_numeric as _enum_is_numeric,
     filter_column as _filter_column,
     load_catalog_specs as _load_catalog_specs,
     normalize_scalar,
     parse_and_validate_filters,
     resolve_category,
+    route_alias_key,
     validate_filter_scope,
 )
 from src.spec.taxonomy_loader import get_taxonomy
 
 logger = logging.getLogger(__name__)
 
-SERVER_VERSION = "2.0.0"
-SCHEMA_VERSION = "2.0.0"
+SERVER_VERSION = "2.1.0"
+SCHEMA_VERSION = "2.1.0"
 
 # Hard ceiling on page size. An agent asking for 1000 rows is almost always
 # paginating by accident, and a negative limit becomes SQL `LIMIT -1` (= no limit).
@@ -191,7 +197,8 @@ class ToolResponseEnvelope(BaseModel):
         None,
         description=(
             "Single machine-readable explanation for an empty, rejected, or low-confidence result. "
-            "Branch on diagnosis.reason instead of inferring from warnings."
+            "Branch on diagnosis.reason and diagnosis.severity (error/warning/info) instead of "
+            "inferring from warnings."
         ),
     )
 
@@ -243,6 +250,8 @@ def make_error(
     diagnosis: Optional[Dict[str, Any]] = None,
 ) -> ToolResponseEnvelope:
     """Builds a structured error envelope without throwing bare ValueErrors."""
+    if diagnosis is not None:
+        diagnosis = {"severity": "error", **diagnosis}
     payload = {
         "ok": False,
         "error_code": error_code,
@@ -250,7 +259,7 @@ def make_error(
         "valid_keys": valid_keys,
         "suggestions": suggestions or [],
         "details": details or {},
-        "diagnosis": diagnosis or {"reason": error_code, **(details or {})},
+        "diagnosis": diagnosis or {"reason": error_code, "severity": "error", **(details or {})},
         "server_version": SERVER_VERSION,
     }
     return ToolResponseEnvelope(**payload)
@@ -301,7 +310,27 @@ def _enum_suggestions(key: str, spec_meta: Dict[str, Any], requested: Any, limit
     if _enum_is_numeric(spec_meta):
         items.sort(key=distance)
     else:
-        items.sort(key=lambda item: -item[1])
+        requested_text = canonical_enum_value(requested, spec_meta)
+        declared = [str(v) for v in (spec_meta.get("enum_values") or [])]
+        declared_present = [v for v in declared if v in counts]
+        near = difflib.get_close_matches(
+            str(requested_text),
+            [str(v) for v in counts],
+            n=limit,
+            cutoff=0.5,
+        )
+
+        def rank(item: Tuple[str, int]) -> Tuple[int, float, int]:
+            value = str(item[0])
+            if value == requested_text:
+                return (0, 0.0, -item[1])
+            if value in declared_present:
+                return (1, float(declared_present.index(value)), -item[1])
+            if value in near:
+                return (2, float(near.index(value)), -item[1])
+            return (3, -float(item[1]), -item[1])
+
+        items.sort(key=rank)
 
     return [{"key": key, "value": v, "count": c} for v, c in items[:limit]]
 
@@ -352,6 +381,9 @@ def _build_coverage_and_warnings(
     norm_filters: Dict[str, Any],
     total_matches: int,
     result_spec_counts: Optional[Dict[str, Dict[str, int]]] = None,
+    category: Optional[str] = None,
+    category_total: Optional[int] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
     Coverage for each filter key, plus warnings that are actually actionable.
@@ -374,6 +406,24 @@ def _build_coverage_and_warnings(
         coverage[fk] = {
             "catalog": {"present": present, "of": total_products, "pct": pct},
         }
+        if category and conn is not None:
+            rows = conn.execute(
+                "SELECT category, filled_count, applicable_count FROM spec_stats WHERE key = ?;",
+                (fk,),
+            ).fetchall()
+            row = next((r for r in rows if str(r[0]) == str(category)), None)
+            filled = int(row[1]) if row and row[1] is not None else 0
+            # A key owned by exactly one category can use the global applicable
+            # count: spec_stats can lag behind after category reclassification,
+            # while the global count is recomputed by the same promotion run.
+            if len(rows) == 1 and str(rows[0][0]) == str(category):
+                filled = max(filled, int(meta.get("count") or 0))
+            denominator = int(category_total or (row[2] if row and row[2] else 0) or 0)
+            coverage[fk]["category"] = {
+                "present": filled,
+                "of": denominator,
+                "pct": round(filled / max(denominator, 1) * 100, 2) if denominator else 0.0,
+            }
 
         # Sparse extraction only distorts the answer when the result set is small
         # enough that a coverage gap could be mistaken for "no such part exists".
@@ -399,12 +449,198 @@ def _build_coverage_and_warnings(
     return coverage, warnings
 
 
+def _compute_filter_recall(
+    conn: sqlite3.Connection,
+    catalog_specs: Dict[str, Dict[str, Any]],
+    norm_filters: Dict[str, Any],
+    query_plan: Optional[QueryPlan],
+    price_max: Optional[float],
+    in_stock_only: bool,
+    category: Optional[str],
+    active_category_keys: Optional[List[str]],
+    require_spec_scope: bool,
+    total_matches: int,
+    alias_filters: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Counts products excluded solely because a filtered key was never extracted."""
+    if not norm_filters:
+        return None, []
+    base_count_sql, base_params, _, _ = _build_sql_query(
+        {},
+        catalog_specs,
+        fts_tokens=(query_plan.effective_tokens if query_plan else None),
+        fts_relaxed=(query_plan.is_relaxed if query_plan else False),
+        price_max=price_max,
+        in_stock_only=in_stock_only,
+        category=category,
+        category_spec_keys=active_category_keys,
+        require_spec_scope=require_spec_scope,
+    )
+    inner_sql = base_count_sql.replace("SELECT COUNT(DISTINCT p.id)", "SELECT p.id", 1).rstrip().rstrip(";")
+    base_total = int(conn.execute(f"SELECT COUNT(*) FROM ({inner_sql}) base;", base_params).fetchone()[0])
+    keys = list(norm_filters.keys())
+    missing_sql = " OR ".join(
+        "NOT EXISTS (SELECT 1 FROM product_specs ps WHERE ps.product_id = base.id AND ps.key = ?)"
+        for _ in keys
+    )
+    if not missing_sql:
+        missing_sql = "0"
+    missing_spec = int(conn.execute(
+        f"SELECT COUNT(*) FROM ({inner_sql}) base WHERE {missing_sql};",
+        base_params + keys,
+    ).fetchone()[0]) if keys else 0
+    filtered_out_value = max(0, base_total - total_matches - missing_spec)
+    recall = {
+        "scope": "extracted_only",
+        "keys": keys,
+        "base_matches": base_total,
+        "missing_spec": missing_spec,
+        "filtered_out_for_value": filtered_out_value,
+    }
+    warnings: List[Dict[str, Any]] = []
+    if missing_spec:
+        warnings.append({
+            "code": "filter_recall_gap",
+            "message": (
+                f"{missing_spec} matching product(s) have no extracted value for "
+                f"{keys} and are excluded from this result. Treat the count as "
+                "'products with extracted specs', not all products."
+            ),
+            "missing_spec": missing_spec,
+            "base_matches": base_total,
+        })
+    return recall, warnings
+
+
+def _diagnosis(reason: str, severity: str = "warning", **payload: Any) -> Dict[str, Any]:
+    """Single ranked explanation; agents branch on `.reason`."""
+    return {"reason": reason, "severity": severity, **payload}
+
+
+def _diagnose_empty_result(
+    norm_filters: Dict[str, Any],
+    category: Optional[str],
+    query_original: Optional[str],
+    total_matches: int,
+    base_total: int,
+    missing_spec: int,
+    filter_recall: Optional[Dict[str, Any]],
+    suggestions: List[Dict[str, Any]],
+    individual_counts: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Implements the documented diagnosis precedence for a 0-row result."""
+    if total_matches > 0:
+        raise ValueError("_diagnose_empty_result is only for empty results")
+    if base_total > 0 and missing_spec >= base_total:
+        return _diagnosis(
+            "filter_key_not_extracted",
+            "warning",
+            filters=norm_filters,
+            category=category,
+            missing_spec=missing_spec,
+            base_matches=base_total,
+            hint=(
+                "All matching products lack this attribute in the catalog. "
+                "This is an extraction gap, not evidence that the part does not exist; "
+                "try search_components without the filter or use a text query."
+            ),
+        )
+    if norm_filters and individual_counts and all(c > 0 for c in individual_counts):
+        return _diagnosis(
+            "no_matching_combination",
+            "info",
+            filters=norm_filters,
+            category=category,
+            per_key_matches=individual_counts,
+            hint="Each filter is valid on its own, but no product satisfies all of them at once.",
+        )
+    if suggestions:
+        return _diagnosis(
+            "filter_value_not_present",
+            "warning",
+            filters=norm_filters,
+            category=category,
+            suggested_value=suggestions[0].get("value"),
+            suggestions=suggestions[:5],
+            missing_spec=missing_spec,
+            base_matches=base_total,
+        )
+    if norm_filters and len(norm_filters) > 1:
+        return _diagnosis(
+            "no_matching_combination",
+            "info",
+            filters=norm_filters,
+            category=category,
+            per_key_matches=individual_counts or [],
+            hint="Each filter is valid on its own, but no product satisfies all of them at once.",
+        )
+    if filter_recall and filter_recall.get("missing_spec"):
+        return _diagnosis(
+            "filter_recall_gap",
+            "warning",
+            filters=norm_filters,
+            category=category,
+            missing_spec=filter_recall["missing_spec"],
+            base_matches=filter_recall["base_matches"],
+        )
+    if norm_filters:
+        return _diagnosis(
+            "filter_value_not_present",
+            "warning",
+            filters=norm_filters,
+            category=category,
+            missing_spec=missing_spec,
+            base_matches=base_total,
+        )
+    if query_original:
+        return _diagnosis(
+            "no_catalog_match",
+            "info",
+            query=query_original,
+            filters=norm_filters,
+            category=category,
+        )
+    return _diagnosis("no_catalog_match", "info", filters=norm_filters, category=category)
+
+
+def _result_diagnosis(
+    query_plan: Optional[QueryPlan],
+    filter_recall: Optional[Dict[str, Any]],
+    norm_filters: Dict[str, Any],
+    category: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Non-empty result diagnosis: relaxed query, or partial filter recall."""
+    if query_plan is not None and query_plan.mode in ("relaxed", "corrected_relaxed"):
+        return _diagnosis(
+            "query_relaxed",
+            "warning",
+            query=query_plan.original,
+            query_effective=query_plan.effective_query,
+            dropped_tokens=list(query_plan.dropped_tokens),
+            match_mode=query_plan.match_mode,
+        )
+    if filter_recall and filter_recall.get("missing_spec"):
+        return _diagnosis(
+            "filter_recall_gap",
+            "warning",
+            filters=norm_filters,
+            category=category,
+            missing_spec=filter_recall["missing_spec"],
+            base_matches=filter_recall["base_matches"],
+        )
+    return None
+
+
 def _parse_and_validate_filters(
     filters: Optional[Dict[str, Any]],
-    advertised_specs: Dict[str, Dict[str, Any]]
+    advertised_specs: Dict[str, Dict[str, Any]],
+    category: Optional[str] = None,
+    coercions: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[ToolResponseEnvelope]]:
     """Validates filter keys and operators, rejecting deprecated string range forms."""
-    normalized, error = parse_and_validate_filters(filters, advertised_specs)
+    normalized, error = parse_and_validate_filters(
+        filters, advertised_specs, category=category, coercions=coercions
+    )
     if error is None:
         return normalized, None
     return None, make_error(
@@ -415,9 +651,78 @@ def _parse_and_validate_filters(
         details=error.get("details"),
         diagnosis={
             "reason": error["error_code"],
+            "severity": "error",
             **(error.get("details") or {}),
         },
     )
+
+
+def _route_filter_aliases(
+    filters: Optional[Dict[str, Any]],
+    catalog_specs: Dict[str, Dict[str, Any]],
+    category: Optional[str],
+    category_keys: List[str],
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Routes equivalent keys to the category-applicable key before validation."""
+    if not filters or not category:
+        return filters, []
+    routed: Dict[str, Any] = {}
+    applied: List[Dict[str, Any]] = []
+    for key, value in filters.items():
+        target = route_alias_key(key, category, category_keys)
+        if target and target != key:
+            routed[target] = value
+            applied.append({"group": "voltage", "from": key, "to": target})
+        else:
+            routed[key] = value
+    return routed, applied
+
+
+def _expand_unscoped_aliases(
+    norm_filters: Dict[str, Any],
+    catalog_specs: Dict[str, Dict[str, Any]],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, List[str]]]:
+    """
+    Replaces equivalent-key filters with one OR-expansion so `voltage:12` and
+    `voltage_v:12` return the same union without double-counting products.
+    """
+    expanded: Dict[str, Any] = {}
+    alias_filters: List[Dict[str, Any]] = []
+    disclosed: Dict[str, List[str]] = {}
+    for key, value in norm_filters.items():
+        expansion = build_alias_expansion(key, value, catalog_specs)
+        if not expansion:
+            expanded[key] = value
+            continue
+        group = expansion["group"]
+        keys = expansion["keys"]
+        existing = next((a for a in alias_filters if a["group"] == group), None)
+        if existing is None:
+            alias_filters.append({"group": group, "keys": keys, "value": value})
+        else:
+            # Both aliases were supplied: union their values when possible.
+            old = existing["value"]
+            if old == value:
+                pass
+            elif isinstance(old, dict) or isinstance(value, dict):
+                existing["value"] = {"in": [old, value]}
+            else:
+                existing["value"] = {"in": [old, value]}
+        disclosed[group] = keys
+    return expanded, alias_filters, disclosed
+
+
+def _coercion_payload(coercions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicates coercion notices for filters_applied."""
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for item in coercions or []:
+        marker = (str(item.get("key")), str(item.get("from")), str(item.get("to")))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append(item)
+    return out
 
 
 def _valid_categories(conn: sqlite3.Connection) -> List[str]:
@@ -542,6 +847,43 @@ def _query_status(plan: Optional[QueryPlan]) -> str:
     return plan.mode
 
 
+def _scoped_query_warning(
+    warnings: List[Dict[str, Any]],
+    total_matches: int,
+) -> None:
+    """Makes query_narrowed report the post-category-scope count, not the pre-scope one."""
+    for warning in warnings:
+        if warning.get("code") != "query_narrowed":
+            continue
+        warning["total_matches"] = total_matches
+        warning["matched_all_terms"] = total_matches
+        warning["message"] = (
+            f"Only {total_matches} listing(s) matched all query terms in this scope, but "
+            f"{warning.get('head_matches')} match '{warning.get('head_token')}' alone. "
+            "This may be over-narrow: drop a modifier or add spec filters to narrow deliberately."
+        )
+
+
+def _category_inference_warning(
+    category: Optional[str],
+    category_source: Optional[str],
+    scoped_total: int,
+    unscoped_total: int,
+) -> Optional[Dict[str, Any]]:
+    if not category or category_source != "query_head" or scoped_total == unscoped_total:
+        return None
+    return {
+        "code": "category_inferred",
+        "message": (
+            f"The query head implied category '{category}', which changed the result count "
+            f"from {unscoped_total} to {scoped_total}. Pass category explicitly to override."
+        ),
+        "category": category,
+        "total_with_category": scoped_total,
+        "total_without_category": unscoped_total,
+    }
+
+
 def _match_ratio(query: str, title: str) -> float:
     """Fraction of content query tokens present in a title (prefix aware)."""
     try:
@@ -616,6 +958,8 @@ def _build_sql_query(
     limit: int = 10,
     offset: int = 0,
     head_token: Optional[str] = None,
+    alias_filters: Optional[List[Dict[str, Any]]] = None,
+    zero_price_only: bool = False,
 ) -> Tuple[str, List[Any], str, List[Any]]:
     """Builds parameterized SQL for count and select queries.
 
@@ -635,6 +979,14 @@ def _build_sql_query(
     join_params.extend(spec_join_params)
     where_clauses.extend(spec_where)
     where_params.extend(spec_where_params)
+
+    alias_where, alias_params = build_alias_clauses(alias_filters, advertised_specs)
+    if alias_where:
+        where_clauses.extend(alias_where)
+        where_params.extend(alias_params)
+
+    if zero_price_only:
+        where_clauses.append("p.price <= 0")
 
     if price_max is not None:
         where_clauses.append("p.price <= ?")
@@ -737,7 +1089,7 @@ def _category_spec_bonus(
 # =====================================================================
 
 @mcp.tool()
-def describe_catalog() -> ToolResponseEnvelope:
+def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
     """
     Return comprehensive catalog-level metadata, total product counts, vendor distributions, category counts, queryable spec keys with coverage percentages, and data freshness timestamps.
 
@@ -748,9 +1100,10 @@ def describe_catalog() -> ToolResponseEnvelope:
     "relay"). spec_keys lists every filterable key with coverage; `values` is null for
     open-ended enums (e.g. battery voltage), where describe_spec shows observed distributions.
 
-    Parameter Syntax: Takes no arguments.
+    Parameter Syntax: summary: bool (default: false). summary=true returns a compact
+    columnar key catalog under ~6 KB instead of the full taxonomy/vendor payload.
 
-    Example Invocation: describe_catalog()
+    Example Invocation: describe_catalog(summary=True)
 
     Behavior When No Matches: Always returns ok:true with complete catalog statistics.
     """
@@ -769,6 +1122,9 @@ def describe_catalog() -> ToolResponseEnvelope:
 
         catalog_specs = _load_catalog_specs(conn)
         category_coverage = _category_coverage(conn)
+        spec_index_updated_at = cur.execute(
+            "SELECT MAX(updated_at) FROM spec_stats_global;"
+        ).fetchone()[0]
         spec_keys_list = []
         for k, s in catalog_specs.items():
             cov_pct = round(s["count"] / max(total_products, 1) * 100, 2)
@@ -778,6 +1134,7 @@ def describe_catalog() -> ToolResponseEnvelope:
                 "type": s["type"],
                 "unit": s["unit"],
                 "coverage_pct": cov_pct,
+                "backfill_pct": cov_pct,
                 "count": s["count"],
                 "category_coverage": category_coverage.get(k, []),
                 "values": s["enum_values"] if s["type"] == "enum" else None,
@@ -824,6 +1181,41 @@ def describe_catalog() -> ToolResponseEnvelope:
             })
 
         vendor_spec_stats = db.description_stats()
+        if summary:
+            # Columnar payload keeps the documented catalog -> count -> search
+            # preamble under ~6 KB while retaining key/type/unit/coverage/values.
+            columns = [
+                "key", "type", "unit", "coverage_pct", "backfill_pct",
+                "values", "category_coverage",
+            ]
+            summary_rows = []
+            for k, s in catalog_specs.items():
+                cov_pct = round(s["count"] / max(total_products, 1) * 100, 2)
+                values = None
+                if s["type"] == "enum":
+                    values = s["enum_values"]
+                    if not values:
+                        values = [v for v, _ in sorted(
+                            (s.get("value_counts") or {}).items(), key=lambda kv: -kv[1]
+                        )][:20]
+                cc = [c for c in category_coverage.get(k, []) if c.get("filled")][:1]
+                cc_payload = (
+                    {c["category"]: [c["filled"], c["applicable"]] for c in cc}
+                    if cc else None
+                )
+                summary_rows.append([
+                    k, s["type"], s["unit"], cov_pct, cov_pct, values, cc_payload,
+                ])
+            data = {
+                "total_products": total_products,
+                "spec_columns": columns,
+                "spec_keys": summary_rows,
+                "aliases": alias_catalog_payload(),
+                "spec_index_updated_at": spec_index_updated_at,
+                "summary": True,
+            }
+            return make_response(data=data, total_matches=total_products, returned=1)
+
         data = {
             "total_products": total_products,
             "counts": {
@@ -838,10 +1230,12 @@ def describe_catalog() -> ToolResponseEnvelope:
             "products_by_spec_category": products_by_spec_category,
             "taxonomy": taxonomy_payload,
             "spec_keys": spec_keys_list,
+            "aliases": alias_catalog_payload(),
             "currency": "INR",
             "freshness": {
                 "oldest_crawl": oldest_crawl,
                 "newest_crawl": newest_crawl,
+                "spec_index_updated_at": spec_index_updated_at,
                 "per_vendor": per_vendor_freshness,
                 "price_stock": db.get_price_stock_stats()
             }
@@ -937,7 +1331,9 @@ def count_components(
 
     Parameter Syntax:
       - filters: dict (supports scalar equality or operators in, gte, lte, gt, lt, eq, tolerance;
-        tolerance is a fraction of eq: 0.05 means +/-5%, must be > 0 and <= 1. Default: null)
+        tolerance is a fraction of eq: 0.05 means +/-5%, must be > 0 and <= 1. Numeric keys accept
+        engineering strings in the declared unit, e.g. resistance_ohm="10k", capacitance_uf="100nF".
+        Default: null)
       - query: str (FTS text search string, default: null)
       - price_max: float (maximum price in INR, must be >= 0; default: null)
       - in_stock_only: bool (default: false)
@@ -965,15 +1361,27 @@ def count_components(
             return price_err
 
         catalog_specs = _load_catalog_specs(conn)
-        norm_filters, err = _parse_and_validate_filters(filters, catalog_specs)
-        if err:
-            return err
-
         category_norm, category_err = _resolve_category_or_error(conn, category)
         if category_err:
             return category_err
-
         category_keys = _category_spec_keys(conn, category_norm) if category_norm else []
+        coercions: List[Dict[str, Any]] = []
+        routed_filters, alias_applied = _route_filter_aliases(
+            filters, catalog_specs, category_norm, category_keys
+        )
+        norm_filters, err = _parse_and_validate_filters(
+            routed_filters, catalog_specs, category=category_norm, coercions=coercions
+        )
+        if err:
+            return err
+        requested_filters = dict(norm_filters or {})
+        if category_norm:
+            alias_filters: List[Dict[str, Any]] = []
+            alias_disclosed: Dict[str, List[str]] = {}
+        else:
+            norm_filters, alias_filters, alias_disclosed = _expand_unscoped_aliases(
+                norm_filters or {}, catalog_specs
+            )
         scope_error = validate_filter_scope(norm_filters or {}, category_norm, category_keys)
         if scope_error:
             return make_error(
@@ -1036,7 +1444,16 @@ def count_components(
 
         if query_plan is not None and not query_plan.resolved:
             coverage, warnings = _build_coverage_and_warnings(
-                catalog_specs, total_products, norm_filters or {}, 0
+                catalog_specs,
+                total_products,
+                requested_filters,
+                0,
+                category=category_norm,
+                category_total=int(cur.execute(
+                    "SELECT COUNT(1) FROM products WHERE category_canonical = ?;",
+                    (category_norm,),
+                ).fetchone()[0]) if category_norm else 0,
+                conn=conn,
             )
             warnings.extend(query_plan.warnings)
             suggestions = _enum_filter_suggestions(
@@ -1058,21 +1475,28 @@ def count_components(
                 total_matches=0,
                 returned=0,
                 filters_applied={
-                    "filters": norm_filters or {},
+                    "filters": requested_filters,
                     "query": query_original,
                     "query_effective": query_plan.effective_query,
                     "price_max": price_max_norm,
                     "price_max_source": price_max_source,
                     "in_stock_only": bool(in_stock_only),
                     "category": category_norm,
+                    "category_source": category_source,
                     "filter_support": _category_filter_support(conn, category_norm),
+                    "filter_scope": "extracted_only" if (norm_filters or alias_filters) else "all_products",
+                    "query_status": "unresolved",
+                    "match_mode": query_plan.match_mode,
+                    "price_zero_excluded": False,
                 },
                 coverage=coverage,
                 warnings=warnings,
                 diagnosis={
                     "reason": "query_unresolved",
+                    "severity": "warning",
                     "query": query_original,
                     "query_suggestions": query_plan.suggestions,
+                    "dropped_tokens": list(query_plan.dropped_tokens),
                 },
             )
 
@@ -1084,56 +1508,115 @@ def count_components(
             price_max=price_max_norm,
             in_stock_only=in_stock_only,
             category=category_norm,
-            require_spec_scope=require_spec_scope
+            require_spec_scope=require_spec_scope,
+            alias_filters=alias_filters,
         )
         cur.execute(count_sql, params)
         total_count = cur.fetchone()[0]
 
+        category_total = 0
+        if category_norm:
+            category_total = int(cur.execute(
+                "SELECT COUNT(1) FROM products WHERE category_canonical = ?;",
+                (category_norm,),
+            ).fetchone()[0])
         coverage, warnings = _build_coverage_and_warnings(
-            catalog_specs, total_products, norm_filters or {}, total_count
+            catalog_specs,
+            total_products,
+            requested_filters,
+            total_count,
+            category=category_norm,
+            category_total=category_total,
+            conn=conn,
         )
+
+        filter_recall, recall_warnings = _compute_filter_recall(
+            conn,
+            catalog_specs,
+            norm_filters or {},
+            query_plan,
+            price_max_norm,
+            in_stock_only,
+            category_norm,
+            _category_spec_keys(conn, category_norm) if category_norm else None,
+            require_spec_scope,
+            total_count,
+            alias_filters=alias_filters,
+        )
+        warnings.extend(recall_warnings)
 
         suggestions: List[Dict[str, Any]] = []
         diagnosis: Optional[Dict[str, Any]] = None
-        if total_count == 0 and norm_filters:
-            suggestions.extend(
-                _enum_filter_suggestions(
-                    norm_filters, catalog_specs, conn=conn, category=category_norm
+        if total_count == 0:
+            individual_counts: List[int] = []
+            for only_key, only_value in (requested_filters or {}).items():
+                only_sql, only_params, _, _ = _build_sql_query(
+                    {only_key: only_value},
+                    catalog_specs,
+                    fts_tokens=(query_plan.effective_tokens if query_plan else None),
+                    fts_relaxed=(query_plan.is_relaxed if query_plan else False),
+                    price_max=price_max_norm,
+                    in_stock_only=in_stock_only,
+                    category=category_norm,
+                    require_spec_scope=require_spec_scope,
                 )
+                cur.execute(only_sql, only_params)
+                individual_counts.append(int(cur.fetchone()[0]))
+            zero_keys = {
+                key: value for (key, value), count in zip(
+                    (requested_filters or {}).items(), individual_counts
+                ) if count == 0
+            }
+            if zero_keys:
+                suggestions.extend(
+                    _enum_filter_suggestions(
+                        zero_keys, catalog_specs, conn=conn, category=category_norm
+                    )
+                )
+            diagnosis = _diagnose_empty_result(
+                requested_filters,
+                category_norm,
+                query_original,
+                total_count,
+                filter_recall["base_matches"] if filter_recall else 0,
+                filter_recall["missing_spec"] if filter_recall else 0,
+                filter_recall,
+                suggestions,
+                individual_counts,
             )
-            if suggestions:
+            if suggestions and diagnosis["reason"] == "filter_value_not_present":
                 warnings.append({
                     "code": "filter_value_not_present",
                     "message": "Filter matched 0 catalog rows; see data.suggestions for the closest populated values."
                 })
-                diagnosis = {
-                    "reason": "filter_value_not_present",
-                    "filters": norm_filters or {},
-                    "category": category_norm,
-                }
-            else:
-                diagnosis = {
-                    "reason": "no_matching_filter_combination",
-                    "filters": norm_filters or {},
-                    "category": category_norm,
-                    "hint": (
-                        "Each key is valid for this category, but no product carries a value "
-                        "matching all filters at once. Relax one bound or remove a key."
-                    ),
-                }
-        elif total_count == 0:
-            diagnosis = {
-                "reason": "no_catalog_match",
-                "query": query_original,
-                "filters": norm_filters or {},
-                "category": category_norm,
-            }
+        else:
+            diagnosis = _result_diagnosis(query_plan, filter_recall, requested_filters, category_norm)
 
         if query_plan is not None:
             warnings.extend(query_plan.warnings)
+            _scoped_query_warning(warnings, total_count)
+        if category_source == "query_head" and category_norm:
+            unscoped_sql, unscoped_params, _, _ = _build_sql_query(
+                norm_filters or {},
+                catalog_specs,
+                fts_tokens=(query_plan.effective_tokens if query_plan else None),
+                fts_relaxed=(query_plan.is_relaxed if query_plan else False),
+                price_max=price_max_norm,
+                in_stock_only=in_stock_only,
+                category=None,
+                require_spec_scope=False,
+                alias_filters=alias_filters,
+            )
+            cur.execute(unscoped_sql, unscoped_params)
+            unscoped_total = int(cur.fetchone()[0])
+            inferred_warning = _category_inference_warning(
+                category_norm, category_source, total_count, unscoped_total
+            )
+            if inferred_warning:
+                warnings.append(inferred_warning)
 
         filters_applied = {
-            "filters": norm_filters or {},
+            "filters": requested_filters,
             "query": query_original,
             "price_max": price_max_norm,
             "price_max_source": price_max_source,
@@ -1141,10 +1624,37 @@ def count_components(
             "category": category_norm,
             "category_source": category_source,
             "filter_support": _category_filter_support(conn, category_norm),
-            "filter_scope": "extracted_only" if norm_filters else "all_products",
+            "filter_scope": "extracted_only" if (norm_filters or alias_filters) else "all_products",
             "query_status": _query_status(query_plan),
             "match_mode": query_plan.match_mode if query_plan else "all_terms",
+            "price_zero_excluded": False,
+            "price_zero_policy": "count_includes_zero_price_rows; price-sorted search excludes them",
         }
+        if alias_applied:
+            filters_applied["filter_alias_applied"] = alias_applied
+        if alias_disclosed:
+            per_key_counts: Dict[str, int] = {}
+            for entry in alias_filters:
+                for key in entry.get("keys") or []:
+                    key_sql, key_params, _, _ = _build_sql_query(
+                        {key: entry.get("value")},
+                        catalog_specs,
+                        fts_tokens=(query_plan.effective_tokens if query_plan else None),
+                        fts_relaxed=(query_plan.is_relaxed if query_plan else False),
+                        price_max=price_max_norm,
+                        in_stock_only=in_stock_only,
+                        category=None,
+                        require_spec_scope=False,
+                    )
+                    cur.execute(key_sql, key_params)
+                    per_key_counts[key] = int(cur.fetchone()[0])
+            filters_applied["filter_expanded"] = {
+                group: keys for group, keys in alias_disclosed.items()
+            }
+            filters_applied["filter_expanded"]["per_key_counts"] = per_key_counts
+        coerced = _coercion_payload(coercions)
+        if coerced:
+            filters_applied["filter_value_coerced"] = coerced
         if query_plan is not None and query_plan.resolved:
             original = (query_original or "")
             if query_plan.effective_query.lower() != original.lower():
@@ -1159,6 +1669,10 @@ def count_components(
                 "query_status": _query_status(query_plan),
                 "match_mode": query_plan.match_mode if query_plan else "all_terms",
                 "query_tokens_dropped": list(query_plan.dropped_tokens) if query_plan else [],
+                "filter_recall": filter_recall,
+                "zero_price_rows_in_catalog": int(cur.execute(
+                    "SELECT COUNT(1) FROM products WHERE price <= 0;"
+                ).fetchone()[0]),
             },
             total_matches=total_count,
             returned=0,
@@ -1373,7 +1887,8 @@ def search_components(
     cursor: Optional[str] = None,
     refresh: bool = True,
     force_refresh: bool = False,
-    category: Optional[str] = None
+    category: Optional[str] = None,
+    compact: bool = False,
 ) -> ToolResponseEnvelope:
     """
     Search electronic components by parametric spec filters and/or full-text query with side-by-side vendor offers and cursor pagination.
@@ -1382,7 +1897,9 @@ def search_components(
 
     Parameter Syntax:
       - filters: dict (supports scalar equality or operators in, gte, lte, gt, lt, eq, tolerance;
-        tolerance is a fraction of eq: 0.05 means +/-5%, must be > 0 and <= 1. Default: null)
+        tolerance is a fraction of eq: 0.05 means +/-5%, must be > 0 and <= 1. Numeric keys accept
+        engineering strings in the declared unit, e.g. resistance_ohm="10k", capacitance_uf="100nF".
+        Default: null)
       - query: str (FTS query string, default: null)
       - price_max: float (max price in INR, must be >= 0; default: null)
       - in_stock_only: bool (default: false; listings flag out-of-stock rather than silently omitting)
@@ -1393,6 +1910,8 @@ def search_components(
       - force_refresh: bool (default: false; bypass the refresh TTL to re-verify now)
       - category: str (restrict to a catalog category, e.g. 'battery', 'motor', 'resistors';
         case-insensitive, plural tolerant; see describe_catalog data.taxonomy, default: null)
+      - compact: bool (default: false; return only product_id/title/vendor/price/currency/
+        stock_status/mpn/specs/product_url per row, keeping 50 rows under 25 KB)
 
     Natural-Language Queries: phrases like "battery to power an arduino for 8 hours" are
     understood: filler words are dropped, an all-terms match is relaxed to an any-term match
@@ -1507,15 +2026,27 @@ def search_components(
         catalog_specs = _load_catalog_specs(conn)
         all_catalog_keys = sorted(catalog_specs.keys())
 
-        norm_filters, err = _parse_and_validate_filters(filters, catalog_specs)
-        if err:
-            return err
-
         category_norm, category_err = _resolve_category_or_error(conn, category)
         if category_err:
             return category_err
-
         category_keys = _category_spec_keys(conn, category_norm) if category_norm else []
+        coercions: List[Dict[str, Any]] = []
+        routed_filters, alias_applied = _route_filter_aliases(
+            filters, catalog_specs, category_norm, category_keys
+        )
+        norm_filters, err = _parse_and_validate_filters(
+            routed_filters, catalog_specs, category=category_norm, coercions=coercions
+        )
+        if err:
+            return err
+        requested_filters = dict(norm_filters or {})
+        if category_norm:
+            alias_filters: List[Dict[str, Any]] = []
+            alias_disclosed: Dict[str, List[str]] = {}
+        else:
+            norm_filters, alias_filters, alias_disclosed = _expand_unscoped_aliases(
+                norm_filters or {}, catalog_specs
+            )
         scope_error = validate_filter_scope(norm_filters or {}, category_norm, category_keys)
         if scope_error:
             return make_error(
@@ -1573,7 +2104,7 @@ def search_components(
 
         # --- cursor is bound to the query that produced it ---
         fingerprint = _query_fingerprint(
-            norm_filters, effective_query, price_max_norm, in_stock_only, sort, category_norm
+            requested_filters, effective_query, price_max_norm, in_stock_only, sort, category_norm
         )
         offset = 0
         if cursor:
@@ -1604,7 +2135,7 @@ def search_components(
                 offset = 0
 
         filters_applied = {
-            "filters": norm_filters or {},
+            "filters": requested_filters,
             "query": query_original,
             "price_max": price_max_norm,
             "price_max_source": price_max_source,
@@ -1619,8 +2150,20 @@ def search_components(
             "refresh": bool(refresh),
             "force_refresh": bool(force_refresh),
             "price_zero_excluded": sort in ("price_asc", "price_desc"),
-            "filter_scope": "extracted_only" if norm_filters else "all_products",
+            "price_zero_policy": (
+                "price-sorted search excludes zero-price quote rows"
+                if sort in ("price_asc", "price_desc")
+                else "relevance search may include zero-price quote rows"
+            ),
+            "filter_scope": "extracted_only" if (norm_filters or alias_filters) else "all_products",
         }
+        if alias_applied:
+            filters_applied["filter_alias_applied"] = alias_applied
+        if alias_disclosed:
+            filters_applied["filter_expanded"] = {g: k for g, k in alias_disclosed.items()}
+        coerced = _coercion_payload(coercions)
+        if coerced:
+            filters_applied["filter_value_coerced"] = coerced
         if query_plan is not None and query_plan.resolved:
             original = (query_original or "")
             if query_plan.effective_query.lower() != original.lower():
@@ -1658,13 +2201,24 @@ def search_components(
                 next_cursor=None,
                 filters_applied=filters_applied,
                 coverage=_build_coverage_and_warnings(
-                    catalog_specs, total_products, norm_filters or {}, 0
+                    catalog_specs,
+                    total_products,
+                    requested_filters,
+                    0,
+                    category=category_norm,
+                    category_total=int(cur.execute(
+                        "SELECT COUNT(1) FROM products WHERE category_canonical = ?;",
+                        (category_norm,),
+                    ).fetchone()[0]) if category_norm else 0,
+                    conn=conn,
                 )[0],
                 warnings=warnings,
                 diagnosis={
                     "reason": "query_unresolved",
+                    "severity": "warning",
                     "query": (query or "").strip(),
                     "query_suggestions": query_plan.suggestions,
+                    "dropped_tokens": list(query_plan.dropped_tokens),
                 },
             )
 
@@ -1683,95 +2237,110 @@ def search_components(
             limit=effective_limit,
             offset=offset,
             head_token=head_token,
+            alias_filters=alias_filters,
         )
 
         cur.execute(count_sql, count_params)
         total_matches = cur.fetchone()[0]
 
-        filter_recall: Optional[Dict[str, Any]] = None
-        if norm_filters:
-            # How many matching products were excluded only because the filtered
-            # attribute was never extracted? Without this, `servo + torque>=1`
-            # looks like "only 70 servos exist" rather than "634 were dropped".
-            base_count_sql, base_params, _, _ = _build_sql_query(
-                {},
+        filter_recall, recall_warnings = _compute_filter_recall(
+            conn,
+            catalog_specs,
+            norm_filters or {},
+            query_plan,
+            price_max_norm,
+            in_stock_only,
+            category_norm,
+            active_category_keys,
+            require_spec_scope,
+            total_matches,
+            alias_filters=alias_filters,
+        )
+        warnings.extend(recall_warnings)
+
+        category_total = 0
+        if category_norm:
+            category_total = int(cur.execute(
+                "SELECT COUNT(1) FROM products WHERE category_canonical = ?;",
+                (category_norm,),
+            ).fetchone()[0])
+
+        coverage, cov_warnings = _build_coverage_and_warnings(
+            catalog_specs,
+            total_products,
+            requested_filters,
+            total_matches,
+            category=category_norm,
+            category_total=category_total,
+            conn=conn,
+        )
+        warnings.extend(cov_warnings)
+        if query_plan is not None:
+            warnings.extend(query_plan.warnings)
+            _scoped_query_warning(warnings, total_matches)
+        if category_source == "query_head" and category_norm:
+            unscoped_sql, unscoped_params, _, _ = _build_sql_query(
+                norm_filters or {},
                 catalog_specs,
                 fts_tokens=(query_plan.effective_tokens if query_plan else None),
                 fts_relaxed=(query_plan.is_relaxed if query_plan else False),
                 price_max=price_max_norm,
                 in_stock_only=in_stock_only,
-                category=category_norm,
-                category_spec_keys=active_category_keys,
-                require_spec_scope=require_spec_scope,
-                sort=sort,
+                category=None,
+                require_spec_scope=False,
+                alias_filters=alias_filters,
             )
-            inner_sql = base_count_sql.replace(
-                "SELECT COUNT(DISTINCT p.id)", "SELECT p.id", 1
-            ).rstrip().rstrip(";")
-            cur.execute(f"SELECT COUNT(*) FROM ({inner_sql}) base;", base_params)
-            base_total = int(cur.fetchone()[0])
-            missing_sql = " OR ".join(
-                "NOT EXISTS (SELECT 1 FROM product_specs ps "
-                "WHERE ps.product_id = base.id AND ps.key = ?)"
-                for _ in norm_filters
+            cur.execute(unscoped_sql, unscoped_params)
+            unscoped_total = int(cur.fetchone()[0])
+            inferred_warning = _category_inference_warning(
+                category_norm, category_source, total_matches, unscoped_total
             )
-            cur.execute(
-                f"SELECT COUNT(*) FROM ({inner_sql}) base WHERE {missing_sql};",
-                base_params + list(norm_filters.keys()),
-            )
-            missing_spec = int(cur.fetchone()[0])
-            filtered_out_value = max(0, base_total - total_matches - missing_spec)
-            filter_recall = {
-                "scope": "extracted_only",
-                "keys": list(norm_filters.keys()),
-                "base_matches": base_total,
-                "missing_spec": missing_spec,
-                "filtered_out_for_value": filtered_out_value,
-            }
-            if missing_spec:
-                warnings.append({
-                    "code": "filter_recall_gap",
-                    "message": (
-                        f"{missing_spec} matching product(s) have no extracted value for "
-                        f"{list(norm_filters.keys())} and are excluded from this result. "
-                        "Treat the count as 'products with extracted specs', not all products."
-                    ),
-                    "missing_spec": missing_spec,
-                    "base_matches": base_total,
-                })
-
-        coverage, cov_warnings = _build_coverage_and_warnings(
-            catalog_specs, total_products, norm_filters or {}, total_matches
-        )
-        warnings.extend(cov_warnings)
-        if query_plan is not None:
-            warnings.extend(query_plan.warnings)
+            if inferred_warning:
+                warnings.append(inferred_warning)
 
         if total_matches == 0:
             suggestions: List[Dict[str, Any]] = []
-            suggestions.extend(
-                _enum_filter_suggestions(
-                    norm_filters, catalog_specs, conn=conn, category=category_norm
+            individual_counts: List[int] = []
+            for only_key, only_value in (requested_filters or {}).items():
+                only_sql, only_params, _, _ = _build_sql_query(
+                    {only_key: only_value},
+                    catalog_specs,
+                    fts_tokens=(query_plan.effective_tokens if query_plan else None),
+                    fts_relaxed=(query_plan.is_relaxed if query_plan else False),
+                    price_max=price_max_norm,
+                    in_stock_only=in_stock_only,
+                    category=category_norm,
+                    require_spec_scope=require_spec_scope,
                 )
+                cur.execute(only_sql, only_params)
+                individual_counts.append(int(cur.fetchone()[0]))
+            zero_keys = {
+                key: value for (key, value), count in zip(
+                    (requested_filters or {}).items(), individual_counts
+                ) if count == 0
+            }
+            if zero_keys:
+                suggestions.extend(
+                    _enum_filter_suggestions(
+                        zero_keys, catalog_specs, conn=conn, category=category_norm
+                    )
+                )
+            diagnosis = _diagnose_empty_result(
+                requested_filters,
+                category_norm,
+                query_original,
+                total_matches,
+                filter_recall["base_matches"] if filter_recall else 0,
+                filter_recall["missing_spec"] if filter_recall else 0,
+                filter_recall,
+                suggestions,
+                individual_counts,
             )
-            diagnosis: Dict[str, Any]
-            if suggestions:
+            if suggestions and diagnosis.get("reason") == "filter_value_not_present":
                 warnings.append({
                     "code": "filter_value_not_present",
                     "message": "Filter value matched 0 catalog rows; see data.suggestions for the closest populated values."
                 })
-                diagnosis = {
-                    "reason": "filter_value_not_present",
-                    "filters": norm_filters or {},
-                    "category": category_norm,
-                }
-            else:
-                diagnosis = {
-                    "reason": "no_catalog_match",
-                    "query": query_original,
-                    "filters": norm_filters or {},
-                    "category": category_norm,
-                }
             zero_data: Dict[str, Any] = {
                 "items": [],
                 "results": [],
@@ -1779,9 +2348,17 @@ def search_components(
                 "query_status": _query_status(query_plan),
                 "match_mode": query_plan.match_mode if query_plan else "all_terms",
                 "price_stock_refresh": None,
+                "filter_recall": filter_recall,
             }
             if query_plan is not None and query_plan.suggestions:
                 zero_data["query_suggestions"] = query_plan.suggestions
+            if alias_applied:
+                filters_applied["filter_alias_applied"] = alias_applied
+            if alias_disclosed:
+                filters_applied["filter_expanded"] = {g: k for g, k in alias_disclosed.items()}
+            coerced = _coercion_payload(coercions)
+            if coerced:
+                filters_applied["filter_value_coerced"] = coerced
             return make_response(
                 data=zero_data,
                 total_matches=0,
@@ -1821,6 +2398,7 @@ def search_components(
                 limit=pool_limit,
                 offset=0,
                 head_token=head_token,
+                alias_filters=alias_filters,
             )
             cur.execute(rank_sql, rank_params)
             candidate_rows = cur.fetchall()
@@ -1876,6 +2454,8 @@ def search_components(
             )
             for spec_key, spec_count in cur.fetchall():
                 result_spec_counts[spec_key] = spec_count
+        for group, keys in (alias_disclosed or {}).items():
+            result_spec_counts[group] = sum(result_spec_counts.get(k, 0) for k in keys)
 
         # Spec presence across the returned page: tells the caller whether a field
         # is genuinely absent from the part or simply never extracted for it.
@@ -1954,6 +2534,13 @@ def search_components(
                 "low_confidence_specs": low_confidence_specs,
             })
 
+        if compact:
+            compact_keys = (
+                "product_id", "title", "vendor", "price", "currency",
+                "stock_status", "mpn", "specs", "product_url",
+            )
+            results = [{k: row.get(k) for k in compact_keys} for row in results]
+
         returned = len(results)
         truncated = (offset + returned) < total_matches
         next_cursor = None
@@ -2002,8 +2589,34 @@ def search_components(
                 "total_matches": total_matches,
             })
 
-        return make_response(
-            data={
+        if alias_disclosed:
+            per_key_counts: Dict[str, int] = {}
+            for entry in alias_filters:
+                for key in entry.get("keys") or []:
+                    key_sql, key_params, _, _ = _build_sql_query(
+                        {key: entry.get("value")},
+                        catalog_specs,
+                        fts_tokens=(query_plan.effective_tokens if query_plan else None),
+                        fts_relaxed=(query_plan.is_relaxed if query_plan else False),
+                        price_max=price_max_norm,
+                        in_stock_only=in_stock_only,
+                        category=None,
+                        require_spec_scope=False,
+                    )
+                    cur.execute(key_sql, key_params)
+                    per_key_counts[key] = int(cur.fetchone()[0])
+            filters_applied["filter_expanded"] = {g: k for g, k in alias_disclosed.items()}
+            filters_applied["filter_expanded"]["per_key_counts"] = per_key_counts
+
+        if compact:
+            data_payload: Dict[str, Any] = {
+                "results": results,
+                "query_status": query_status,
+                "total_listings": total_matches,
+                "compact": True,
+            }
+        else:
+            data_payload = {
                 "items": results,
                 "results": results,
                 "items_are": "listings",
@@ -2021,14 +2634,18 @@ def search_components(
                 "page_coverage": page_coverage,
                 "filter_recall": filter_recall,
                 "price_stock_refresh": refresh_info.model_dump() if refresh_info else None,
-            },
+            }
+
+        return make_response(
+            data=data_payload,
             total_matches=total_matches,
             returned=returned,
             truncated=truncated,
             next_cursor=next_cursor,
             filters_applied=filters_applied,
             coverage=coverage,
-            warnings=warnings
+            warnings=warnings,
+            diagnosis=_result_diagnosis(query_plan, filter_recall, requested_filters, category_norm),
         )
     finally:
         conn.close()
@@ -2054,6 +2671,9 @@ def list_spec_keys() -> ToolResponseEnvelope:
 
         catalog_specs = _load_catalog_specs(conn)
         category_coverage = _category_coverage(conn)
+        spec_index_updated_at = cur.execute(
+            "SELECT MAX(updated_at) FROM spec_stats_global;"
+        ).fetchone()[0]
         spec_keys_list = []
         for k, s in catalog_specs.items():
             cov_pct = round(s["count"] / max(total_products, 1) * 100, 2)
@@ -2063,6 +2683,7 @@ def list_spec_keys() -> ToolResponseEnvelope:
                 "type": s["type"],
                 "unit": s["unit"],
                 "coverage_pct": cov_pct,
+                "backfill_pct": cov_pct,
                 "count": s["count"],
                 "category_coverage": category_coverage.get(k, []),
                 "values": s["enum_values"] if s["type"] == "enum" else None,
@@ -2072,9 +2693,21 @@ def list_spec_keys() -> ToolResponseEnvelope:
             })
 
         return make_response(
-            data={"spec_keys": spec_keys_list},
+            data={
+                "spec_keys": spec_keys_list,
+                "spec_key_names": [s["key"] for s in spec_keys_list],
+                "deprecated": True,
+                "replacement": "describe_catalog(summary=True)",
+            },
             total_matches=len(spec_keys_list),
-            returned=len(spec_keys_list)
+            returned=len(spec_keys_list),
+            warnings=[{
+                "code": "deprecated_tool",
+                "message": (
+                    "list_spec_keys is retained for backward compatibility. Use "
+                    "describe_catalog(summary=True) for a compact key/type/unit/coverage catalog."
+                ),
+            }],
         )
     finally:
         conn.close()
@@ -2131,6 +2764,24 @@ def health() -> ToolResponseEnvelope:
             "db_path": str(getattr(getattr(db, "settings", None), "db_path", "unknown")),
             "integrity_check": integrity,
             "counts": counts,
+            "spec_index_updated_at": cur.execute(
+                "SELECT MAX(updated_at) FROM spec_stats_global;"
+            ).fetchone()[0],
+            "spec_backfill_pct": round(
+                (cur.execute("SELECT COUNT(1) FROM product_specs;").fetchone()[0] or 0)
+                / max(cur.execute("SELECT COUNT(1) FROM products;").fetchone()[0] or 1, 1)
+                * 100, 2
+            ),
+            "spec_backfill_pct_by_key": {
+                str(row[0]): round(
+                    float(row[1] or 0)
+                    / max(int(cur.execute("SELECT COUNT(1) FROM products;").fetchone()[0] or 1), 1)
+                    * 100, 2
+                )
+                for row in cur.execute(
+                    "SELECT key, applicable_count FROM spec_stats_global ORDER BY key;"
+                ).fetchall()
+            },
             "dependency_versions": dependency_versions,
             "server_version": SERVER_VERSION,
             "schema_version": SCHEMA_VERSION,
@@ -2369,6 +3020,7 @@ def search_by_mpn(
         ]
 
         suggested_mpns: List[str] = []
+        diagnosis: Optional[Dict[str, Any]] = None
         if not listings:
             suggested_mpns = db.suggest_mpns(needle)
             warnings.append({
@@ -2379,6 +3031,13 @@ def search_by_mpn(
                     "concluding the part is absent from the catalog."
                 ),
             })
+            diagnosis = _diagnosis(
+                "mpn_not_found",
+                "warning",
+                mpn=needle,
+                mpn_normalized=normalized,
+                suggested_mpns=suggested_mpns,
+            )
             if suggested_mpns:
                 warnings.append({
                     "code": "mpn_did_you_mean",
@@ -2400,7 +3059,9 @@ def search_by_mpn(
                 "mpn": needle,
                 "mpn_normalized": normalized,
                 "items": listings,
+                "results": listings,
                 "listings": listings,
+                "listings_deprecated": "Use data.results; data.listings is a compatibility alias.",
                 "total_listings": total,
                 "items_are": "listings",
                 "suggested_mpns": suggested_mpns,
@@ -2422,7 +3083,8 @@ def search_by_mpn(
                 "refresh": bool(refresh),
                 "force_refresh": bool(force_refresh),
             },
-            warnings=warnings
+            warnings=warnings,
+            diagnosis=diagnosis,
         )
     finally:
         conn.close()
