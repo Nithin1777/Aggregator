@@ -32,8 +32,8 @@ sys.path.insert(0, str(BASE_DIR))
 
 import db
 from adapters.robu_graphql import (
-    RobuGraphQLError,
     RobuGraphQLClient,
+    RobuGraphQLSchemaError,
     description_html,
 )
 from models import UnifiedProduct
@@ -100,29 +100,58 @@ def run(
     batch_size: int,
     sleep_s: float,
     dry_run: bool,
+    timeout: int = 60,
+    retries: int = 3,
+    backoff: float = 2.0,
 ) -> Dict[str, int]:
     stats = {"batches": 0, "slugs": 0, "upserted": 0, "described": 0, "attributes": 0, "missing": 0}
-    client = RobuGraphQLClient()
+    client = RobuGraphQLClient(timeout=timeout, retries=retries, backoff=backoff)
     conn = db.get_db_connection()
+    consecutive_failures = 0
     try:
-        while True:
-            remaining = limit - stats["slugs"] if limit else batch_size
-            if limit and remaining <= 0:
-                break
-            pending = db.get_pending_robu_slugs(limit=min(batch_size, remaining) if limit else batch_size)
-            if not pending:
-                logger.info("No pending Robu slugs left.")
-                break
+        pending = [
+            {"slug": r[0], "url": r[1]}
+            for r in conn.execute(
+                "SELECT slug, url FROM robu_catalog_registry "
+                "WHERE status = 'pending' ORDER BY slug;"
+            ).fetchall()
+        ]
+        if limit:
+            pending = pending[:limit]
+        if not pending:
+            logger.info("No pending Robu slugs left.")
+            return stats
 
-            slugs = [item["slug"] for item in pending]
+        for start in range(0, len(pending), max(1, batch_size)):
+            batch = pending[start:start + max(1, batch_size)]
+            slugs = [item["slug"] for item in batch]
             try:
                 details = client.fetch_batch(slugs, batch_size=batch_size)
-            except RobuGraphQLError as exc:
-                logger.warning("Stopped at %s pending slugs: %s", len(slugs), exc)
+            except RobuGraphQLSchemaError as exc:
+                logger.error("Stopping: Robu GraphQL schema/query error: %s", exc)
                 break
+            if client.failures:
+                logger.warning(
+                    "Skipped %s slug(s) after retries; they remain pending",
+                    len(client.failures),
+                )
             if not details:
-                logger.warning("No product details returned; stopping this batch.")
-                break
+                consecutive_failures += 1
+                logger.warning(
+                    "No details for this batch (%s consecutive failure(s)); continuing.",
+                    consecutive_failures,
+                )
+                if consecutive_failures >= 5:
+                    logger.error(
+                        "5 consecutive failed batches; stopping so the endpoint can "
+                        "recover. Rerun to retry the remaining pending slugs."
+                    )
+                    break
+                stats["batches"] += 1
+                if sleep_s:
+                    time.sleep(sleep_s)
+                continue
+            consecutive_failures = 0
 
             for slug, detail in details.items():
                 stats["slugs"] += 1
@@ -145,19 +174,22 @@ def run(
                 else:
                     stats["upserted"] += 1
 
-            for item in pending:
-                if item["slug"] not in details:
+            for item in batch:
+                if item["slug"] not in details and item["slug"] not in client.failures:
                     stats["missing"] += 1
                     if not dry_run:
-                        # Do not retry the same 404 slug forever; a future registry
-                        # refresh can reset it to pending.
+                        # A genuine 404: do not retry the same slug forever.
                         db.mark_robu_slug_status(item["slug"], "missing")
+
             stats["batches"] += 1
             stats["upserted"] = stats["described"]
+            pending_left = conn.execute(
+                "SELECT COUNT(1) FROM robu_catalog_registry WHERE status = 'pending';"
+            ).fetchone()[0]
             logger.info(
-                "batch=%s slugs=%s described=%s attrs=%s pending_left~%s",
+                "batch=%s slugs=%s described=%s attrs=%s pending_left=%s",
                 stats["batches"], stats["slugs"], stats["described"],
-                stats["attributes"], len(db.get_pending_robu_slugs(limit=1)),
+                stats["attributes"], pending_left,
             )
             if sleep_s:
                 time.sleep(sleep_s)
@@ -172,6 +204,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--limit", type=int, default=0, help="max slugs (0 = all pending)")
     parser.add_argument("--batch-size", type=int, default=25)
     parser.add_argument("--sleep", type=float, default=0.2)
+    parser.add_argument("--timeout", type=int, default=60, help="per-request timeout (seconds)")
+    parser.add_argument("--retries", type=int, default=3, help="retries per request")
+    parser.add_argument("--backoff", type=float, default=2.0, help="retry backoff base (seconds)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -181,6 +216,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         batch_size=max(1, args.batch_size),
         sleep_s=max(0.0, args.sleep),
         dry_run=args.dry_run,
+        timeout=max(5, args.timeout),
+        retries=max(1, args.retries),
+        backoff=max(0.0, args.backoff),
     )
     logger.info("Done: %s", stats)
     if not args.dry_run:

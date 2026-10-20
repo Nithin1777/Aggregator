@@ -36,8 +36,8 @@ sys.path.insert(0, str(BASE_DIR))
 
 import db
 from adapters.robu_graphql import (
-    RobuGraphQLError,
     RobuGraphQLClient,
+    RobuGraphQLSchemaError,
     description_html,
 )
 from config import settings
@@ -308,6 +308,9 @@ def _robu_graphql(
     force: bool,
     dry_run: bool,
     update_price_stock: bool = False,
+    timeout: int = 60,
+    retries: int = 3,
+    backoff: float = 2.0,
 ) -> Dict[str, int]:
     """
     Robu product descriptions via the frontend's ProductDetails GraphQL API.
@@ -334,7 +337,8 @@ def _robu_graphql(
     if not rows:
         return stats
 
-    client = RobuGraphQLClient()
+    client = RobuGraphQLClient(timeout=timeout, retries=retries, backoff=backoff)
+    consecutive_failures = 0
     try:
         for start in range(0, len(rows), max(1, batch_size)):
             chunk = rows[start:start + max(1, batch_size)]
@@ -343,9 +347,24 @@ def _robu_graphql(
                 continue
             try:
                 details = client.fetch_batch(list(by_slug.keys()), batch_size=batch_size)
-            except RobuGraphQLError as exc:
-                logger.warning("[robu-graphql] stopped at offset %s: %s", start, exc)
+            except RobuGraphQLSchemaError as exc:
+                logger.error("[robu-graphql] schema error at offset %s: %s", start, exc)
                 break
+            if client.failures:
+                logger.warning(
+                    "[robu-graphql] skipped %s slug(s) in batch at offset %s; they remain undescribed",
+                    len(client.failures), start,
+                )
+            if not details and client.failures:
+                consecutive_failures += 1
+                if consecutive_failures >= 5:
+                    logger.error(
+                        "[robu-graphql] 5 consecutive failed batches; stopping so the "
+                        "endpoint can recover. Rerun to retry the undescribed products."
+                    )
+                    break
+            else:
+                consecutive_failures = 0
             for slug, detail in details.items():
                 row = by_slug.get(slug)
                 if row is None:
@@ -409,6 +428,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="also write price/stock returned by the Robu GraphQL API",
     )
+    parser.add_argument("--timeout", type=int, default=60, help="per-request timeout (seconds)")
+    parser.add_argument("--retries", type=int, default=3, help="retries per request")
+    parser.add_argument("--backoff", type=float, default=2.0, help="retry backoff base (seconds)")
     parser.add_argument("--force", action="store_true", help="refetch even if a description exists")
     parser.add_argument("--dry-run", action="store_true", help="parse but do not write")
     args = parser.parse_args(argv)
@@ -445,6 +467,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         args.force,
                         args.dry_run,
                         update_price_stock=args.update_price_stock,
+                        timeout=max(5, args.timeout),
+                        retries=max(1, args.retries),
+                        backoff=max(0.0, args.backoff),
                     )
                 else:
                     totals[vendor] = _robu(

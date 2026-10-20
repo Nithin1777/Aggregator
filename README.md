@@ -478,6 +478,11 @@ slugs.
 python scripts/ingest_robu_graphql.py --limit 100 --batch-size 25
 ```
 
+Both Robu GraphQL scripts retry timeouts/429/403 with exponential backoff, split a failing
+batch and keep the successful half, and skip a slug only after retries so an overnight run is
+not killed by one slow product. Failed slugs stay pending/undescribed for the next run.
+Tune with `--timeout`, `--retries` and `--backoff`.
+
 ### Keeping the taxonomy current
 
 Filterable attributes are defined in `config/taxonomy.yaml` and `config/extractors.yaml`. After
