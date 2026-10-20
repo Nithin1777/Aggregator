@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import math
 import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
@@ -186,6 +187,12 @@ def normalize_scalar(key: str, val: Any, v_type: str = "string", unit: Optional[
         if m_a:
             return float(m_a.group(1))
 
+    # Discharge C-rate (10C / 10 C)
+    if key == "discharge_c":
+        m_c = re.search(r"^([\d\.]+)\s*c$", s, re.I)
+        if m_c:
+            return float(m_c.group(1))
+
     # Channels
     if key == "channels":
         m_ch = re.search(r"^(\d+)\s*(?:ch|channel|channels)?$", s, re.I)
@@ -198,7 +205,8 @@ def normalize_scalar(key: str, val: Any, v_type: str = "string", unit: Optional[
 
     if v_type in ("integer", "float"):
         try:
-            return int(s) if v_type == "integer" else float(s)
+            number = float(s)
+            return int(round(number)) if v_type == "integer" else number
         except ValueError:
             pass
 
@@ -215,6 +223,103 @@ def _nearest_keys(bad_key: str, valid_keys: List[str], limit: int = 5) -> List[D
     if not close:
         close = valid_keys[:limit]
     return [{"key": k} for k in close]
+
+
+# ---------------------------------------------------------------------------
+# Category resolution
+# ---------------------------------------------------------------------------
+
+def _singular(token: str) -> str:
+    """Conservative singular form used only for category-name matching."""
+    if len(token) > 3 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 2 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def resolve_category(
+    value: Optional[str],
+    valid_categories: List[str],
+    limit: int = 5,
+) -> Tuple[Optional[str], List[str]]:
+    """
+    Resolves a caller-supplied category to a canonical catalog category.
+
+    Returns `(canonical, suggestions)`. Accepts exact names, simple plurals
+    ("motors" -> "motor") and close misspellings ("motr" -> "motor"). Always
+    suggests the nearest valid categories when it cannot resolve, ranked with
+    the same fuzzy matcher used for spec keys.
+    """
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None, []
+
+    valid = sorted({str(c) for c in valid_categories})
+    if raw in valid:
+        return raw, []
+
+    singular = _singular(raw)
+    if singular in valid:
+        return singular, []
+
+    close = difflib.get_close_matches(raw, valid, n=limit, cutoff=0.4)
+    if not close and singular != raw:
+        close = difflib.get_close_matches(singular, valid, n=limit, cutoff=0.4)
+    if not close:
+        close = valid[:limit]
+    return None, close
+
+
+# ---------------------------------------------------------------------------
+# Value validation
+# ---------------------------------------------------------------------------
+
+def _numeric_key(spec_meta: Dict[str, Any]) -> bool:
+    """True when the key's values are numbers (either typed or numeric enum)."""
+    return spec_meta.get("type") in ("integer", "float") or enum_is_numeric(spec_meta)
+
+
+def _validate_numeric_value(
+    key: str,
+    value: Any,
+    spec_meta: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Rejects values that cannot be compared numerically.
+
+    Without this, `rpm: "abc"` reaches SQL as `value_num = 'abc'`, matches zero
+    rows, and is indistinguishable from "no such part exists".
+    """
+    if not _numeric_key(spec_meta):
+        return None
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return {
+            "error_code": "invalid_filter_value",
+            "message": (
+                f"Filter '{key}' expects a numeric value; got {value!r}. "
+                f"This key is {spec_meta.get('type', 'numeric')}."
+            ),
+            "suggestions": [{"key": key, "value": 1}],
+            "details": {
+                "key": key,
+                "provided_value": value,
+                "expected_type": spec_meta.get("type") or "number",
+                "unit": spec_meta.get("unit"),
+            },
+        }
+    if not math.isfinite(number):
+        return {
+            "error_code": "invalid_filter_value",
+            "message": f"Filter '{key}' expects a finite number; got {value!r}.",
+            "suggestions": [{"key": key, "value": 1}],
+            "details": {"key": key, "provided_value": value, "expected_type": "number"},
+        }
+    return None
 
 
 def parse_and_validate_filters(
@@ -322,36 +427,145 @@ def parse_and_validate_filters(
                         "suggestions": [],
                         "details": {"provided_value": in_list},
                     }
-                norm_op_dict["in"] = [normalize_scalar(f_key, v, v_type, unit) for v in in_list]
+                if not in_list:
+                    return None, {
+                        "error_code": "invalid_filter_value",
+                        "message": f"Operator 'in' for filter '{f_key}' requires at least one value.",
+                        "valid_keys": all_valid_keys,
+                        "suggestions": [],
+                        "details": {"provided_value": in_list},
+                    }
+                norm_op_dict["in"] = []
+                for raw_value in in_list:
+                    value = normalize_scalar(f_key, raw_value, v_type, unit)
+                    invalid = _validate_numeric_value(f_key, value, spec_meta)
+                    if invalid:
+                        invalid["valid_keys"] = all_valid_keys
+                        invalid["details"]["operator"] = "in"
+                        return None, invalid
+                    norm_op_dict["in"].append(value)
 
             for bound in ("gte", "lte", "gt", "lt"):
                 if bound in f_val:
-                    norm_op_dict[bound] = normalize_scalar(f_key, f_val[bound], v_type, unit)
+                    value = normalize_scalar(f_key, f_val[bound], v_type, unit)
+                    invalid = _validate_numeric_value(f_key, value, spec_meta)
+                    if invalid:
+                        invalid["valid_keys"] = all_valid_keys
+                        invalid["details"]["operator"] = bound
+                        return None, invalid
+                    norm_op_dict[bound] = value
 
             if "eq" in f_val:
-                norm_op_dict["eq"] = normalize_scalar(f_key, f_val["eq"], v_type, unit)
+                value = normalize_scalar(f_key, f_val["eq"], v_type, unit)
+                invalid = _validate_numeric_value(f_key, value, spec_meta)
+                if invalid:
+                    invalid["valid_keys"] = all_valid_keys
+                    invalid["details"]["operator"] = "eq"
+                    return None, invalid
+                norm_op_dict["eq"] = value
 
             if "tolerance" in f_val:
+                if "eq" not in f_val:
+                    return None, {
+                        "error_code": "invalid_filter_value",
+                        "message": (
+                            f"Filter '{f_key}' supplied 'tolerance' without 'eq'. Tolerance is a "
+                            "fraction of an equality value (0.05 = +/-5%)."
+                        ),
+                        "valid_keys": all_valid_keys,
+                        "suggestions": [
+                            {"key": f_key, "value": {"eq": f_val.get("eq", 1), "tolerance": 0.05}}
+                        ],
+                        "details": {"provided_value": f_val},
+                    }
                 try:
-                    norm_op_dict["tolerance"] = float(f_val["tolerance"])
+                    tolerance = float(f_val["tolerance"])
                 except (ValueError, TypeError):
                     return None, {
                         "error_code": "invalid_filter_value",
                         "message": (
-                            f"Tolerance value for '{f_key}' must be a float multiplier "
-                            "(e.g. 0.1 for +/-10%)."
+                            f"Tolerance value for '{f_key}' must be a fraction of the equality "
+                            "value (e.g. 0.05 for +/-5%)."
                         ),
                         "valid_keys": all_valid_keys,
                         "suggestions": [],
                         "details": {"provided_value": f_val},
                     }
+                if not math.isfinite(tolerance) or not (0.0 < tolerance <= 1.0):
+                    return None, {
+                        "error_code": "invalid_filter_value",
+                        "message": (
+                            f"Tolerance for '{f_key}' must be a fraction greater than 0 and at most 1. "
+                            f"Got {f_val['tolerance']!r}; 0.05 means +/-5% of the 'eq' value."
+                        ),
+                        "valid_keys": all_valid_keys,
+                        "suggestions": [{"key": f_key, "tolerance": 0.05}],
+                        "details": {
+                            "key": f_key,
+                            "provided_value": f_val["tolerance"],
+                            "expected": "0 < tolerance <= 1 (fraction of eq)",
+                        },
+                    }
+                norm_op_dict["tolerance"] = tolerance
 
             normalized[f_key] = norm_op_dict
         else:
             # Primitive scalar equality
-            normalized[f_key] = normalize_scalar(f_key, f_val, v_type, unit)
+            value = normalize_scalar(f_key, f_val, v_type, unit)
+            invalid = _validate_numeric_value(f_key, value, spec_meta)
+            if invalid:
+                invalid["valid_keys"] = all_valid_keys
+                return None, invalid
+            normalized[f_key] = value
 
     return normalized, None
+
+
+def validate_filter_scope(
+    normalized_filters: Dict[str, Any],
+    category: Optional[str],
+    category_keys: List[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Rejects filters that cannot apply to the requested category.
+
+    A key such as `chemistry` exists globally (batteries) but is meaningless for
+    motors. Previously that returned an empty success and a suggestion list from
+    the global value distribution, which told the caller the opposite of the
+    truth. The category is the scope; the key must be defined inside it.
+    """
+    if not category or not normalized_filters:
+        return None
+
+    applicable = list(dict.fromkeys(str(k) for k in (category_keys or [])))
+    bad_keys = [k for k in normalized_filters if k not in applicable]
+    if not bad_keys:
+        return None
+
+    filter_support = "none" if not applicable else "partial"
+    if not applicable:
+        message = (
+            f"Category '{category}' has no filterable spec attributes. "
+            "Search it by text, or use a category that advertises attributes "
+            "(see describe_catalog data.taxonomy[].filterable_attributes)."
+        )
+    else:
+        message = (
+            f"Filter key(s) {bad_keys} do not apply to category '{category}'. "
+            f"Applicable keys: {applicable}."
+        )
+
+    return {
+        "error_code": "filter_not_applicable_to_category",
+        "message": message,
+        "suggestions": [{"key": k} for k in applicable[:8]],
+        "details": {
+            "category": category,
+            "not_applicable_keys": bad_keys,
+            "applicable_keys": applicable,
+            "filter_support": filter_support,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

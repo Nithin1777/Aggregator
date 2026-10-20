@@ -110,6 +110,32 @@ def clean_html(text: str) -> str:
     return re.sub(r"<[^>]+>", " ", text).strip()
 
 
+_PACK_QUANTITY_RE = re.compile(
+    r"\b(?:pack|set|lot|bundle)\s+of\s+(\d{1,4})\b"
+    r"|\b(\d{1,4})\s*(?:pcs|pieces|pc|nos)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_pack_quantity(title: str) -> Optional[int]:
+    """
+    Quantity contained in one listing, when the title states it.
+
+    'Pack of 10', '10 pcs' -> 10. Returns None when the title does not say, so
+    callers can mark the price as not unit-comparable instead of guessing.
+    """
+    text = clean_html(title or "")
+    match = _PACK_QUANTITY_RE.search(text)
+    if not match:
+        return None
+    raw = match.group(1) or match.group(2)
+    try:
+        quantity = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return quantity if 1 <= quantity <= 10000 else None
+
+
 @lru_cache(maxsize=16384)
 def strip_compatibility_clauses(text: str) -> str:
     """Removes trailing compatibility spam like 'Compatible with Arduino/ESP32', 'for Arduino/ESP32/sensors', or host accessory clauses."""

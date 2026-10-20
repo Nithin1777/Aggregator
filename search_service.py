@@ -791,19 +791,31 @@ class AggregatorEngine:
         info.vendors_failed = sorted(vendors_failed)
         info.refreshed_products = applied
         info.cached_products = max(len(products) - applied, 0)
+        info.verified_pct = round(
+            applied / max(len(products), 1) * 100.0, 1
+        )
 
         if applied > 0:
             info.fetched_at = fetched_at
-            if vendors_failed:
+            # 'live' must mean every returned listing was verified. Previously a
+            # single refreshed row out of twenty still reported status='live',
+            # and agents quoted the other nineteen cached prices as fresh.
+            if applied < len(products) or vendors_failed:
                 info.status = "partial"
                 info.message = (
-                    f"Refreshed price/stock for {applied} listing(s); unreachable vendors: "
-                    f"{', '.join(sorted(vendors_failed))}. Remaining listings use cached values."
+                    f"Refreshed price/stock for {applied} of {len(products)} listing(s) "
+                    f"({info.verified_pct}% verified)"
+                    + (
+                        f"; unreachable vendors: {', '.join(sorted(vendors_failed))}."
+                        if vendors_failed
+                        else "."
+                    )
+                    + " Remaining listings use cached values."
                 )
             else:
                 info.status = "live"
                 info.message = (
-                    f"Refreshed price/stock for {applied} listing(s) from live vendor data "
+                    f"Refreshed price/stock for all {applied} listing(s) from live vendor data "
                     f"(cached in the local catalog for offline fallback)."
                 )
         else:

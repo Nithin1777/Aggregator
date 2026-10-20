@@ -86,7 +86,7 @@ def test_category_filter_scopes_results():
     res = search_components(category="battery", limit=5, refresh=False)
     assert res.ok is True
     assert res.total_matches > 0
-    assert all(r["spec_category"] == "battery" for r in res.data["results"])
+    assert all(r["category_canonical"] == "battery" for r in res.data["results"])
 
 
 def test_unknown_category_returns_error_with_valid_values():

@@ -99,6 +99,7 @@ class PriceStockRefreshInfo(BaseModel):
     candidates: int = 0
     refreshed_products: int = 0
     cached_products: int = 0
+    verified_pct: float = 0.0
     vendors_ok: List[str] = Field(default_factory=list)
     vendors_failed: List[str] = Field(default_factory=list)
     queries: List[str] = Field(default_factory=list)

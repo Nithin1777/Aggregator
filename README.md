@@ -317,14 +317,51 @@ the **MCP tools**, the **web UI**, and `GET /api/search?source=local`, driven by
 `filters_applied.query` always echoes what the caller typed; `filters_applied.query_effective`
 shows what was actually searched.
 
+**Booleans and quotes are not silently rewritten.** `esp32 OR esp8266` returns
+`error_code: "unsupported_query_syntax"`; run one query per alternative instead. Lowercase
+`or`/`and` are reported as `query_operator_dropped`.
+
+**Relaxation is progressive, not all-or-nothing.** When a strict query is empty, generic
+modifiers are dropped before the head term; the response exposes `query_tokens_dropped`,
+`query_status` (`exact`, `relaxed`, `low_confidence`, `unresolved`) and `match_ratio_top`.
+A query that matches only a handful of rows while the head term matches thousands also gets a
+`query_narrowed` warning, so a plausible-looking small count is not mistaken for the full answer.
+
+**Price intent is honoured.** “cheapest X” sets `sort=price_asc` (`sort_inferred`), price-zero
+quote/fabrication rows are excluded from price sorts, and “under ₹500” is parsed into
+`price_max` when the caller did not pass one.
+
 ### Component categories
 
 `search_components`, `count_components` (and the web search) accept a `category` filter —
-`battery`, `motor`, `relay`, or any value in `describe_catalog` →
-`counts.products_by_spec_category`. Within a category, genuine components rank above
-bundles/chargers/kits that merely mention the category word (ranking prefers products that carry
-the category's extracted specs). Unknown categories return `error_code: "unknown_category"` with
-the valid list.
+`battery`, `motor`, `relay`, or any taxonomy category (see `describe_catalog` → `data.taxonomy`).
+The name is case-insensitive and plural tolerant (`Motor`, `motors` → `motor`); a typo returns
+`error_code: "unknown_category"` with ranked nearest categories (`motr` → `motor`). Category
+filters use `products.category_canonical`, not the spec-extraction scope, so a 9V battery snap
+connector filed under “Battery Accessories” cannot enter a `category="battery"` result through
+its extracted voltage.
+
+A filter key must be valid **for that category**. Asking for `chemistry` under `category="motor"`
+is not an empty result — it returns `error_code: "filter_not_applicable_to_category"` with the
+keys that do apply. Categories with no attributes (for example `resistors` today) return
+`filter_support: "none"` instead of silently returning zero rows.
+
+### Request validation and diagnosis
+
+Every empty/rejected result carries a single `diagnosis` object, so an agent branches on
+`diagnosis.reason` instead of inferring intent from a warning string:
+
+```json
+{"ok": false, "error_code": "filter_not_applicable_to_category",
+ "diagnosis": {"reason": "filter_not_applicable_to_category", "category": "motor",
+               "not_applicable_keys": ["chemistry"],
+               "applicable_keys": ["current_a", "rpm", "torque_kgcm", "voltage"],
+               "filter_support": "partial"}}
+```
+
+Numeric keys reject non-numeric values (`rpm: "abc"` → `invalid_filter_value`) instead of
+returning a confident zero. `tolerance` is a fraction of `eq` (`0.05` = ±5%) and must be
+`0 < tolerance <= 1`; `tolerance: 5` is rejected. `price_max` must be `>= 0`.
 
 ### Fit filtering (will this part work for my need?)
 
@@ -347,8 +384,25 @@ search_components(filters={"chemistry": "lipo", "voltage": "3.7",
 ```
 
 Per-product `specs_not_extracted` is scoped to keys that apply to that product's category, so a
-battery is never reported as “missing rpm”. The web equivalents are the same filters through
-`source=local`.
+battery is never reported as “missing rpm”; an unclassified product reports an empty list instead
+of all nine catalog keys. The web equivalents are the same filters through `source=local`.
+
+### Response contract (schema 2.0)
+
+- List tools return `data.items` (with `items_are: "listings"` and `total_listings`); `results` /
+  `listings` remain as aliases for older clients.
+- Specifications use one shape: `specs` is `{key: value}` everywhere; `get_product` adds
+  `spec_details` with value/type/confidence/evidence and keeps `extracted_specs` as an alias.
+- `coverage[key]` has two explicit denominators: `catalog` and `page`. There is no longer a
+  `result_present / result_of` pair computed from different populations.
+- Filters report `filter_scope: "extracted_only"` and `data.filter_recall` with
+  `base_matches`, `missing_spec` and `filtered_out_for_value`, plus a `filter_recall_gap`
+  warning. The count is “products with extracted specs”, not “all products”.
+- Price/stock freshness reports `status="live"` only when every returned candidate was refreshed;
+  otherwise `partial`, with `refreshed_products`, `cached_products` and `verified_pct`.
+- `search_by_mpn` rejects family tokens (`mpn_family_token`) and shared identifiers
+  (`mpn_ambiguous`) unless `allow_ambiguous=True`; listings carry pack quantity, unit price and
+  `price_is_quote`.
 
 ### MPN resolution
 
@@ -356,6 +410,35 @@ battery is never reported as “missing rpm”. The web equivalents are the same
 `MPU 6050` resolve to the same listings. Listings include extracted `specs` and `price_source`,
 pagination uses `next_cursor` (with `stale_cursor` protection), and a miss returns
 `data.suggested_mpns` (closest catalog part numbers) instead of a dead end.
+
+### Vendor descriptions and free-form specs
+
+The taxonomy only defines attributes for a few categories. Vendor descriptions carry far more:
+QuartzComponents and MakerBazar publish two-column `Specification | Value` tables (resistance,
+tolerance, dielectric, package, dimensions, ...), and REES52/Robokits publish prose specs.
+
+`scripts/backfill_descriptions.py` stores those descriptions in `product_descriptions` and parses
+the tables/lists into `product_attributes`. The curated, filterable layer stays in
+`product_specs`; `vendor_specs` is the larger free-form layer returned by `get_product`.
+
+```powershell
+# Shopify: quartzcomponents, makerbazar, rees52 (fast, ~75 catalog pages)
+python scripts/backfill_descriptions.py --vendors quartzcomponents,makerbazar,rees52
+
+# Robokits product pages (one request per product)
+python scripts/backfill_descriptions.py --vendors robokits --limit 100
+
+# Robu is Cloudflare-protected; 403s are skipped, so run it where the IP is allowed
+python scripts/backfill_descriptions.py --vendors robu --limit 50
+
+# Inspect without writing
+python scripts/backfill_descriptions.py --vendors quartzcomponents --limit 5 --dry-run
+```
+
+The script is idempotent (existing descriptions are skipped unless `--force`). `describe_catalog`
+reports `products_with_descriptions`, `products_with_vendor_attributes` and
+`vendor_attribute_rows`; `get_product` returns `vendor_specs` plus a real `description`
+instead of falling back to the title.
 
 ### Keeping the taxonomy current
 

@@ -15,6 +15,7 @@ from src.search.query_terms import (
     QueryPlan,
     content_tokens,
     correctable,
+    detect_unsupported_syntax,
     fts_variations,
     relaxed_fts_expr,
     strict_fts_expr,
@@ -117,6 +118,42 @@ def _ensure_price_stock_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_products_price_stock_attempted "
         "ON products(price_stock_attempted_at);"
+    )
+
+
+def _ensure_description_schema(conn: sqlite3.Connection) -> None:
+    """
+    Vendor descriptions and the free-form attributes extracted from them.
+
+    `product_specs` stays the taxonomy-filterable layer. Vendor tables often
+    carry dozens of attributes the taxonomy does not define yet (tolerance,
+    package, dielectric, interface, ...); they live here so agents can answer
+    fit questions without waiting for a taxonomy migration.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS product_descriptions (
+            product_id INTEGER PRIMARY KEY,
+            description TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'vendor_page',
+            fetched_at TEXT
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS product_attributes (
+            product_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            label TEXT,
+            value TEXT NOT NULL,
+            value_num REAL,
+            unit TEXT,
+            source TEXT NOT NULL DEFAULT 'description_table',
+            confidence REAL DEFAULT 1.0,
+            PRIMARY KEY (product_id, key)
+        );
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_product_attributes_key "
+        "ON product_attributes(key);"
     )
 
 
@@ -226,6 +263,9 @@ def init_db():
 
             # 2b. Canonical category layer (user facing taxonomy + facets)
             _ensure_category_schema(conn)
+
+            # 2c. Vendor descriptions and free-form attributes
+            _ensure_description_schema(conn)
 
             # 2b. Variant families table for Option B
             conn.execute("""
@@ -445,6 +485,172 @@ def upsert_products(products: List[UnifiedProduct]) -> int:
     finally:
         conn.close()
     return count
+
+def ensure_description_schema(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Creates product_descriptions/product_attributes if an older DB lacks them."""
+    own = conn is None
+    conn = conn or get_db_connection()
+    try:
+        with conn:
+            _ensure_description_schema(conn)
+    finally:
+        if own:
+            conn.close()
+
+
+def save_product_description(
+    product_id: int,
+    description: str,
+    source: str = "vendor_page",
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Stores the cleaned vendor description (idempotent per product)."""
+    own = conn is None
+    conn = conn or get_db_connection()
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO product_descriptions (product_id, description, source, fetched_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(product_id) DO UPDATE SET
+                    description = excluded.description,
+                    source = excluded.source,
+                    fetched_at = excluded.fetched_at;
+                """,
+                (int(product_id), description or "", source, utc_now_iso()),
+            )
+    finally:
+        if own:
+            conn.close()
+
+
+def get_product_description(product_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT description, source, fetched_at FROM product_descriptions WHERE product_id = ?;",
+            (int(product_id),),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "description": row[0],
+            "source": row[1],
+            "fetched_at": row[2],
+        }
+    finally:
+        conn.close()
+
+
+def replace_product_attributes(
+    product_id: int,
+    attributes: List[Dict[str, Any]],
+    source: str = "description",
+    conn: Optional[sqlite3.Connection] = None,
+) -> int:
+    """
+    Replaces the free-form attributes for one product. Idempotent.
+
+    `attributes` items use the `src.spec.description` shape:
+    key, label, value, value_num, unit, confidence.
+    """
+    own = conn is None
+    conn = conn or get_db_connection()
+    try:
+        with conn:
+            conn.execute(
+                "DELETE FROM product_attributes WHERE product_id = ?;",
+                (int(product_id),),
+            )
+            rows = [
+                (
+                    int(product_id),
+                    str(item["key"])[:80],
+                    str(item.get("label") or item["key"])[:120],
+                    str(item["value"])[:500],
+                    item.get("value_num"),
+                    item.get("unit"),
+                    item.get("source") or source,
+                    float(item.get("confidence", 1.0)),
+                )
+                for item in attributes
+                if item.get("key") and item.get("value") is not None
+            ]
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO product_attributes
+                        (product_id, key, label, value, value_num, unit, source, confidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    rows,
+                )
+            return len(rows)
+    finally:
+        if own:
+            conn.close()
+
+
+def get_product_attributes(product_id: int) -> Dict[str, Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT key, label, value, value_num, unit, source, confidence "
+            "FROM product_attributes WHERE product_id = ? ORDER BY key;",
+            (int(product_id),),
+        ).fetchall()
+        return {
+            row[0]: {
+                "label": row[1],
+                "value": row[2],
+                "value_num": row[3],
+                "unit": row[4],
+                "source": row[5],
+                "confidence": row[6],
+            }
+            for row in rows
+        }
+    finally:
+        conn.close()
+
+
+def get_attribute_counts(product_ids: List[int]) -> Dict[int, int]:
+    """Number of vendor attributes per product, for compact list payloads."""
+    if not product_ids:
+        return {}
+    placeholders = ", ".join(["?"] * len(product_ids))
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            f"SELECT product_id, COUNT(1) FROM product_attributes "
+            f"WHERE product_id IN ({placeholders}) GROUP BY product_id;",
+            list(product_ids),
+        ).fetchall()
+        return {int(r[0]): int(r[1]) for r in rows}
+    finally:
+        conn.close()
+
+
+def description_stats() -> Dict[str, int]:
+    conn = get_db_connection()
+    try:
+        return {
+            "descriptions": int(
+                conn.execute("SELECT COUNT(1) FROM product_descriptions;").fetchone()[0]
+            ),
+            "attribute_rows": int(
+                conn.execute("SELECT COUNT(1) FROM product_attributes;").fetchone()[0]
+            ),
+            "products_with_attributes": int(
+                conn.execute(
+                    "SELECT COUNT(DISTINCT product_id) FROM product_attributes;"
+                ).fetchone()[0]
+            ),
+        }
+    finally:
+        conn.close()
+
 
 def row_to_unified_product(row: sqlite3.Row) -> UnifiedProduct:
     """Maps a `products` row (including optional refresh columns) to UnifiedProduct."""
@@ -862,6 +1068,81 @@ def suggest_query_token(conn: sqlite3.Connection, token: str, limit: int = 3) ->
     return difflib.get_close_matches(lowered, candidates, n=limit, cutoff=0.75)
 
 
+def _fts_term_doc_count(conn: sqlite3.Connection, token: str) -> int:
+    """Document frequency of one token in the FTS vocabulary."""
+    row = conn.execute(
+        "SELECT doc FROM products_fts_vocab WHERE term = ? LIMIT 1;", (token.lower(),)
+    ).fetchone()
+    return int(row[0]) if row and row[0] else 1
+
+
+def _head_token(tokens: List[str]) -> Optional[str]:
+    """
+    The earliest token that names a taxonomy category ("battery", "motor", ...).
+
+    The head term is the anchor of a natural-language component query. It must
+    never be relaxed away; the modifiers around it may be.
+    """
+    try:
+        taxonomy = get_taxonomy()
+        category_tokens = set()
+        for category in taxonomy.categories.values():
+            category_tokens.add(category.id.replace("-", " "))
+            category_tokens.update(category.detect_keywords)
+        flat = {token for value in category_tokens for token in tokenize(value)}
+        for token in tokens:
+            if token in flat:
+                return token
+            if any(len(term) >= 4 and token.startswith(term) for term in flat):
+                return token
+    except Exception:  # noqa: BLE001 - head detection is best-effort
+        return None
+    return None
+
+
+def _spec_like_token(token: str) -> bool:
+    """Numeric/unit tokens are constraints; drop them only after plain modifiers."""
+    if re.fullmatch(r"\d{1,2}", token):
+        # A bare "8" is far more likely to be "8 hours" than "8V"; do not keep
+        # it as a hard constraint after relaxation.
+        return False
+    return bool(re.search(r"\d", token)) or token.lower() in {
+        "v", "a", "w", "mah", "ah", "rpm", "kgcm", "kg", "mm", "cm", "nm", "ohm",
+    }
+
+
+def _progressive_relaxation(
+    conn: sqlite3.Connection,
+    tokens: List[str],
+    head: Optional[str],
+) -> Tuple[Optional[List[str]], List[str]]:
+    """
+    Drops plain modifiers first, then numeric constraints, never the head term.
+
+    This replaces the old all-or-nothing AND -> OR switch, which turned
+    "battery to power an arduino for 8 hours" into 30,119 rows. "hours" must not
+    survive as the last token: it would match capacitor lifetimes, not batteries.
+    """
+    remaining = list(tokens)
+    dropped: List[str] = []
+
+    while len(remaining) > 1:
+        candidates = [t for t in remaining if t != head]
+        if not candidates:
+            break
+        modifiers = [t for t in candidates if not _spec_like_token(t)]
+        pool = modifiers or candidates
+        drop = max(pool, key=lambda t: (_fts_term_doc_count(conn, t), t))
+        remaining.remove(drop)
+        dropped.append(drop)
+        if _fts_match_count(conn, strict_fts_expr(remaining)) > 0:
+            return remaining, dropped
+
+    if remaining and _fts_match_count(conn, strict_fts_expr(remaining)) > 0:
+        return remaining, dropped
+    return None, dropped
+
+
 def resolve_query_plan(query: Optional[str], conn: Optional[sqlite3.Connection] = None) -> QueryPlan:
     """
     Resolves how a free-text query should hit the FTS index.
@@ -874,9 +1155,29 @@ def resolve_query_plan(query: Optional[str], conn: Optional[sqlite3.Connection] 
     what was actually searched.
     """
     plan = QueryPlan(original=query or "")
+    syntax = detect_unsupported_syntax(query)
+    if syntax:
+        plan.mode = "unresolved"
+        plan.tokens = content_tokens(query)[0]
+        plan.effective_tokens = plan.tokens
+        plan.operator_tokens = list(syntax["operators"])
+        plan.warnings.append({
+            "code": "unsupported_query_syntax",
+            "message": syntax["message"],
+            "operators": syntax["operators"],
+            "characters": syntax["characters"],
+        })
+        return plan
+
     tokens, ignored = content_tokens(query)
     plan.tokens = tokens
     plan.ignored = ignored
+    operator_tokens = [
+        token for token in ignored if token.lower() in ("or", "and", "not")
+    ]
+    plan.operator_tokens = operator_tokens
+    head = _head_token(tokens)
+    plan.head_token = head or ""
     if not tokens:
         return plan
 
@@ -884,9 +1185,27 @@ def resolve_query_plan(query: Optional[str], conn: Optional[sqlite3.Connection] 
     if own_conn:
         conn = get_db_connection()
     try:
-        if _fts_match_count(conn, strict_fts_expr(tokens)) > 0:
+        strict_count = _fts_match_count(conn, strict_fts_expr(tokens))
+        if strict_count > 0:
             plan.mode = "strict"
             plan.effective_tokens = tokens
+            if operator_tokens:
+                plan.warnings.append(_operator_warning(plan, operator_tokens))
+            if head and len(tokens) > 1:
+                head_count = _fts_match_count(conn, strict_fts_expr([head]))
+                plan.head_match_count = head_count
+                if strict_count <= 20 and head_count >= 50 and head_count >= strict_count * 20:
+                    plan.warnings.append({
+                        "code": "query_narrowed",
+                        "message": (
+                            f"Only {strict_count} listing(s) matched all query terms, but "
+                            f"{head_count} match '{head}' alone. This may be over-narrow: drop a "
+                            "modifier or add spec filters to narrow deliberately."
+                        ),
+                        "head_token": head,
+                        "head_matches": head_count,
+                        "query_effective": plan.effective_query,
+                    })
             return plan
 
         if not _ensure_fts_vocab(conn):
@@ -894,6 +1213,7 @@ def resolve_query_plan(query: Optional[str], conn: Optional[sqlite3.Connection] 
             if len(tokens) > 1 and _fts_match_count(conn, relaxed_fts_expr(tokens)) > 0:
                 plan.mode = "relaxed"
                 plan.effective_tokens = tokens
+                plan.match_mode = "any_terms"
                 plan.warnings.append(_relaxed_warning(plan))
                 return plan
             plan.mode = "unresolved"
@@ -913,18 +1233,41 @@ def resolve_query_plan(query: Optional[str], conn: Optional[sqlite3.Connection] 
                 plan.mode = "corrected"
                 plan.effective_tokens = corrected
                 plan.warnings.append(_corrected_warning(plan))
+                if operator_tokens:
+                    plan.warnings.append(_operator_warning(plan, operator_tokens))
                 return plan
             if len(corrected) > 1 and _fts_match_count(conn, relaxed_fts_expr(corrected)) > 0:
                 plan.mode = "corrected_relaxed"
                 plan.effective_tokens = corrected
+                plan.match_mode = "any_terms"
                 plan.warnings.append(_corrected_warning(plan))
                 plan.warnings.append(_relaxed_warning(plan))
                 return plan
 
+        # Progressive relaxation: drop the most generic token first, so a
+        # natural-language modifier ("robot", "arduino") does not collapse the
+        # result set to a near-empty list.
+        if len(tokens) > 1:
+            subset, dropped = _progressive_relaxation(conn, tokens, head)
+            if subset:
+                plan.mode = "relaxed"
+                plan.effective_tokens = subset
+                plan.dropped_tokens = dropped
+                plan.match_mode = "all_terms"
+                plan.warnings.append(_relaxed_warning(plan))
+                if operator_tokens:
+                    plan.warnings.append(_operator_warning(plan, operator_tokens))
+                return plan
+
+        # Last resort: any-term matching. The MCP layer flags this as
+        # low-confidence because a single matching token is not a search.
         if len(tokens) > 1 and _fts_match_count(conn, relaxed_fts_expr(tokens)) > 0:
             plan.mode = "relaxed"
             plan.effective_tokens = tokens
+            plan.match_mode = "any_terms"
             plan.warnings.append(_relaxed_warning(plan))
+            if operator_tokens:
+                plan.warnings.append(_operator_warning(plan, operator_tokens))
             return plan
 
         plan.mode = "unresolved"
@@ -958,14 +1301,37 @@ def _corrected_warning(plan: QueryPlan) -> Dict[str, Any]:
     }
 
 
+def _operator_warning(plan: QueryPlan, operators: List[str]) -> Dict[str, Any]:
+    return {
+        "code": "query_operator_dropped",
+        "message": (
+            f"The word(s) {operators} were treated as filler, not as boolean operators. "
+            "This server does not implement OR/AND/NOT; issue separate searches instead."
+        ),
+        "operators": operators,
+        "query_effective": plan.effective_query,
+    }
+
+
 def _relaxed_warning(plan: QueryPlan) -> Dict[str, Any]:
+    if plan.match_mode == "any_terms":
+        message = (
+            "No listing matched the query terms together; results match any single term and "
+            "are ranked by relevance. Treat this as a broad discovery result, not an exact match."
+        )
+    else:
+        dropped = ", ".join(plan.dropped_tokens) or "none"
+        message = (
+            "No listing matched every query term; the most generic term(s) were dropped "
+            f"(dropped: {dropped}) and the remaining terms are matched together. "
+            "Narrow the query or add spec filters for exact matches."
+        )
     return {
         "code": "query_relaxed",
-        "message": (
-            "No listing matched every query term; results match any term and are ranked by "
-            "relevance. Narrow the query or add spec filters for exact matches."
-        ),
+        "message": message,
         "query_effective": plan.effective_query,
+        "match_mode": plan.match_mode,
+        "dropped_tokens": list(plan.dropped_tokens),
     }
 
 
@@ -1019,6 +1385,50 @@ def find_products_by_mpn(needle: str, limit: int = 20, offset: int = 0) -> Tuple
             (normalized, normalized, max(1, int(limit)), max(0, int(offset))),
         ).fetchall()
         return rows, total
+    finally:
+        conn.close()
+
+
+def mpn_match_stats(needle: str, sample_limit: int = 8) -> Dict[str, Any]:
+    """
+    Ambiguity statistics for an MPN/SKU match.
+
+    A single MPN value shared by hundreds of unrelated titles ("ESP32") is a
+    family token, not a part number; callers should not present it as an exact
+    lookup.
+    """
+    normalized = normalize_identifier(needle)
+    if not normalized:
+        return {"total": 0, "distinct_titles": 0, "distinct_vendors": 0, "sample_titles": []}
+
+    mpn_expr = _NORM_COL_TEMPLATE.format(col="mpn")
+    sku_expr = _NORM_COL_TEMPLATE.format(col="sku")
+    where_sql = f"({mpn_expr} = ? OR {sku_expr} = ?)"
+    conn = get_db_connection()
+    try:
+        total = int(conn.execute(
+            f"SELECT COUNT(1) FROM products WHERE {where_sql};", (normalized, normalized)
+        ).fetchone()[0])
+        distinct_titles = int(conn.execute(
+            f"SELECT COUNT(DISTINCT title) FROM products WHERE {where_sql};",
+            (normalized, normalized),
+        ).fetchone()[0])
+        distinct_vendors = int(conn.execute(
+            f"SELECT COUNT(DISTINCT vendor) FROM products WHERE {where_sql};",
+            (normalized, normalized),
+        ).fetchone()[0])
+        samples = [
+            str(r[0]) for r in conn.execute(
+                f"SELECT DISTINCT title FROM products WHERE {where_sql} LIMIT ?;",
+                (normalized, normalized, int(sample_limit)),
+            ).fetchall()
+        ]
+        return {
+            "total": total,
+            "distinct_titles": distinct_titles,
+            "distinct_vendors": distinct_vendors,
+            "sample_titles": samples,
+        }
     finally:
         conn.close()
 
