@@ -245,8 +245,10 @@ VENDOR_KEY_ALIASES: Dict[str, Dict[str, str]] = {
         "nominal_capacity": "capacity_mah",
         "discharge_rate": "discharge_c",
         "battery_type": "chemistry",
-        "continuous_discharge_current": "max_discharge_current_a",
-        "discharge_current": "max_discharge_current_a",
+        "continuous_discharge_current": "continuous_discharge_current_a",
+        "max_discharge_current": "max_discharge_current_a",
+        "peak_discharge_current": "peak_discharge_current_a",
+        "discharge_current": "discharge_current_a",
         "charge_current": "charge_current_a",
         "charging_current": "charge_current_a",
         "charge_current_a": "charge_current_a",
@@ -256,6 +258,27 @@ VENDOR_KEY_ALIASES: Dict[str, Dict[str, str]] = {
         "bms": "bms_included",
     },
 }
+
+
+def vendor_alias_is_current(category, key, raw_key, source):
+    """Old materialized aliases cannot silently retain superseded semantics."""
+    if source != "vendor_alias":
+        return 1
+    expected = (VENDOR_KEY_ALIASES.get(category or "") or {}).get(raw_key or "")
+    return int(expected == key)
+
+
+def vendor_fallback_key_applies(category, key):
+    """A raw vendor name cannot acquire a different promoted meaning.
+
+    For example, a diode's raw 'voltage' maps to reverse_voltage_v, not a
+    generic supply voltage. Explicit vendor_filters can still inspect it.
+    """
+    target = (VENDOR_KEY_ALIASES.get(category or "") or {}).get(key, key)
+    if target == key:
+        return 1
+    from src.spec.filters import equivalent_alias_keys
+    return int(target in equivalent_alias_keys(key))
 
 
 # ---------------------------------------------------------------------------
@@ -299,20 +322,6 @@ _BASE_DISPLAY: Dict[str, Tuple[str, float]] = {
     "n": ("N", 1.0),
     "kgcm": ("kg-cm", 1.0),
 }
-
-_TARGET_UNITS: Dict[str, Tuple[str, float]] = {
-    "v": ("v", 1.0), "a": ("a", 1.0), "w": ("w", 1.0), "ohm": ("ohm", 1.0),
-    "uf": ("f", 1e6), "nf": ("f", 1e9), "pf": ("f", 1e12), "mf": ("f", 1e3),
-    "uh": ("h", 1e6), "mh": ("h", 1e3), "nh": ("h", 1e9),
-    "mhz": ("hz", 1e6), "khz": ("hz", 1e3), "hz": ("hz", 1.0),
-    "mm": ("mm", 1.0), "m": ("mm", 1000.0), "cm": ("mm", 10.0), "in": ("mm", 25.4),
-    "mah": ("mah", 1.0), "ah": ("mah", 1000.0),
-    "c": ("c", 1.0), "%": ("percent", 1.0), "pct": ("percent", 1.0),
-    "kgcm": ("kgcm", 1.0), "kg-cm": ("kgcm", 1.0), "nm": ("kgcm", 10.197162),
-    "g": ("g", 1.0), "kg": ("g", 1000.0),
-    "rpm": ("rpm", 1.0), "pins": (None, 1.0), "n": ("n", 1.0),
-}
-
 
 def target_unit_for_key(key: str) -> Optional[str]:
     """Declared/display unit for a canonical or vendor key, when known."""
@@ -387,10 +396,10 @@ def _convert_to_target(
     base_dim, base_mult = factor
     base_value = float(number) * base_mult
     if target_unit:
-        target = _TARGET_UNITS.get(normalize_vendor_key(target_unit))
+        target = _unit_factor(target_unit)
         # Normalize display unit text such as "kg-cm" -> "kgcm".
         if target is None:
-            target = _TARGET_UNITS.get(str(target_unit).strip().lower())
+            target = _UNIT_TO_BASE.get(str(target_unit).strip().lower())
         if target and target[0] == base_dim:
             return base_value / target[1], target_unit
     display, display_mult = _BASE_DISPLAY.get(base_dim, (str(raw_unit), 1.0))
@@ -477,13 +486,17 @@ def normalize_vendor_value(
     starts_number = bool(re.match(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text))
     if number is not None and not (unit_info or _is_integer_key(key) or bare_number or (target and starts_number)):
         number = None
+    parsed_in_target = False
     if number is None and text:
         if target and "torque" in normalize_vendor_key(key):
             number = _parse_torque_text(text)
         if number is None:
             number = parse_engineering_value(key, text, target)
+        parsed_in_target = number is not None
     if number is not None:
-        converted, display_unit = _convert_to_target(number, unit, target)
+        # The parser already returns target units. Only an independently
+        # supplied source-unit number needs conversion here.
+        converted, display_unit = (number, target) if parsed_in_target else _convert_to_target(number, unit, target)
         if not math.isfinite(converted):
             return text.lower(), None, "string", None
         if _is_integer_key(key):
@@ -561,7 +574,10 @@ def rebuild_vendor_specs(
         where = f"AND p.category_canonical IN ({placeholders})"
         params = list(categories)
     if not dry_run:
-        conn.execute("DELETE FROM product_vendor_specs;")
+        if categories:
+            conn.execute(f"DELETE FROM product_vendor_specs WHERE product_id IN (SELECT id FROM products p WHERE 1=1 {where})", params)
+        else:
+            conn.execute("DELETE FROM product_vendor_specs;")
         conn.execute("DELETE FROM vendor_spec_stats_global;")
         conn.execute("DELETE FROM vendor_spec_stats;")
 
@@ -616,7 +632,8 @@ def rebuild_vendor_specs(
         stats["rows"] += len(pending)
     stats["products"] = len(seen_products)
     if not dry_run:
-        conn.commit()
+        # Publish rows and their statistics together. An exception before this
+        # commit leaves the old derived index visible to other connections.
         recompute_vendor_stats(conn)
     return stats
 
@@ -717,7 +734,7 @@ def load_vendor_specs(
         result[str(key)] = {
             "key": str(key),
             "type": "float" if vtype == "float" else "enum",
-            "unit": unit,
+            "unit": target_unit_for_key(str(key)) or unit,
             "count": present,
             "global_count": int(count or 0),
             "of": int(applicable or 0) if category else None,

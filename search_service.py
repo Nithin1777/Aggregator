@@ -10,7 +10,7 @@ import logging
 import re
 import sqlite3
 import time
-from typing import AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 from adapters.base import BaseAdapter
 from adapters.robu import RobuAdapter
@@ -40,9 +40,10 @@ from normalizer import (
     match_components_v2,
     normalize_title,
 )
-from src.search.retrieval import search_catalog_ranked
+from src.search.retrieval import search_catalog_ranked, retrieve_catalog
 from src.search.product_prior import coverage, query_affinity, query_category_hint
 from src.search.query_intent import get_query_intent
+from src.search.listing_identity import listing_role_conflict
 from gray_zone import evaluate_gray_zone_risk, record_gray_zone_entry
 
 
@@ -156,6 +157,9 @@ class AggregatorEngine:
         2. Else fall back to can_merge (V2 matcher)
         Emits log: pair=<pair_id> source=<llm_label|v2_fallback> label=<label|->
         """
+        conflict = listing_role_conflict(ci_a.title, ci_b.title)
+        if conflict:
+            return False, conflict, "identity_guard"
         norm = sorted([ci_a.title.lower().strip(), ci_b.title.lower().strip()])
         pair_id = hashlib.sha1("::".join(norm).encode("utf-8")).hexdigest()[:16]
 
@@ -898,6 +902,7 @@ class AggregatorEngine:
         total_matches: int,
         price_refresh: Optional[PriceStockRefreshInfo] = None,
         source: str = "local_db",
+        query_contract: Optional[Dict[str, Any]] = None,
     ) -> SearchResponse:
         (
             page_groups,
@@ -911,6 +916,7 @@ class AggregatorEngine:
             query=query,
             total_results=total_matches,
             source=source,
+            query_contract=query_contract or {},
             results=page_products,
             comparison_groups=page_groups,
             price_refresh=price_refresh,
@@ -996,27 +1002,12 @@ class AggregatorEngine:
         page_size = max(1, min(int(requested or settings.search_page_size), settings.search_page_size_max))
         pool = self._pool_size(page, page_size)
 
-        total_matches = await asyncio.to_thread(
-            db.count_search_products,
-            query=query,
-            vendor=vendor,
-            in_stock_only=in_stock_only,
-            category=category,
-            spec_filters=spec_filters,
-            price_min=price_min,
-            price_max=price_max,
+        batch = await asyncio.to_thread(
+            retrieve_catalog, query=query, limit=pool, vendor=vendor,
+            in_stock_only=in_stock_only, category=category, spec_filters=spec_filters,
+            price_min=price_min, price_max=price_max,
         )
-        products = await asyncio.to_thread(
-            search_catalog_ranked,
-            query=query,
-            limit=pool,
-            vendor=vendor,
-            in_stock_only=in_stock_only,
-            category=category,
-            spec_filters=spec_filters,
-            price_min=price_min,
-            price_max=price_max,
-        )
+        total_matches, products = batch.total_matches, batch.products
         groups = await asyncio.to_thread(self.group_and_compare, products, query=query)
 
         page_groups, page_products, _, _, _, _ = self._slice_page(
@@ -1074,6 +1065,7 @@ class AggregatorEngine:
             products=products,
             total_matches=total_matches,
             price_refresh=price_refresh,
+            query_contract=batch.query_contract,
         )
 
     async def browse_local(
@@ -1163,6 +1155,28 @@ class AggregatorEngine:
             except Exception as e:
                 logger.warning(f"Error updating local database with live search: {e}")
 
+        # Vendor search engines may relax independently. Reapply our own
+        # eligibility before exposing a listing as a confirmed result.
+        connection = db.get_db_connection()
+        try:
+            ids = []
+            for product in all_products:
+                row = connection.execute(
+                    "SELECT id FROM products WHERE vendor = ? AND external_id = ?",
+                    (product.vendor, str(product.external_id)),
+                ).fetchone()
+                if row:
+                    ids.append(int(row[0]))
+        finally:
+            connection.close()
+        batch = await asyncio.to_thread(retrieve_catalog, clean_q,
+                                        limit=max(1, len(ids)), listing_ids=tuple(ids))
+        eligible = {(product.vendor, str(product.external_id)): product.id for product in batch.products}
+        all_products = [product for product in all_products
+                        if (product.vendor, str(product.external_id)) in eligible]
+        for product in all_products:
+            product.id = eligible[(product.vendor, str(product.external_id))]
+
         comparison_groups = self.group_and_compare(all_products)
 
         if all_products:
@@ -1195,6 +1209,7 @@ class AggregatorEngine:
             query=clean_q,
             total_results=len(all_products),
             source="live",
+            query_contract=batch.query_contract,
             results=all_products,
             comparison_groups=comparison_groups,
             price_refresh=price_refresh,
@@ -1224,7 +1239,7 @@ class AggregatorEngine:
         Synchronous and cache-only: use `search_local_refreshed` (async) when the
         response should carry freshly verified price/stock with fallback.
         """
-        products = search_catalog_ranked(
+        batch = retrieve_catalog(
             query=query,
             limit=limit,
             vendor=vendor,
@@ -1234,10 +1249,12 @@ class AggregatorEngine:
             price_min=price_min,
             price_max=price_max,
         )
+        products = batch.products
         comparison_groups = self.group_and_compare(products, query=query)
         return SearchResponse(
             query=query,
-            total_results=len(products),
+            total_results=batch.total_matches,
+            query_contract=batch.query_contract,
             source="local_db",
             results=products,
             comparison_groups=comparison_groups

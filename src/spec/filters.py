@@ -1,13 +1,10 @@
 """
 Shared spec-attribute filtering.
 
-This module holds the filtering logic that used to live only inside
-`mcp_server/server.py`: loading the advertised spec keys, validating a filter
-expression against them, and turning it into SQL over the `product_specs`
-table.
-
-Both the MCP tools and the web UI use it, so a filter like
-`{"voltage": {"gte": 12}}` means exactly the same thing in both places.
+Loads advertised specification metadata, validates typed values and operators,
+and renders value comparisons. Cross-tier routing belongs to search.filter_plan;
+evidence precedence and eligibility belong to spec.constraints. The legacy JOIN
+adapter at the end is retained for compatibility and is not used by retrieval.
 """
 from __future__ import annotations
 
@@ -117,7 +114,7 @@ def enum_is_numeric(spec_meta: Dict[str, Any]) -> bool:
     unguarded `value_num >= x` silently matches nothing.
     """
     if spec_meta.get("type") != "enum":
-        return True
+        return spec_meta.get("type") in {"integer", "float"}
 
     samples: List[str] = []
     enum_vals = spec_meta.get("enum_values")
@@ -133,7 +130,7 @@ def enum_is_numeric(spec_meta: Dict[str, Any]) -> bool:
         try:
             float(str(s).strip())
             numeric += 1
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pass
     # Tolerate a few stray non-numeric members (e.g. an "N/A" bucket).
     return numeric >= max(1, int(len(samples) * 0.9))
@@ -151,6 +148,8 @@ def filter_column(alias: str, spec_meta: Dict[str, Any], ordering: bool = False)
         return f"{alias}.value_num"
     if ordering and enum_is_numeric(spec_meta):
         return f"CAST({alias}.value AS REAL)"
+    if spec_meta.get("type") in {"string", "enum"}:
+        return f"aggregate_canonical_value({alias}.value, {alias}.key)"
     return f"{alias}.value"
 
 
@@ -177,6 +176,7 @@ _BASE_UNIT_ALIASES: Dict[str, set] = {
     "h": {"h", "henry", "henries"},
     "v": {"v", "volt", "volts", "vdc", "vac"},
     "a": {"a", "amp", "amps", "ampere", "amperes"},
+    "ah": {"ah", "amperehour", "amperehours"},
     "w": {"w", "watt", "watts"},
     "hz": {"hz", "hertz"},
     "m": {"m", "meter", "meters", "metre", "metres"},
@@ -211,6 +211,8 @@ _TARGET_UNITS: Dict[str, Tuple[str, float]] = {
     "mv": ("v", 1e3),
     "kv": ("v", 1e-3),
     "a": ("a", 1.0),
+    "ah": ("ah", 1.0),
+    "mah": ("ah", 1e3),
     "ma": ("a", 1e3),
     "ua": ("a", 1e6),
     "µa": ("a", 1e6),
@@ -262,7 +264,9 @@ def _target_unit(unit: Optional[str]) -> Tuple[Optional[str], float]:
     # A target unit such as "ohm" or "V" that only appears in the alias table.
     if raw in _ALIAS_TO_BASE:
         return _ALIAS_TO_BASE[raw], 1.0
-    return None, 1.0
+    # An explicitly declared non-SI unit (e.g. RPM) is its own dimension.
+    # It may match itself, but cannot become an unrelated recognized unit.
+    return raw, 1.0
 
 
 def _clean_number(value: float) -> Optional[float]:
@@ -301,6 +305,8 @@ def parse_engineering_value(
     if not text:
         return None
     text = text.replace("µ", "u").replace("μ", "u").replace("Ω", "Ω")
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", text):
+        return _clean_number(float(text))
 
     base_unit, target_factor = _target_unit(unit)
 
@@ -382,6 +388,24 @@ def canonical_enum_value(value: Any, spec_meta: Optional[Dict[str, Any]] = None)
     if not text:
         return text
     text = text.lower()
+    key = (spec_meta or {}).get("key")
+    if key in {"voltage", "voltage_v"}:
+        m = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?:v(?:dc)?)?", text)
+        if m:
+            return f"{float(m[1]):g}"
+    if key == "cells":
+        m = re.fullmatch(r"(\d+)\s*s?(?:\s+(?:lipo|li-ion))?", text)
+        if m:
+            return f"{int(m[1])}s"
+    if key == "package" and re.fullmatch(r"\d{3}", text):
+        text = text.zfill(4)
+    if key == "channel_type":
+        channel = re.fullmatch(r"([np])[ _-]*(?:ch(?:annel)?)?", text)
+        if channel:
+            return channel[1] + "_channel"
+    if key == "resolution":
+        text = re.sub(r"\s*(?:×|x)\s*", "x", text)
+        text = re.sub(r"\s*pixels?\s*$", "", text)
     text = text.replace("–", "-").replace("—", "-").replace("−", "-")
     text = text.replace("µ", "u").replace("μ", "u").replace("Ω", "ohm")
     # Drop parenthetical detail: "sot-23(surface mount device)" -> "sot-23".
@@ -551,6 +575,8 @@ def normalize_scalar(
     """Normalizes units and aliases into standard canonical catalog forms."""
     if val is None:
         return None
+    if isinstance(val, bool):
+        return val
     s = str(val).strip()
 
     # Cells (e.g. 4S, 4 s, 4s lipo, or a bare count 4 -> 4s)
@@ -569,7 +595,7 @@ def normalize_scalar(
 
     # Torque (2.5kg-cm / 2.5 kgcm)
     if "torque" in key or (isinstance(s, str) and re.search(r"kg[\s-]*cm", s, re.I)):
-        m_t = re.search(r"^([\d\.]+)\s*kg[\s-]*cm$", s, re.I)
+        m_t = re.search(r"^([\d\.]+)\s*kg[\s.·-]*cm$", s, re.I)
         if m_t:
             return float(m_t.group(1))
 
@@ -636,7 +662,7 @@ def normalize_scalar(
 
     # Remaining enums: canonical spelling, dashes and case.
     text, _coerced = coerce_enum_value(key, s)
-    return canonical_enum_value(text)
+    return canonical_enum_value(text, {"key": key})
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +794,7 @@ def _normalize_enum_filter_value(
         coercions.append({"key": key, "from": raw_value, "to": coerced})
     # Reuse the key-specific normalizers (voltage "24V" -> "24", cells 3 -> "3s").
     normalized = normalize_scalar(key, coerced, "enum", spec_meta.get("unit"), category)
-    canonical = canonical_enum_value(normalized, spec_meta)
+    canonical = canonical_enum_value(normalized, {**spec_meta, "key": key})
     if canonical != str(coerced).strip().lower() and coercions is not None:
         # A normalization such as "SOT-23(SMD)" -> "sot-23" is still worth
         # disclosing; it tells the caller the stored vocabulary differs.
@@ -776,7 +802,7 @@ def _normalize_enum_filter_value(
             coercions.append({"key": key, "from": raw_value, "to": canonical})
     umbrella = expand_enum_umbrella(key, canonical, category)
     if umbrella:
-        return {"in": umbrella}
+        return {"in": list(dict.fromkeys([canonical] + umbrella))}
     return canonical
 
 
@@ -794,10 +820,13 @@ def parse_and_validate_filters(
     `suggestions`, `details`) so any caller can render it in its own envelope.
     """
     clean_filters = filters or {}
+    if not isinstance(clean_filters, dict):
+        return None, {"error_code": "invalid_filter_value", "message": "filters must be an object."}
     all_valid_keys = sorted(advertised_specs.keys())
     normalized: Dict[str, Any] = {}
 
     for f_key, f_val in clean_filters.items():
+        f_key = str(f_key).strip().lower()
         if f_key not in advertised_specs:
             return None, {
                 "error_code": "unknown_filter_key",
@@ -810,6 +839,16 @@ def parse_and_validate_filters(
         spec_meta = advertised_specs[f_key]
         v_type = spec_meta["type"]
         unit = spec_meta["unit"]
+        if isinstance(f_val, (list, tuple)):
+            f_val = {"in": list(f_val)}
+        if f_val is None or isinstance(f_val, bool):
+            return None, {"error_code": "invalid_filter_value", "message": f"Filter '{f_key}' requires a non-null scalar or operator object."}
+        if isinstance(f_val, dict) and not f_val:
+            return None, {"error_code": "invalid_filter_value", "message": f"Filter '{f_key}' has an empty operator set."}
+        raw_scalars = list(f_val.values()) if isinstance(f_val, dict) else [f_val]
+        raw_scalars = [item for v in raw_scalars for item in (v if isinstance(v, (list, tuple)) else [v])]
+        if any(v is None or isinstance(v, (dict, list, tuple, bool)) for v in raw_scalars):
+            return None, {"error_code": "invalid_filter_value", "message": f"Filter '{f_key}' contains a non-scalar or null operand."}
 
         # Check for deprecated string range syntax e.g. "150-250"
         if isinstance(f_val, str) and "-" in f_val and not f_val.strip().startswith("-"):
@@ -941,6 +980,8 @@ def parse_and_validate_filters(
                     norm_op_dict["eq"] = value
 
             if "tolerance" in f_val:
+                if not isinstance(f_val["tolerance"], (int, float)) or isinstance(f_val["tolerance"], bool):
+                    return None, {"error_code": "invalid_filter_value", "message": "tolerance must be a number, not a boolean or numeric string."}
                 if "eq" not in f_val:
                     return None, {
                         "error_code": "invalid_filter_value",
@@ -1000,6 +1041,14 @@ def parse_and_validate_filters(
                 return None, invalid
             normalized[f_key] = value
 
+    if coercions is not None:
+        # Report the final applied expression, including type, case, unit and
+        # shorthand transformations. Comparing JSON avoids True == 1 surprises.
+        for raw_key, original in clean_filters.items():
+            key = str(raw_key).strip().lower()
+            applied = normalized.get(key)
+            if json.dumps(original, sort_keys=True) != json.dumps(applied, sort_keys=True):
+                coercions.append({"key": key, "from": original, "to": applied})
     return normalized, None
 
 
@@ -1020,7 +1069,8 @@ def validate_filter_scope(
         return None
 
     applicable = list(dict.fromkeys(str(k) for k in (category_keys or [])))
-    bad_keys = [k for k in normalized_filters if k not in applicable]
+    bad_keys = [k for k in normalized_filters if k not in applicable
+                and not set(equivalent_alias_keys(k)).intersection(applicable)]
     if not bad_keys:
         return None
 
@@ -1059,70 +1109,7 @@ def _enum_match_values(value: Any, spec_meta: Dict[str, Any]) -> List[str]:
     canonical = str(value)
     variants = (spec_meta.get("variant_map") or {}).get(canonical) or []
     values = [canonical] + [str(v) for v in variants if str(v) != canonical]
-    return list(dict.fromkeys(values))
-
-
-def build_alias_clauses(
-    alias_filters: Optional[List[Dict[str, Any]]],
-    advertised_specs: Dict[str, Dict[str, Any]],
-) -> Tuple[List[str], List[Any]]:
-    """
-    SQL for an equivalent-key union, e.g. voltage OR voltage_v.
-
-    Each key becomes an EXISTS subquery so a product carrying both keys is
-    counted once (a normal JOIN would duplicate it before COUNT(DISTINCT)).
-    """
-    clauses: List[str] = []
-    params: List[Any] = []
-    for entry in alias_filters or []:
-        group_clauses: List[str] = []
-        for key in entry.get("keys") or []:
-            meta = advertised_specs.get(str(key))
-            if meta is None:
-                continue
-            alias = "psa"
-            col = filter_column(alias, meta)
-            num_col = filter_column(alias, meta, ordering=True)
-            value = entry.get("value")
-            conditions: List[str] = [f"{alias}.key = ?"]
-            local_params: List[Any] = [str(key)]
-            if isinstance(value, dict):
-                if "in" in value:
-                    values = []
-                    for v in value["in"]:
-                        values.extend(_enum_match_values(v, meta) if meta.get("type") == "enum" else [v])
-                    ph = ", ".join(["?"] * len(values))
-                    conditions.append(f"{col} IN ({ph})")
-                    local_params.extend(values)
-                for op, sql_op in (("gte", ">="), ("gt", ">"), ("lte", "<="), ("lt", "<")):
-                    if op in value:
-                        conditions.append(f"{num_col} {sql_op} ?")
-                        local_params.append(float(value[op]))
-                if "eq" in value:
-                    if "tolerance" in value:
-                        center = float(value["eq"])
-                        tol = float(value["tolerance"])
-                        conditions.append(f"{num_col} >= ? AND {num_col} <= ?")
-                        local_params.extend([center * (1 - tol), center * (1 + tol)])
-                    else:
-                        vals = _enum_match_values(value["eq"], meta) if meta.get("type") == "enum" else [value["eq"]]
-                        ph = ", ".join(["?"] * len(vals))
-                        conditions.append(f"{col} IN ({ph})")
-                        local_params.extend(vals)
-            else:
-                vals = _enum_match_values(value, meta) if meta.get("type") == "enum" else [value]
-                ph = ", ".join(["?"] * len(vals))
-                conditions.append(f"{col} IN ({ph})")
-                local_params.extend(vals)
-            group_clauses.append(
-                "EXISTS (SELECT 1 FROM product_specs psa WHERE psa.product_id = p.id AND "
-                + " AND ".join(conditions)
-                + ")"
-            )
-            params.extend(local_params)
-        if group_clauses:
-            clauses.append("(" + " OR ".join(group_clauses) + ")")
-    return clauses, params
+    return list(dict.fromkeys(str(canonical_enum_value(v, spec_meta)) for v in values))
 
 
 def _value_conditions(
@@ -1185,165 +1172,23 @@ def _value_conditions(
     return conditions, params
 
 
-def build_hybrid_spec_clauses(
-    normalized_filters: Dict[str, Any],
-    advertised_specs: Dict[str, Dict[str, Any]],
-) -> Tuple[List[str], List[Any]]:
-    """
-    Promoted-first filter with a vendor fallback only for products that have no
-    promoted value for that key.
-
-    This is deliberately a fallback, not a union: if the taxonomy already
-    extracted a value, it wins. Vendor rows fill the "unknown" gap without
-    allowing a conflicting vendor value to override a validated one.
-    """
-    where: List[str] = []
-    params: List[Any] = []
-    for i, (key, value) in enumerate(normalized_filters.items()):
-        meta = advertised_specs[key]
-        ps = f"hps_{i}"
-        pv = f"hpv_{i}"
-        pn = f"hpn_{i}"
-        promoted_conditions, promoted_params = _value_conditions(ps, value, meta)
-        vendor_conditions, vendor_params = _value_conditions(pv, value, meta)
-        promoted = (
-            f"EXISTS (SELECT 1 FROM product_specs {ps} "
-            f"WHERE {ps}.product_id = p.id AND {ps}.key = ? AND "
-            + " AND ".join(promoted_conditions)
-            + ")"
-        )
-        vendor = (
-            f"EXISTS (SELECT 1 FROM product_vendor_specs {pv} "
-            f"WHERE {pv}.product_id = p.id AND {pv}.key = ? AND "
-            + " AND ".join(vendor_conditions)
-            + ")"
-        )
-        unknown = (
-            f"NOT EXISTS (SELECT 1 FROM product_specs {pn} "
-            f"WHERE {pn}.product_id = p.id AND {pn}.key = ?)"
-        )
-        where.append(f"({promoted} OR ({unknown} AND {vendor}))")
-        params.extend([str(key)] + promoted_params + [str(key), str(key)] + vendor_params)
-    return where, params
-
-
-def build_vendor_spec_clauses(
-    normalized_filters: Dict[str, Any],
-    vendor_specs: Dict[str, Dict[str, Any]],
-    alias_prefix: str = "pvs",
-) -> Tuple[List[str], List[Any], List[str], List[Any]]:
-    """JOIN/WHERE clauses for explicit vendor-attribute filters."""
-    joins: List[str] = []
-    join_params: List[Any] = []
-    where_clauses: List[str] = []
-    where_params: List[Any] = []
-    for i, (key, value) in enumerate(normalized_filters.items()):
-        alias = f"{alias_prefix}_{i}"
-        meta = vendor_specs[key]
-        joins.append(
-            f"JOIN product_vendor_specs {alias} "
-            f"ON p.id = {alias}.product_id AND {alias}.key = ?"
-        )
-        join_params.append(str(key))
-        conditions, params = _value_conditions(alias, value, meta)
-        where_clauses.extend(conditions)
-        where_params.extend(params)
-    return joins, join_params, where_clauses, where_params
-
-
 def build_spec_clauses(
     normalized_filters: Dict[str, Any],
     advertised_specs: Dict[str, Dict[str, Any]],
     alias_prefix: str = "ps",
 ) -> Tuple[List[str], List[Any], List[str], List[Any]]:
+    """Legacy JOIN API retained for existing callers.
+
+    Active retrieval uses src.spec.constraints.compile_predicates, which also
+    enforces product ownership and evidence precedence. This adapter only
+    renders individual value comparisons and does not define eligibility.
     """
-    Builds the JOINs and WHERE clauses for a set of spec filters.
-
-    Returns `(joins, join_params, where_clauses, where_params)`. The two
-    parameter lists are kept apart on purpose: the generated SQL renders the
-    joins before the WHERE clause, so the join parameters have to be bound
-    first. Each filter key gets its own `product_specs` join so multiple keys
-    can be constrained independently.
-    """
-    joins: List[str] = []
-    join_params: List[Any] = []
-    where_clauses: List[str] = []
-    where_params: List[Any] = []
-
-    for i, (f_key, f_val) in enumerate(normalized_filters.items()):
-        alias = f"{alias_prefix}_{i}"
-        spec_meta = advertised_specs[f_key]
-
-        joins.append(
-            f"JOIN product_specs {alias} ON p.id = {alias}.product_id AND {alias}.key = ?"
-        )
-        join_params.append(f_key)
-
-        col = filter_column(alias, spec_meta)
-        num_col = filter_column(alias, spec_meta, ordering=True)
-
-        if isinstance(f_val, dict):
-            if "in" in f_val:
-                expanded: List[Any] = []
-                for value in f_val["in"]:
-                    if spec_meta.get("type") == "enum":
-                        expanded.extend(_enum_match_values(value, spec_meta))
-                    else:
-                        expanded.append(value)
-                placeholders = ", ".join(["?"] * len(expanded))
-                where_clauses.append(f"{col} IN ({placeholders})")
-                where_params.extend(expanded)
-
-            if "gte" in f_val:
-                where_clauses.append(f"{num_col} >= ?")
-                where_params.append(float(f_val["gte"]))
-            if "gt" in f_val:
-                where_clauses.append(f"{num_col} > ?")
-                where_params.append(float(f_val["gt"]))
-            if "lte" in f_val:
-                where_clauses.append(f"{num_col} <= ?")
-                where_params.append(float(f_val["lte"]))
-            if "lt" in f_val:
-                where_clauses.append(f"{num_col} < ?")
-                where_params.append(float(f_val["lt"]))
-
-            if "eq" in f_val:
-                if "tolerance" in f_val:
-                    center = float(f_val["eq"])
-                    tol = float(f_val["tolerance"])
-                    where_clauses.append(f"{num_col} >= ? AND {num_col} <= ?")
-                    where_params.extend([center * (1.0 - tol), center * (1.0 + tol)])
-                else:
-                    values = (
-                        _enum_match_values(f_val["eq"], spec_meta)
-                        if spec_meta.get("type") == "enum"
-                        else [f_val["eq"]]
-                    )
-                    if len(values) > 1:
-                        placeholders = ", ".join(["?"] * len(values))
-                        where_clauses.append(f"{col} IN ({placeholders})")
-                        where_params.extend(values)
-                    elif spec_meta.get("type") == "float":
-                        where_clauses.append(f"ABS({col} - ?) <= 1e-9 * MAX(1.0, ABS(?))")
-                        where_params.extend([f_val["eq"], f_val["eq"]])
-                    else:
-                        where_clauses.append(f"{col} = ?")
-                        where_params.append(f_val["eq"])
-        else:
-            values = (
-                _enum_match_values(f_val, spec_meta)
-                if spec_meta.get("type") == "enum"
-                else [f_val]
-            )
-            if len(values) > 1:
-                placeholders = ", ".join(["?"] * len(values))
-                where_clauses.append(f"{col} IN ({placeholders})")
-                where_params.extend(values)
-            elif spec_meta.get("type") == "float":
-                where_clauses.append(f"ABS({col} - ?) <= 1e-9 * MAX(1.0, ABS(?))")
-                where_params.extend([f_val, f_val])
-            else:
-                where_clauses.append(f"{col} = ?")
-                where_params.append(f_val)
-
-    return joins, join_params, where_clauses, where_params
+    joins, join_params, clauses, params = [], [], [], []
+    for index, (key, value) in enumerate(normalized_filters.items()):
+        alias = f"{alias_prefix}_{index}"
+        joins.append(f"JOIN product_specs {alias} ON p.id = {alias}.product_id AND {alias}.key = ?")
+        join_params.append(key)
+        conditions, values = _value_conditions(alias, value, advertised_specs[key])
+        clauses.extend(conditions)
+        params.extend(values)
+    return joins, join_params, clauses, params

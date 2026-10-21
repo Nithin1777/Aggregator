@@ -1,0 +1,52 @@
+version: 1
+# These define entities and relationships, independently of vendor categories.
+# Electrical units are deliberately absent from identity evidence.
+families:
+  motor: '\b(motors?|servos?|steppers?)\b'
+  battery: '\b(batter(?:y|ies)|(?:coin|button|lithium|alkaline|rechargeable|prismatic|pouch)\s+cells?|lipo|li[ -]?ion|lifepo4|nimh|nicd|18650|21700)\b'
+  speakers: '\b(speakers?|loudspeakers?|buzzers?)\b'
+  sensors: '\b(sensors?|transducers?|load\s+cells?)\b'
+  amplifiers: '\b(amplifiers?)\b'
+  displays: '\b(displays?|oled|lcd|screens?)\b'
+  resistors: '\b(resistors?)\b'
+  capacitors: '\b(capacitors?)\b'
+  inductors: '\b(inductors?|chokes?)\b'
+  microcontrollers: '\b(microcontrollers?|esp32[\w-]*|esp8266[\w-]*|stm32[\w-]*|atmega[\w-]*)\b'
+  switches: '\b(switch(?:es)?|pushbuttons?)\b'
+  connectors: '\b(connectors?|headers?|sockets?)\b'
+  relay: '\b(relays?)\b'
+roles:
+  enclosure: '\b(cases?|enclosures?|housings?|shells?|boxes?)\b'
+  accessory: '\b(brackets?|mounts?|mounting\s+(?:screws?|plates?|brackets?)|screws?|wheels?|pulleys|pulley|blades?|encoder\s+dis[ck]s?|holders?|stands?|covers?|grilles?|cones?|diaphragms?|replacement\s+brush(?:es)?|carbon\s+brush(?:es)?)\b'
+  charger: '\b(chargers?|charging\s+(?:boards?|modules?))\b'
+  controller: '\b(bms|battery\s+(?:management|protection)|(?:motor|led|display|lcd|oled)\s+drivers?|(?:motor|charge|speed)\s+controllers?)\b'
+  bundle: '\b(assortments?|kits?)\b'
+# These fields describe the physical item even when it is an accessory.
+physical_attributes:
+  - manufacturer
+  - brand
+  - material
+  - color
+  - colour
+  - mounting_type
+  - package
+  - weight
+  - weight_g
+  - length_mm
+  - width_mm
+  - height_mm
+  - diameter_mm
+  - thread_size
+
+# A property can belong to an entity only if its meaning applies to that entity.
+# BMS current ratings remain BMS properties; their chemistry/cell compatibility
+# does not turn a management board into an energy-storage device.
+property_entities:
+  capacity_mah: {families: [battery], roles: [pack, cell]}
+  chemistry: {families: [battery], roles: [pack, cell]}
+  cells: {families: [battery], roles: [pack, cell]}
+  discharge_c: {families: [battery], roles: [pack, cell]}
+  torque_kgcm: {families: [motor], roles: [component]}
+  rated_torque_kgcm: {families: [motor], roles: [component]}
+  stall_torque_kgcm: {families: [motor], roles: [component]}
+  rpm: {families: [motor, fan], roles: [component]}

@@ -22,6 +22,9 @@ logs/
 # via Git LFS — see .gitattributes.
 *.db-wal
 *.db-shm
+/data/backups/
+/scratch/catalog_backups/
+/scratch/blackbox_*/
 
 # OS / editor cruft
 .DS_Store

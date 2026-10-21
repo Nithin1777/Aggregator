@@ -1,0 +1,166 @@
+{
+  "refresh": false,
+  "workers": 4,
+  "repeats": 5,
+  "p95_method": "nearest rank; small-sample diagnostic, not a service-level estimate",
+  "sequential": {
+    "motor_torque": {
+      "samples": 5,
+      "total_matches": 101,
+      "partial_candidates": 0,
+      "count": {
+        "p50_ms": 324.92,
+        "p95_ms": 377.29
+      },
+      "search": {
+        "p50_ms": 329.46,
+        "p95_ms": 347.86
+      }
+    },
+    "motor_speed": {
+      "samples": 5,
+      "total_matches": 209,
+      "partial_candidates": 0,
+      "count": {
+        "p50_ms": 375.1,
+        "p95_ms": 393.1
+      },
+      "search": {
+        "p50_ms": 406.75,
+        "p95_ms": 438.32
+      }
+    },
+    "battery_compound": {
+      "samples": 5,
+      "total_matches": 0,
+      "partial_candidates": 5,
+      "count": {
+        "p50_ms": 708.82,
+        "p95_ms": 743.54
+      },
+      "search": {
+        "p50_ms": 779.37,
+        "p95_ms": 964.37
+      }
+    },
+    "vendor_mounting": {
+      "samples": 5,
+      "total_matches": 0,
+      "partial_candidates": 0,
+      "count": {
+        "p50_ms": 1127.46,
+        "p95_ms": 1161.59
+      },
+      "search": {
+        "p50_ms": 996.6,
+        "p95_ms": 1201.89
+      }
+    },
+    "mcu_discovery": {
+      "samples": 5,
+      "total_matches": 8,
+      "partial_candidates": 0,
+      "count": {
+        "p50_ms": 1006.7,
+        "p95_ms": 1067.75
+      },
+      "search": {
+        "p50_ms": 1051.14,
+        "p95_ms": 1134.37
+      }
+    },
+    "runtime_requirement": {
+      "samples": 5,
+      "total_matches": 1514,
+      "partial_candidates": 0,
+      "count": {
+        "p50_ms": 2792.17,
+        "p95_ms": 3020.37
+      },
+      "search": {
+        "p50_ms": 3156.4,
+        "p95_ms": 3251.82
+      }
+    }
+  },
+  "concurrent": {
+    "motor_torque": {
+      "samples": 5,
+      "total_matches": 101,
+      "partial_candidates": 0,
+      "count": {
+        "p50_ms": 474.45,
+        "p95_ms": 912.89
+      },
+      "search": {
+        "p50_ms": 498.89,
+        "p95_ms": 846.19
+      }
+    },
+    "motor_speed": {
+      "samples": 5,
+      "total_matches": 209,
+      "partial_candidates": 0,
+      "count": {
+        "p50_ms": 565.4,
+        "p95_ms": 1124.68
+      },
+      "search": {
+        "p50_ms": 668.48,
+        "p95_ms": 996.0
+      }
+    },
+    "battery_compound": {
+      "samples": 5,
+      "total_matches": 0,
+      "partial_candidates": 5,
+      "count": {
+        "p50_ms": 1308.37,
+        "p95_ms": 1959.8
+      },
+      "search": {
+        "p50_ms": 1445.27,
+        "p95_ms": 1556.84
+      }
+    },
+    "vendor_mounting": {
+      "samples": 5,
+      "total_matches": 0,
+      "partial_candidates": 0,
+      "count": {
+        "p50_ms": 1814.0,
+        "p95_ms": 2665.42
+      },
+      "search": {
+        "p50_ms": 1339.04,
+        "p95_ms": 1727.66
+      }
+    },
+    "mcu_discovery": {
+      "samples": 5,
+      "total_matches": 8,
+      "partial_candidates": 0,
+      "count": {
+        "p50_ms": 1333.74,
+        "p95_ms": 1393.21
+      },
+      "search": {
+        "p50_ms": 1316.45,
+        "p95_ms": 1438.99
+      }
+    },
+    "runtime_requirement": {
+      "samples": 5,
+      "total_matches": 1514,
+      "partial_candidates": 0,
+      "count": {
+        "p50_ms": 3693.56,
+        "p95_ms": 3950.06
+      },
+      "search": {
+        "p50_ms": 4282.64,
+        "p95_ms": 4308.24
+      }
+    }
+  }
+}

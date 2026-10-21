@@ -851,11 +851,32 @@
         "<strong>" + formatInt(data.total_results || 0) + "</strong> matching parts"
       );
       if (groups) parts.push("grouped into <strong>" + groups + "</strong> cards");
+        if (data.retrieval_status === "no_exact_match") {
+          parts.push("No exact product match; the requested identity was preserved");
+        } else if (data.retrieval_status === "no_match") {
+          parts.push("No match for all required terms; try a revised query");
+        } else if (data.retrieval_status === "corrected_matches") {
+          parts.push("Matched after correcting a category word");
+        }
       if (state.category) {
         const meta = categoryMeta(state.category);
         if (meta) parts.push("in <strong>" + escapeHtml(meta.label) + "</strong>");
       }
       sub.innerHTML = parts.join(" · ");
+    }
+    const requirements = $("[data-results-requirements]");
+    if (requirements) {
+      const unresolved = data.unresolved_constraints || [];
+      requirements.hidden = unresolved.length === 0;
+      const durations = unresolved
+        .filter((constraint) => constraint.kind === "runtime")
+        .map((constraint) => constraint.value_hours + " h")
+        .join(", ");
+      requirements.textContent = unresolved.length
+        ? durations
+          ? "The " + durations + " runtime requirement is unverified. Check the load current, voltage, usable battery energy, and conversion losses."
+          : "Some operating requirements remain unverified."
+        : "";
     }
     renderPriceBadge(data.price_refresh);
   };

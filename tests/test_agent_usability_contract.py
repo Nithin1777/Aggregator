@@ -84,8 +84,9 @@ def test_count_reports_filter_recall_gap_like_search():
 def test_count_coverage_is_category_scoped():
     res = count_components(category="motor", filters={"torque_kgcm": {"gte": 4}})
     category = res.coverage["torque_kgcm"]["category"]
-    motor_total = count_components(category="motor").total_matches
+    motor_total = count_components(category="motor", include_related=True).total_matches
     assert category["of"] == motor_total
+    assert category["scope"] == "discovery_category"
     assert 0 < category["present"] <= motor_total
 
 
@@ -109,14 +110,14 @@ def test_servo_voltage_is_reported_as_an_extraction_gap():
     assert res.diagnosis["severity"] == "warning"
 
 
-def test_relaxed_natural_language_query_has_a_diagnosis():
+def test_unresolved_engineering_requirement_has_a_diagnosis():
     res = search_components(
         query="battery to power an arduino for 8 hours", refresh=False, limit=2
     )
     assert res.ok is True
-    assert res.diagnosis["reason"] == "query_relaxed"
-    assert res.diagnosis["dropped_tokens"]
-    assert res.diagnosis["query_effective"]
+    assert res.diagnosis["reason"] == "unresolved_engineering_constraints"
+    assert res.diagnosis["unresolved_constraints"][0]["value_hours"] == 8
+    assert res.data["requirements_verified"] is False
 
 
 def test_unknown_mpn_has_a_diagnosis():

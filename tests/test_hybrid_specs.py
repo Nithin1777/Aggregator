@@ -19,7 +19,11 @@ def test_vendor_only_attribute_is_queryable_on_a_gap_category():
         filters={"max_discharge_current_a": {"gte": 20}},
     )
     assert res.ok is True
-    assert res.total_matches > 0
+    # Availability of a vendor key is separate from evidence that a complete
+    # battery pack satisfies it. Earlier catalog counts included BMS boards.
+    # Positive pack/vendor matching is covered by test_semantic_mcp's fixture.
+    assert res.data["filter_recall"]["confirmed_matches"] == res.total_matches
+    assert "missing_spec" in res.data["filter_recall"]
     assert res.filters_applied["filter_mode"] == "hybrid"
     assert res.filters_applied["vendor_filters"]["max_discharge_current_a"]["gte"] == 20.0
     assert res.filters_applied["filter_routed_to_vendor"][0]["tier"] == "vendor"

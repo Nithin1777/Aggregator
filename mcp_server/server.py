@@ -12,13 +12,12 @@ import json
 import logging
 import math
 from pathlib import Path
-import re
 import sqlite3
 import sys
 import threading
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 # Ensure project root is in sys.path
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -36,49 +35,70 @@ from src.search.query_terms import (
     QueryPlan,
     detect_sort_intent,
     detect_unsupported_syntax,
-    parse_price_constraints,
-    relaxed_fts_expr,
-    strict_fts_expr,
 )
-from src.search.retrieval import rank_products
+from src.search.ranking import (rank_products, spec_completeness_bonus,
+                                category_spec_bonus)
+from src.search.planner import resolve_query_plan
+from src.search.filter_plan import FilterPlanError, prepare_filters
+from src.search.catalog_query import CatalogQuery, build_catalog_statements
+from src.search.product_role import classify_role, identify_product, spec_subject, identity_policy_summary
+from src.search.listing_identity import sold_form, comparison_evidence
+from src.search.requirements import extract_requirements
+from src.spec.constraints import compile_predicates, summarize_states, discover_candidates, individual_match_counts
+from src.spec.introspection import filter_population
 from src.spec.filters import (
-    ALIAS_GROUPS,
     _nearest_keys,
     alias_catalog_payload,
-    build_alias_clauses,
-    build_alias_expansion,
-    build_hybrid_spec_clauses,
-    build_spec_clauses,
-    build_vendor_spec_clauses,
     canonical_enum_value,
     enum_is_numeric as _enum_is_numeric,
-    filter_column as _filter_column,
     load_catalog_specs as _load_catalog_specs,
-    normalize_scalar,
-    parse_and_validate_filters,
     resolve_category,
-    route_alias_key,
     validate_filter_scope,
 )
 from src.spec.vendor_index import (
+    VENDOR_KEY_ALIASES,
     load_vendor_specs,
     normalize_vendor_key,
     vendor_category_keys,
-    vendor_key_value_counts,
+    vendor_alias_is_current,
 )
 from src.spec.taxonomy_loader import get_taxonomy
 
 logger = logging.getLogger(__name__)
 
-SERVER_VERSION = "2.2.0"
-SCHEMA_VERSION = "2.2.0"
+SERVER_VERSION = "2.4.0"
+SCHEMA_VERSION = "2.4.0"
 
 # Hard ceiling on page size. An agent asking for 1000 rows is almost always
 # paginating by accident, and a negative limit becomes SQL `LIMIT -1` (= no limit).
 MAX_PAGE_SIZE = 50
 
 # Initialize FastMCP Server
-mcp = FastMCP("aggregate-agent-first")
+class EnvelopeMCP(FastMCP):
+    """Validate transport arguments before FastMCP turns failures into exceptions."""
+
+    def add_tool(self, fn, *args, **kwargs):
+        result = super().add_tool(fn, *args, **kwargs)
+        tool = self._tool_manager.get_tool(kwargs.get("name") or fn.__name__)
+        if tool is not None:
+            tool.parameters["additionalProperties"] = False
+        return result
+
+    async def call_tool(self, name, arguments):
+        tool = self._tool_manager.get_tool(name)
+        if tool is not None:
+            try:
+                tool.fn_metadata.arg_model.model_validate(arguments, strict=True, extra="forbid")
+            except ValidationError as exc:
+                result = make_error(
+                    error_code="invalid_arguments", message="Tool arguments do not match the advertised schema.",
+                    details={"errors": exc.errors(include_url=False, include_context=False, include_input=False)},
+                )
+                return tool.fn_metadata.convert_result(result)
+        return await super().call_tool(name, arguments)
+
+
+mcp = EnvelopeMCP("aggregate-agent-first")
 _engine = AggregatorEngine()
 
 
@@ -173,14 +193,19 @@ def refresh_price_stock_for_products(
 
 def _price_stock_fallback_warning(refresh_info: Optional[PriceStockRefreshInfo]) -> List[Dict[str, Any]]:
     """Warns when displayed price/stock came from cache because live refresh was impossible."""
-    if refresh_info is None or not refresh_info.attempted:
+    if refresh_info is None:
         return []
+    if refresh_info.status == "partial":
+        return [{"code": "price_refresh_partial", **refresh_info.model_dump()}]
     if refresh_info.status in ("cached", "offline_cooldown", "timeout", "error"):
         return [{
             "code": "price_stock_cache_fallback",
             "status": refresh_info.status,
             "message": refresh_info.message or "Serving cached price/stock.",
         }]
+    if refresh_info.status in {"disabled", "fresh_cache"}:
+        return [{"code": "price_stock_cached", "status": refresh_info.status,
+                 "message": refresh_info.message or "Serving cached price/stock; no live request was made."}]
     return []
 
 class ToolResponseEnvelope(BaseModel):
@@ -231,8 +256,34 @@ def make_response(
     coverage: Optional[Dict[str, Any]] = None,
     warnings: Optional[List[Dict[str, Any]]] = None,
     diagnosis: Optional[Dict[str, Any]] = None,
+    query_plan: Optional[QueryPlan] = None,
 ) -> ToolResponseEnvelope:
     """Builds a successful uniform response envelope."""
+    filters_applied = dict(filters_applied or {})
+    warnings = list(warnings or [])
+    if query_plan is not None and isinstance(data, dict):
+        from src.search.query_intent import retrieval_response_fields
+        data.update(retrieval_response_fields(query_plan.contract(), total_matches))
+        filters_applied["price_min"] = query_plan.price_min
+        filters_applied["query_contract"] = query_plan.contract()
+    original_query = filters_applied.get("query")
+    if original_query and isinstance(data, dict):
+        _, requirements = extract_requirements(original_query)
+        if query_plan is not None:
+            requirements = query_plan.unresolved_constraints
+        data["original_query"] = original_query
+        data["unresolved_constraints"] = requirements
+        data["requirements_verified"] = False if requirements else None
+        if requirements:
+            filters_applied["unresolved_constraints"] = requirements
+            if not any(w.get("code") == "unresolved_engineering_constraints" for w in warnings):
+                warnings.append({"code": "unresolved_engineering_constraints",
+                                 "message": "Retrieved listings do not verify the preserved application requirements.",
+                                 "constraints": requirements})
+            if total_matches > 0:
+                diagnosis = {"reason": "unresolved_engineering_constraints", "severity": "warning",
+                             "unresolved_constraints": requirements,
+                             "hint": "Resolve the preserved requirements before making an engineering recommendation."}
     payload = {
         "ok": True,
         "data": data,
@@ -280,6 +331,8 @@ def _query_fingerprint(
     sort: str,
     category: Optional[str] = None,
     vendor_filters: Optional[Dict[str, Any]] = None,
+    include_related: bool = False,
+    include_vendor_specs: bool = True,
 ) -> str:
     """Stable hash binding a pagination cursor to the exact query that produced it."""
     payload = json.dumps(
@@ -291,6 +344,8 @@ def _query_fingerprint(
             "in_stock_only": bool(in_stock_only),
             "sort": sort,
             "category": category,
+            "include_related": include_related,
+            "include_vendor_specs": include_vendor_specs,
         },
         sort_keys=True,
         default=str,
@@ -417,19 +472,14 @@ def _build_coverage_and_warnings(
             "catalog": {"present": present, "of": total_products, "pct": pct},
         }
         if category and conn is not None:
-            rows = conn.execute(
-                "SELECT category, filled_count, applicable_count FROM spec_stats WHERE key = ?;",
-                (fk,),
-            ).fetchall()
-            row = next((r for r in rows if str(r[0]) == str(category)), None)
-            filled = int(row[1]) if row and row[1] is not None else 0
-            # A key owned by exactly one category can use the global applicable
-            # count: spec_stats can lag behind after category reclassification,
-            # while the global count is recomputed by the same promotion run.
-            if len(rows) == 1 and str(rows[0][0]) == str(category):
-                filled = max(filled, int(meta.get("count") or 0))
-            denominator = int(category_total or (row[2] if row and row[2] else 0) or 0)
+            filled = int(conn.execute(
+                "SELECT COUNT(DISTINCT ps.product_id) FROM product_specs ps "
+                "JOIN products p ON p.id = ps.product_id WHERE p.category_canonical = ? AND ps.key = ?",
+                (category, fk),
+            ).fetchone()[0])
+            denominator = int(category_total or 0)
             coverage[fk]["category"] = {
+                "scope": "discovery_category",
                 "present": filled,
                 "of": denominator,
                 "pct": round(filled / max(denominator, 1) * 100, 2) if denominator else 0.0,
@@ -459,138 +509,77 @@ def _build_coverage_and_warnings(
     return coverage, warnings
 
 
-def _compute_filter_recall(
-    conn: sqlite3.Connection,
-    catalog_specs: Dict[str, Dict[str, Any]],
-    norm_filters: Dict[str, Any],
-    query_plan: Optional[QueryPlan],
-    price_max: Optional[float],
-    in_stock_only: bool,
-    category: Optional[str],
-    active_category_keys: Optional[List[str]],
-    require_spec_scope: bool,
-    total_matches: int,
-    alias_filters: Optional[List[Dict[str, Any]]] = None,
-    vendor_filters: Optional[Dict[str, Any]] = None,
-    vendor_specs_meta: Optional[Dict[str, Dict[str, Any]]] = None,
-    include_vendor_specs: bool = True,
-) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Counts products excluded because a filtered key was never extracted."""
-    norm_filters = norm_filters or {}
-    vendor_filters = vendor_filters or {}
-    if not norm_filters and not vendor_filters:
-        return None, []
-    base_count_sql, base_params, _, _ = _build_sql_query(
-        {},
-        catalog_specs,
-        fts_tokens=(query_plan.effective_tokens if query_plan else None),
-        fts_relaxed=(query_plan.is_relaxed if query_plan else False),
-        price_max=price_max,
-        in_stock_only=in_stock_only,
-        category=category,
-        category_spec_keys=active_category_keys,
-        require_spec_scope=require_spec_scope,
+def _constraint_scope(
+    conn, catalog_specs, norm_filters, query_plan, price_max, in_stock_only,
+    category, active_category_keys, require_spec_scope, alias_filters=None,
+    vendor_filters=None, vendor_specs_meta=None, include_vendor_specs=True,
+    include_related=False, sort="relevance", head_token=None,
+):
+    scope = CatalogQuery(
+        query_plan=query_plan,
+        price_max=price_max, in_stock_only=in_stock_only, category=category,
+        include_related=include_related,
     )
-    inner_sql = base_count_sql.replace("SELECT COUNT(DISTINCT p.id)", "SELECT p.id", 1).rstrip().rstrip(";")
-    base_total = int(conn.execute(f"SELECT COUNT(*) FROM ({inner_sql}) base;", base_params).fetchone()[0])
-    warnings: List[Dict[str, Any]] = []
-    recall: Dict[str, Any] = {
-        "scope": "extracted_only",
-        "mode": "hybrid" if include_vendor_specs else "promoted",
-        "base_matches": base_total,
-    }
+    base_sql, params = scope.ids_statement()
+    predicates = compile_predicates(
+        norm_filters, catalog_specs, hybrid=include_vendor_specs,
+        vendor_filters=vendor_filters, vendor_metadata=vendor_specs_meta,
+        aliases=alias_filters,
+    )
+    return base_sql, params, predicates
 
-    if norm_filters:
-        keys = list(norm_filters.keys())
-        promoted_sql, promoted_params, _, _ = _build_sql_query(
-            norm_filters,
-            catalog_specs,
-            fts_tokens=(query_plan.effective_tokens if query_plan else None),
-            fts_relaxed=(query_plan.is_relaxed if query_plan else False),
-            price_max=price_max,
-            in_stock_only=in_stock_only,
-            category=category,
-            category_spec_keys=active_category_keys,
-            require_spec_scope=require_spec_scope,
-            hybrid_vendor=False,
-            vendor_filters=vendor_filters,
-            vendor_specs=vendor_specs_meta,
-        )
-        promoted_total = int(conn.execute(promoted_sql, promoted_params).fetchone()[0])
-        missing_sql = " OR ".join(
-            "(NOT EXISTS (SELECT 1 FROM product_specs ps WHERE ps.product_id = base.id AND ps.key = ?) "
-            "AND NOT EXISTS (SELECT 1 FROM product_vendor_specs pvs "
-            "WHERE pvs.product_id = base.id AND pvs.key = ?))"
-            for _ in keys
-        )
-        missing_params: List[Any] = []
-        for key in keys:
-            missing_params.extend([key, key])
-        missing_spec = int(conn.execute(
-            f"SELECT COUNT(*) FROM ({inner_sql}) base WHERE {missing_sql};",
-            base_params + missing_params,
-        ).fetchone()[0])
-        promoted_missing = int(conn.execute(
-            f"SELECT COUNT(*) FROM ({inner_sql}) base WHERE "
-            + " OR ".join(
-                "NOT EXISTS (SELECT 1 FROM product_specs ps "
-                "WHERE ps.product_id = base.id AND ps.key = ?)"
-                for _ in keys
-            )
-            + ";",
-            base_params + keys,
-        ).fetchone()[0])
-        filtered_out_value = max(0, base_total - total_matches - missing_spec)
-        recall.update({
-            "keys": keys,
-            "missing_spec": missing_spec,
-            "promoted_matches": promoted_total,
-            "hybrid_matches": total_matches,
-            "vendor_fallback_matches": max(0, total_matches - promoted_total),
-            "promoted_missing": promoted_missing,
-            "vendor_available_but_value_mismatch": max(0, promoted_missing - missing_spec),
-            "filtered_out_for_value": filtered_out_value,
-        })
-        if missing_spec:
-            warnings.append({
-                "code": "filter_recall_gap",
-                "message": (
-                    f"{missing_spec} matching product(s) have no extracted value for "
-                    f"{keys} in either the promoted or vendor layer and are excluded. "
-                    "Treat the count as 'products with usable specs', not all products."
-                ),
-                "missing_spec": missing_spec,
-                "base_matches": base_total,
-                "vendor_fallback_matches": recall["vendor_fallback_matches"],
-            })
 
+def _compute_filter_recall(
+    conn, catalog_specs, norm_filters, query_plan, price_max, in_stock_only,
+    category, active_category_keys, require_spec_scope, total_matches,
+    alias_filters=None, vendor_filters=None, vendor_specs_meta=None,
+    include_vendor_specs=True, include_related=False, sort="relevance", head_token=None,
+):
+    """Diagnostics use exactly the predicates and evidence states used by retrieval."""
+    base_sql, params, predicates = _constraint_scope(
+        conn, catalog_specs, norm_filters, query_plan, price_max, in_stock_only,
+        category, active_category_keys, require_spec_scope, alias_filters,
+        vendor_filters, vendor_specs_meta, include_vendor_specs, include_related,
+        sort, head_token,
+    )
+    recall = summarize_states(conn, base_sql, params, predicates)
+    if recall is None:
+        return None, []
+    state_summary = dict(recall)
+    promoted = compile_predicates(
+        norm_filters, catalog_specs, hybrid=False, aliases=alias_filters,
+        vendor_filters=vendor_filters, vendor_metadata=vendor_specs_meta,
+    )
+    promoted_recall = (
+        summarize_states(conn, base_sql, params, promoted)
+        if include_vendor_specs and (norm_filters or alias_filters)
+        else state_summary
+    )
+    recall.update({
+        "scope": "usable_evidence", "mode": "hybrid" if include_vendor_specs else "promoted",
+        "promoted_matches": promoted_recall["confirmed_matches"],
+        "hybrid_matches": recall["confirmed_matches"],
+        "vendor_fallback_matches": max(0, recall["confirmed_matches"] - promoted_recall["confirmed_matches"]),
+        "promoted_missing": promoted_recall["any_unknown"],
+        "vendor_filled_unknown": max(0, promoted_recall["any_unknown"] - recall["any_unknown"]),
+    })
     if vendor_filters:
-        vendor_keys = list(vendor_filters.keys())
-        vendor_missing_sql = " OR ".join(
-            "NOT EXISTS (SELECT 1 FROM product_vendor_specs pvs "
-            "WHERE pvs.product_id = base.id AND pvs.key = ?)"
-            for _ in vendor_keys
+        vendor_predicates = compile_predicates(
+            {}, catalog_specs, vendor_filters=vendor_filters, vendor_metadata=vendor_specs_meta,
         )
-        vendor_missing = int(conn.execute(
-            f"SELECT COUNT(*) FROM ({inner_sql}) base WHERE {vendor_missing_sql};",
-            base_params + vendor_keys,
-        ).fetchone()[0])
-        recall["vendor_filters"] = {
-            "keys": vendor_keys,
-            "missing_spec": vendor_missing,
-            "base_matches": base_total,
-        }
-        if vendor_missing:
-            warnings.append({
-                "code": "vendor_filter_recall_gap",
-                "message": (
-                    f"{vendor_missing} matching product(s) have no vendor attribute "
-                    f"for {vendor_keys}; the vendor tier is incomplete."
-                ),
-                "missing_spec": vendor_missing,
-                "base_matches": base_total,
-                "tier": "vendor",
-            })
+        vendor_recall = (
+            summarize_states(conn, base_sql, params, vendor_predicates)
+            if norm_filters or alias_filters else state_summary
+        )
+        recall["vendor_filters"] = vendor_recall
+    warnings = []
+    if recall["any_unknown"]:
+        warnings.append({
+            "code": "filter_recall_gap", "missing_spec": recall["missing_spec"],
+            "any_unknown": recall["any_unknown"], "base_matches": recall["base_matches"],
+            "vendor_fallback_matches": recall["vendor_fallback_matches"],
+            "message": "Some listings have unknown constraints. Unknown never satisfies a filter; explicit failures take precedence in the count partition.",
+        })
     return recall, warnings
 
 
@@ -793,171 +782,6 @@ def _result_diagnosis(
     return None
 
 
-def _parse_and_validate_filters(
-    filters: Optional[Dict[str, Any]],
-    advertised_specs: Dict[str, Dict[str, Any]],
-    category: Optional[str] = None,
-    coercions: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[Optional[Dict[str, Any]], Optional[ToolResponseEnvelope]]:
-    """Validates filter keys and operators, rejecting deprecated string range forms."""
-    normalized, error = parse_and_validate_filters(
-        filters, advertised_specs, category=category, coercions=coercions
-    )
-    if error is None:
-        return normalized, None
-    return None, make_error(
-        error_code=error["error_code"],
-        message=error["message"],
-        valid_keys=error.get("valid_keys"),
-        suggestions=error.get("suggestions"),
-        details=error.get("details"),
-        diagnosis={
-            "reason": error["error_code"],
-            "severity": "error",
-            **(error.get("details") or {}),
-        },
-    )
-
-
-def _route_filter_aliases(
-    filters: Optional[Dict[str, Any]],
-    catalog_specs: Dict[str, Dict[str, Any]],
-    category: Optional[str],
-    category_keys: List[str],
-) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Routes equivalent keys to the category-applicable key before validation."""
-    if not filters or not category:
-        return filters, []
-    routed: Dict[str, Any] = {}
-    applied: List[Dict[str, Any]] = []
-    for key, value in filters.items():
-        target = route_alias_key(key, category, category_keys)
-        if target and target != key:
-            routed[target] = value
-            applied.append({"group": "voltage", "from": key, "to": target})
-        else:
-            routed[key] = value
-    return routed, applied
-
-
-GLOBAL_VENDOR_KEYS = {
-    "manufacturer", "brand", "operating_temperature", "mounting_type",
-    "material", "color", "colour", "weight",
-}
-
-
-def _split_filter_tiers(
-    filters: Optional[Dict[str, Any]],
-    catalog_specs: Dict[str, Dict[str, Any]],
-    conn: sqlite3.Connection,
-    category: Optional[str],
-    category_keys: List[str],
-    allow_vendor: bool = True,
-) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
-    """
-    Splits caller filters into taxonomy/promoted filters and vendor-tier filters.
-
-    Auto-routing is category-scoped on purpose. An unscoped key like "torque"
-    exists on motor shafts and connector screws; silently unioning those would
-    produce a confident but semantically wrong answer. Without a category, only
-    genuinely cross-category keys (manufacturer, operating temperature, ...) are
-    auto-routed; everything else must use the explicit vendor_filters argument.
-    """
-    promoted: Dict[str, Any] = {}
-    vendor: Dict[str, Any] = {}
-    routed: List[Dict[str, Any]] = []
-    for key, value in (filters or {}).items():
-        applicable_to_category = (not category) or (bool(category_keys) and key in category_keys)
-        if key in catalog_specs and applicable_to_category:
-            promoted[key] = value
-            continue
-        vkey = normalize_vendor_key(key)
-        if not allow_vendor:
-            promoted[key] = value
-            continue
-        if category is None and key not in catalog_specs and vkey not in GLOBAL_VENDOR_KEYS:
-            promoted[key] = value
-            continue
-        meta = load_vendor_specs(
-            conn, category=category, min_count=1, keys=[vkey]
-        )
-        if meta and next(iter(meta.values()))["count"] > 0:
-            vendor[vkey] = value
-            routed.append({"from": key, "to": vkey, "tier": "vendor"})
-        else:
-            promoted[key] = value
-    return promoted, vendor, routed
-
-
-def _load_vendor_filter_meta(
-    conn: sqlite3.Connection,
-    vendor_filters: Dict[str, Any],
-    category: Optional[str],
-) -> Dict[str, Dict[str, Any]]:
-    keys = [normalize_vendor_key(k) for k in (vendor_filters or {})]
-    if not keys:
-        return {}
-    return load_vendor_specs(conn, category=category, min_count=1, keys=keys)
-
-
-def _parse_vendor_filters(
-    filters: Optional[Dict[str, Any]],
-    vendor_specs: Dict[str, Dict[str, Any]],
-) -> Tuple[Optional[Dict[str, Any]], Optional[ToolResponseEnvelope]]:
-    normalized, error = parse_and_validate_filters(filters, vendor_specs)
-    if error is None:
-        return normalized, None
-    details = dict(error.get("details") or {})
-    details.setdefault("tier", "vendor")
-    return None, make_error(
-        error_code=error["error_code"],
-        message=error["message"],
-        valid_keys=error.get("valid_keys"),
-        suggestions=error.get("suggestions"),
-        details=details,
-        diagnosis={
-            "reason": error["error_code"],
-            "severity": "error",
-            "tier": "vendor",
-            **details,
-        },
-    )
-
-
-def _expand_unscoped_aliases(
-    norm_filters: Dict[str, Any],
-    catalog_specs: Dict[str, Dict[str, Any]],
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, List[str]]]:
-    """
-    Replaces equivalent-key filters with one OR-expansion so `voltage:12` and
-    `voltage_v:12` return the same union without double-counting products.
-    """
-    expanded: Dict[str, Any] = {}
-    alias_filters: List[Dict[str, Any]] = []
-    disclosed: Dict[str, List[str]] = {}
-    for key, value in norm_filters.items():
-        expansion = build_alias_expansion(key, value, catalog_specs)
-        if not expansion:
-            expanded[key] = value
-            continue
-        group = expansion["group"]
-        keys = expansion["keys"]
-        existing = next((a for a in alias_filters if a["group"] == group), None)
-        if existing is None:
-            alias_filters.append({"group": group, "keys": keys, "value": value})
-        else:
-            # Both aliases were supplied: union their values when possible.
-            old = existing["value"]
-            if old == value:
-                pass
-            elif isinstance(old, dict) or isinstance(value, dict):
-                existing["value"] = {"in": [old, value]}
-            else:
-                existing["value"] = {"in": [old, value]}
-        disclosed[group] = keys
-    return expanded, alias_filters, disclosed
-
-
 def _coercion_payload(coercions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Deduplicates coercion notices for filters_applied."""
     seen = set()
@@ -971,14 +795,18 @@ def _coercion_payload(coercions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _valid_categories(conn: sqlite3.Connection) -> List[str]:
-    """Canonical taxonomy categories actually present in the catalog."""
+def _populated_categories(conn: sqlite3.Connection) -> List[str]:
     rows = conn.execute(
         "SELECT DISTINCT category_canonical FROM products "
         "WHERE category_canonical IS NOT NULL AND category_canonical != '' "
         "ORDER BY category_canonical;"
     ).fetchall()
     return [str(r[0]) for r in rows]
+
+
+def _valid_categories(conn: sqlite3.Connection) -> List[str]:
+    """Supported categories include empty ones; inference requires actual data."""
+    return sorted(set(_populated_categories(conn)) | set(get_taxonomy().categories))
 
 
 def _category_spec_keys(conn: sqlite3.Connection, category: str) -> List[str]:
@@ -1063,6 +891,8 @@ def _category_filter_support(conn: sqlite3.Connection, category: Optional[str]) 
 
 
 def _unsupported_query_error(query: Optional[str]) -> Optional[ToolResponseEnvelope]:
+    if query and "\x00" in query:
+        return make_error(error_code="invalid_query", message="query must not contain a NUL character.")
     """Rejects FTS5 boolean/phrase syntax instead of silently rewriting it."""
     syntax = detect_unsupported_syntax(query)
     if not syntax:
@@ -1091,8 +921,10 @@ def _query_status(plan: Optional[QueryPlan]) -> str:
     """Coarse search-mode label exposed to agents."""
     if plan is None:
         return "filters_only"
-    if plan.mode in ("strict", "corrected"):
-        return "exact"
+    if plan.mode == "strict":
+        return "all_terms"
+    if plan.mode == "corrected":
+        return "corrected"
     if plan.mode in ("relaxed", "corrected_relaxed"):
         return "relaxed" if plan.match_mode == "all_terms" else "low_confidence"
     if plan.mode == "unresolved":
@@ -1197,199 +1029,6 @@ def _category_coverage(conn: sqlite3.Connection) -> Dict[str, List[Dict[str, Any
     return coverage
 
 
-def _build_sql_query(
-    normalized_filters: Dict[str, Any],
-    advertised_specs: Dict[str, Dict[str, Any]],
-    fts_tokens: Optional[List[str]] = None,
-    fts_relaxed: bool = False,
-    price_max: Optional[float] = None,
-    in_stock_only: bool = False,
-    category: Optional[str] = None,
-    category_spec_keys: Optional[List[str]] = None,
-    require_spec_scope: bool = False,
-    sort: str = "relevance",
-    limit: int = 10,
-    offset: int = 0,
-    head_token: Optional[str] = None,
-    alias_filters: Optional[List[Dict[str, Any]]] = None,
-    zero_price_only: bool = False,
-    hybrid_vendor: bool = False,
-    vendor_filters: Optional[Dict[str, Any]] = None,
-    vendor_specs: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> Tuple[str, List[Any], str, List[Any]]:
-    """Builds parameterized SQL for count and select queries.
-
-    Text matching is driven by a resolved token list: `fts_tokens` with
-    `fts_relaxed=False` requires every token to match (precision), while
-    `fts_relaxed=True` matches any token (recall after query relaxation).
-    """
-    joins: List[str] = []
-    join_params: List[Any] = []
-    where_clauses: List[str] = []
-    where_params: List[Any] = []
-
-    if hybrid_vendor and normalized_filters:
-        hybrid_where, hybrid_params = build_hybrid_spec_clauses(
-            normalized_filters, advertised_specs
-        )
-        where_clauses.extend(hybrid_where)
-        where_params.extend(hybrid_params)
-    else:
-        spec_joins, spec_join_params, spec_where, spec_where_params = build_spec_clauses(
-            normalized_filters, advertised_specs
-        )
-        joins.extend(spec_joins)
-        join_params.extend(spec_join_params)
-        where_clauses.extend(spec_where)
-        where_params.extend(spec_where_params)
-
-    if vendor_filters and vendor_specs:
-        vendor_joins, vendor_join_params, vendor_where, vendor_where_params = (
-            build_vendor_spec_clauses(vendor_filters, vendor_specs)
-        )
-        joins.extend(vendor_joins)
-        join_params.extend(vendor_join_params)
-        where_clauses.extend(vendor_where)
-        where_params.extend(vendor_where_params)
-
-    alias_where, alias_params = build_alias_clauses(alias_filters, advertised_specs)
-    if alias_where:
-        where_clauses.extend(alias_where)
-        where_params.extend(alias_params)
-
-    if zero_price_only:
-        where_clauses.append("p.price <= 0")
-
-    if price_max is not None:
-        where_clauses.append("p.price <= ?")
-        where_params.append(float(price_max))
-
-    if sort in ("price_asc", "price_desc"):
-        # Price 0 rows are quote/fabrication services, not components. Sorting
-        # them first makes "cheapest X" return a service, not the part.
-        where_clauses.append("p.price > 0")
-
-    if head_token and sort == "price_asc":
-        # A compatibility clause ("... for Arduino ESP32") is not the product.
-        # For a single-term query, require the term to appear in the first ~30
-        # characters rather than anywhere in the title.
-        where_clauses.append("instr(lower(p.title), lower(?)) BETWEEN 1 AND 30")
-        where_params.append(head_token)
-
-    if in_stock_only:
-        where_clauses.append("p.available = 1")
-
-    if category:
-        # Always use the canonical catalog category. `spec_category` is the
-        # extraction scope, and it contains accessories filed by vendors under
-        # "Battery Accessories" (a 9V snap connector is not a battery). Spec
-        # joins still require extracted values when filters are supplied.
-        where_clauses.append("p.category_canonical = ?")
-        where_params.append(category)
-
-    if fts_tokens:
-        if fts_relaxed:
-            fts_expr = relaxed_fts_expr(fts_tokens)
-        else:
-            fts_expr = strict_fts_expr(fts_tokens)
-        joins.append("JOIN products_fts fts ON p.id = fts.rowid")
-        where_clauses.append("products_fts MATCH ?")
-        where_params.append(fts_expr)
-
-    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-
-    # Sort. When a category is requested, rank genuine components above catalog
-    # entries that merely mention the category word (kits, bundles, chargers):
-    # products carrying more of that category's extracted specs come first.
-    order_params: List[Any] = []
-    spec_boost = None
-    if category_spec_keys and sort == "relevance":
-        spec_placeholders = ", ".join(["?"] * len(category_spec_keys))
-        spec_boost = (
-            "(SELECT COUNT(1) FROM product_specs psc "
-            f"WHERE psc.product_id = p.id AND psc.key IN ({spec_placeholders})) DESC"
-        )
-        order_params = list(category_spec_keys)
-
-    if sort == "price_asc":
-        order_by = "ORDER BY p.price ASC"
-    elif sort == "price_desc":
-        order_by = "ORDER BY p.price DESC"
-    elif spec_boost and fts_tokens:
-        order_by = f"ORDER BY {spec_boost}, rank"
-    elif spec_boost:
-        order_by = f"ORDER BY {spec_boost}, p.is_canonical DESC, p.query_ctr DESC, p.available DESC, p.price ASC"
-    elif fts_tokens:
-        order_by = "ORDER BY rank"
-    else:
-        order_by = "ORDER BY p.is_canonical DESC, p.query_ctr DESC, p.available DESC, p.price ASC"
-
-    count_sql = f"SELECT COUNT(DISTINCT p.id) FROM products p {' '.join(joins)} {where_sql};"
-    select_sql = f"SELECT p.* FROM products p {' '.join(joins)} {where_sql} {order_by} LIMIT ? OFFSET ?;"
-
-    params = join_params + where_params
-    select_params = params + order_params + [limit, offset]
-    return count_sql, params, select_sql, select_params
-
-
-def _spec_completeness_bonus(
-    conn: sqlite3.Connection,
-    product_ids: List[int],
-) -> Dict[int, float]:
-    """
-    Small engineering-quality tie-break: prefer products with more extracted
-    specifications. Mandatory filters already decided compatibility; this only
-    orders equally compatible candidates.
-    """
-    if not product_ids:
-        return {}
-    id_ph = ", ".join(["?"] * len(product_ids))
-    promoted = {
-        int(pid): int(count)
-        for pid, count in conn.execute(
-            f"SELECT product_id, COUNT(1) FROM product_specs "
-            f"WHERE product_id IN ({id_ph}) GROUP BY product_id;",
-            product_ids,
-        ).fetchall()
-    }
-    vendor = {
-        int(pid): int(count)
-        for pid, count in conn.execute(
-            f"SELECT product_id, COUNT(1) FROM product_vendor_specs "
-            f"WHERE product_id IN ({id_ph}) GROUP BY product_id;",
-            product_ids,
-        ).fetchall()
-    }
-    return {
-        pid: 2.0 * min(promoted.get(pid, 0), 10) + 0.2 * min(vendor.get(pid, 0), 25)
-        for pid in product_ids
-    }
-
-
-def _category_spec_bonus(
-    conn: sqlite3.Connection,
-    product_ids: List[int],
-    spec_keys: Optional[List[str]],
-) -> Dict[int, float]:
-    """
-    Reproduces the category spec-coverage ORDER BY as a score bonus.
-
-    The SQL path puts products carrying more of the category's extracted specs
-    first. When the shared Python ranker is used instead, the same signal is
-    applied as a large per-spec bonus so it still dominates raw BM25.
-    """
-    if not product_ids or not spec_keys:
-        return {}
-    id_ph = ", ".join(["?"] * len(product_ids))
-    key_ph = ", ".join(["?"] * len(spec_keys))
-    rows = conn.execute(
-        f"SELECT product_id, COUNT(1) FROM product_specs "
-        f"WHERE product_id IN ({id_ph}) AND key IN ({key_ph}) "
-        f"GROUP BY product_id;",
-        list(product_ids) + list(spec_keys),
-    ).fetchall()
-    return {int(pid): 100.0 * int(count) for pid, count in rows}
-
 # =====================================================================
 # 6 AGENT-FIRST TOOLS
 # =====================================================================
@@ -1401,10 +1040,11 @@ def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
 
     Recommended Call Order: Call describe_catalog first before running any searches to inspect available attributes and catalog size.
 
-    Using The Output: counts.products_by_spec_category lists the values accepted by the
-    `category` parameter of search_components/count_components (e.g. "battery", "motor",
-    "relay"). spec_keys lists every filterable key with coverage; `values` is null for
-    open-ended enums (e.g. battery voltage), where describe_spec shows observed distributions.
+    Using The Output: taxonomy[].id lists accepted categories. taxonomy[].products
+    and products_component match default category counts; products_with_related is
+    broad discovery. products_by_spec_category describes extraction assignments.
+    Key coverage statistics describe stored promoted rows before identity/ownership
+    checks. Use describe_spec for usable filter coverage and observed distributions.
 
     Parameter Syntax: summary: bool (default: false). summary=true returns a compact
     columnar key catalog under ~6 KB instead of the full taxonomy/vendor payload.
@@ -1463,6 +1103,16 @@ def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
             "GROUP BY category_canonical ORDER BY COUNT(1) DESC;"
         )
         products_by_category = {r[0]: r[1] for r in cur.fetchall()}
+        component_counts = {str(r[0]): int(r[1]) for r in conn.execute(
+            "SELECT category_canonical, SUM(aggregate_identity_matches(title,category_canonical,category_canonical)) "
+            "FROM products GROUP BY category_canonical")}
+        observed_values = {}
+        for cat_id, key, value in conn.execute(
+            "SELECT DISTINCT p.category_canonical,s.key,aggregate_canonical_value(s.value,s.key) "
+            "FROM product_specs s JOIN products p ON p.id=s.product_id "
+            "WHERE aggregate_identity_matches(p.title,p.category_canonical,p.category_canonical)=1 "
+            "AND aggregate_spec_subject(p.title,p.category_canonical,s.key)='sold_item'"):
+            observed_values.setdefault((cat_id, key), set()).add(value)
 
         taxonomy = get_taxonomy()
         taxonomy_payload = []
@@ -1471,7 +1121,9 @@ def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
                 "id": cat.id,
                 "display": cat.display,
                 "description": cat.description,
-                "products": products_by_category.get(cat.id, 0),
+                "products": component_counts.get(cat.id, 0),
+                "products_component": component_counts.get(cat.id, 0),
+                "products_with_related": products_by_category.get(cat.id, 0),
                 "filter_support": "partial" if cat.attributes else "none",
                 "filterable_attributes": [
                     {
@@ -1479,10 +1131,12 @@ def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
                         "display_name": attr.display_name,
                         "type": attr.type,
                         "unit": attr.unit,
-                        "values": attr.values,
+                        "values": sorted(observed_values.get((cat.id, attr.key), set())) if attr.type in {"enum", "string"} else None,
+                        "values_scope": "populated_promoted_component_evidence",
+                        "schema_values": attr.values,
                         "range": {"min": attr.range[0], "max": attr.range[1]} if attr.range else None,
                     }
-                    for attr in cat.attributes.values()
+                    for attr in cat.attributes.values() if attr.key in catalog_specs
                 ],
             })
 
@@ -1533,8 +1187,11 @@ def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
                 "spec_keys": summary_rows,
                 "aliases": alias_catalog_payload(),
                 "spec_index_updated_at": spec_index_updated_at,
-                "vendor_spec_key_count": len(vendor_keys),
+                "vendor_spec_key_count": int(conn.execute("SELECT COUNT(*) FROM vendor_spec_stats_global").fetchone()[0]),
+                "vendor_spec_discovery_min_count": 5,
                 "summary": True,
+                "spec_statistics_scope": "stored_promoted_rows; describe_spec gives filterable coverage",
+                "identity_policy": {"version": 1, "details": "describe_catalog(summary=False)"},
             }
             return make_response(data=data, total_matches=total_products, returned=1)
 
@@ -1550,14 +1207,20 @@ def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
                 "vendor_spec_rows": cur.execute(
                     "SELECT COUNT(1) FROM product_vendor_specs;"
                 ).fetchone()[0],
-                "vendor_spec_keys": len(vendor_keys),
+                "vendor_spec_keys": int(conn.execute("SELECT COUNT(*) FROM vendor_spec_stats_global").fetchone()[0]),
             },
             "products_by_vendor": products_by_vendor,
             "products_by_spec_category": products_by_spec_category,
+            "products_by_spec_category_scope": "extraction_assignment; not the category search population",
+            "products_by_category": component_counts,
+            "category_count_policy": "taxonomy.products and products_by_category match default count_components(category); products_with_related is broad discovery",
+            "spec_statistics_scope": "stored_promoted_rows_before_identity_and_ownership; use describe_spec for filterable coverage",
             "taxonomy": taxonomy_payload,
+            "identity_policy": identity_policy_summary(),
             "spec_keys": spec_keys_list,
             "aliases": alias_catalog_payload(),
-            "vendor_spec_key_count": len(vendor_keys),
+            "vendor_spec_key_count": int(conn.execute("SELECT COUNT(*) FROM vendor_spec_stats_global").fetchone()[0]),
+                "vendor_spec_discovery_min_count": 5,
             "vendor_spec_keys": vendor_key_payload,
             "currency": "INR",
             "freshness": {
@@ -1575,144 +1238,60 @@ def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
         conn.close()
 
 @mcp.tool()
-def describe_spec(key: str, vendor: bool = False) -> ToolResponseEnvelope:
-    """
-    Return detailed metadata, value distributions, ranges, and coverage diagnostics for a single spec attribute.
-
-    Recommended Call Order: Call after describe_catalog to introspect a specific spec key before building filters.
-
-    Using The Output: `coverage_pct` is global (all products, most of which are unclassified);
-    `category_coverage` breaks the same key down per component category (e.g. voltage is
-    extracted on ~61% of batteries but only ~22% of motors), which is the number to trust
-    when deciding whether a filter is meaningful for a category.
-
-    Parameter Syntax: key: str (e.g. "rpm", "voltage", "cells", "capacity_mah");
-    vendor: bool (default false; force the normalized vendor layer, including keys
-    that are not in the promoted taxonomy).
+def describe_spec(key: str, vendor: bool = False, include_vendor_specs: bool = True,
+                  category: Optional[str] = None, include_related: bool = False) -> ToolResponseEnvelope:
+    """Inspect a filter's usable values, range and coverage using search semantics.
 
     Example Invocation: describe_spec(key="rpm")
-
-    Behavior When No Matches: If key is not in the taxonomy, returns ok:false with error_code='unknown_filter_key' and a list of valid keys.
+    Keys are case/whitespace normalized. Default counts use promoted evidence with
+    vendor fallback, just like count_components. Set include_vendor_specs=False for
+    promoted-only counts, or vendor=True for explicit vendor_filters. category and
+    include_related have the same meaning as in search. Stored extraction coverage
+    is reported separately. values is a bounded list of populated equality values;
+    each count can be reproduced with the same filter options.
     """
+    key = str(key).strip().lower()
     conn = get_db()
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(1) FROM products;")
-        total_products = cur.fetchone()[0]
-
-        catalog_specs = _load_catalog_specs(conn)
-        vendor_key = normalize_vendor_key(key)
-        vendor_meta = load_vendor_specs(
-            conn, min_count=1, keys=[vendor_key]
-        ).get(vendor_key)
-        if vendor or (key not in catalog_specs and vendor_meta):
-            if not vendor_meta:
-                all_vendor = load_vendor_specs(conn, min_count=5)
-                return make_error(
-                    error_code="unknown_filter_key",
-                    message=f"Vendor spec key '{key}' is not in the normalized vendor layer.",
-                    valid_keys=sorted(catalog_specs.keys()),
-                    suggestions=[
-                        {"key": k, "tier": "vendor"}
-                        for k in list(all_vendor.keys())[:5]
-                    ],
-                    details={"tier": "vendor"},
-                )
-            counts = vendor_key_value_counts(conn, vendor_key, limit=30)
-            category_rows = conn.execute(
-                "SELECT category, filled_count, applicable_count FROM vendor_spec_stats "
-                "WHERE key = ? ORDER BY filled_count DESC LIMIT 12;",
-                (vendor_key,),
-            ).fetchall()
-            data = {
-                "key": vendor_key,
-                "tier": "vendor",
-                "status": "vendor_reported",
-                "display_name": str(vendor_key).replace("_", " ").title(),
-                "type": vendor_meta["type"],
-                "unit": vendor_meta["unit"],
-                "coverage_pct": round(
-                    int(vendor_meta.get("global_count") or 0) / max(total_products, 1) * 100, 2
-                ),
-                "coverage_count": int(vendor_meta.get("global_count") or 0),
-                "category_coverage": [
-                    {
-                        "category": str(row[0]),
-                        "filled": int(row[1] or 0),
-                        "applicable": int(row[2] or 0),
-                        "pct": round(
-                            int(row[1] or 0) / max(int(row[2] or 0), 1) * 100, 1
-                        ),
-                    }
-                    for row in category_rows
-                ],
-                "values": counts if vendor_meta["type"] == "enum" else None,
-                "range": (
-                    {"min": vendor_meta.get("min"), "max": vendor_meta.get("max")}
-                    if vendor_meta["type"] != "enum" else None
-                ),
-                "sample_raw_strings": list(counts.keys())[:5],
-                "note": (
-                    "Vendor-reported attribute normalized from product descriptions. "
-                    "Lower confidence than a taxonomy-promoted specification."
-                ),
-            }
-            return make_response(
-                data=data,
-                total_matches=int(vendor_meta.get("global_count") or 0),
-                returned=1,
-                warnings=[{
-                    "code": "vendor_spec_tier",
-                    "message": (
-                        "This key is vendor-reported, not taxonomy-promoted. "
-                        "Use it through filters/vendor_filters; values may be incomplete."
-                    ),
-                }],
-            )
-        if key not in catalog_specs:
-            all_valid_keys = sorted(catalog_specs.keys())
-            return make_error(
-                error_code="unknown_filter_key",
-                message=f"Spec key '{key}' is not in the catalog taxonomy.",
-                valid_keys=all_valid_keys,
-                suggestions=_nearest_keys(key, all_valid_keys)
-            )
-
-        spec = catalog_specs[key]
-        cov_pct = round(spec["count"] / max(total_products, 1) * 100, 2)
-        status = "key_extracted_low_coverage" if cov_pct < 1.0 else "key_healthy"
-
-        cur.execute("SELECT DISTINCT value FROM product_specs WHERE key = ? LIMIT 5;", (key,))
-        sample_raw = [r[0] for r in cur.fetchall()]
-
+        catalog = _load_catalog_specs(conn)
+        category_norm, error = _resolve_category_or_error(conn, category)
+        if error:
+            return error
+        vkey = normalize_vendor_key(key)
+        vendor_meta = load_vendor_specs(conn, min_count=1, keys=[vkey])
+        use_vendor = vendor or (key not in catalog and vkey in vendor_meta)
+        metadata = vendor_meta if use_vendor else catalog
+        key = vkey if use_vendor else key
+        if key not in metadata:
+            return make_error(error_code="unknown_filter_key", message=f"Unknown spec key '{key}'.",
+                              valid_keys=sorted(catalog), suggestions=_nearest_keys(key, sorted(catalog)))
+        if category_norm and not use_vendor:
+            scope_error = validate_filter_scope({key: {}}, category_norm, _category_spec_keys(conn, category_norm))
+            if scope_error:
+                return make_error(**scope_error)
+        meta = metadata[key]
+        population = filter_population(conn, key, catalog, vendor_metadata=vendor_meta,
+                                       hybrid=include_vendor_specs, category=category_norm,
+                                       include_related=include_related, vendor=use_vendor)
+        total = int(conn.execute("SELECT COUNT(*) FROM products").fetchone()[0])
+        count = population["coverage_count"]
+        data = {"key": key, "tier": "vendor" if use_vendor else "promoted",
+                "status": "vendor_reported" if use_vendor else "key_healthy" if count else "key_no_usable_data",
+                "display_name": meta["display_name"], "type": meta["type"], "unit": meta["unit"],
+                **population, "coverage_pct": round(count / max(total, 1) * 100, 2),
+                "coverage_denominator": {"products": total, "scope": "global_catalog"},
+                "stored_coverage_count": meta.get("global_count", meta.get("count", 0)),
+                "stored_coverage_scope": "indexed_rows_before_identity_and_ownership",
+                "category_coverage": _category_coverage(conn).get(key, []) if not use_vendor else []}
         warnings = []
+        if use_vendor:
+            warnings.append({"code": "vendor_spec_tier", "message": "Vendor-reported evidence; use vendor_filters."})
         if key == "current_a":
-            warnings.append({
-                "code": "low_precision_advisory",
-                "message": "Advisory only (~70% precision in catalog titles; often reflects driver/module current rather than motor rated current)."
-            })
-        if status == "key_extracted_low_coverage":
-            warnings.append({
-                "code": "low_coverage_warning",
-                "message": f"Attribute has low catalog coverage ({cov_pct}% of total products)."
-            })
-
-        data = {
-            "key": key,
-            "status": status,
-            "display_name": spec["display_name"],
-            "type": spec["type"],
-            "unit": spec["unit"],
-            "coverage_pct": cov_pct,
-            "coverage_count": spec["count"],
-            "category_coverage": _category_coverage(conn).get(key, []),
-            "values": spec["value_counts"] if spec["type"] == "enum" else None,
-            "range": {"min": spec["min"], "max": spec["max"]} if spec["type"] in ("integer", "float") else None,
-            "sample_raw_strings": sample_raw
-        }
-        return make_response(data=data, total_matches=spec["count"], returned=1, warnings=warnings)
+            warnings.append({"code": "low_precision_advisory", "message": "Current extraction may describe a driver or module; verify the item."})
+        return make_response(data=data, total_matches=count, returned=1, warnings=warnings)
     finally:
         conn.close()
+
 
 @mcp.tool()
 def count_components(
@@ -1723,9 +1302,14 @@ def count_components(
     category: Optional[str] = None,
     vendor_filters: Optional[Dict[str, Any]] = None,
     include_vendor_specs: bool = True,
+    include_related: bool = False,
 ) -> ToolResponseEnvelope:
     """
     Count matching components and inspect filter coverage without fetching product rows.
+
+    Identity: modeled component families require sold-item identity evidence by default.
+    include_related=True browses the broader vendor category, including accessories and
+    unknown identities. See describe_catalog.identity_policy for modeled families.
 
     Recommended Call Order: Call after describe_catalog and before search_components to size query results and verify filter coverage.
 
@@ -1744,8 +1328,10 @@ def count_components(
       - include_vendor_specs: bool (default: true; fall back to normalized vendor
         values only where the promoted value is missing)
 
-    Natural-Language Queries: phrases like "battery to power an arduino" are handled by dropping
-    filler words and relaxing an all-terms match to an any-term match when needed; warnings report it.
+    Query policy: required terms are conjoined and never dropped automatically.
+    Brand/model/variant identity is protected. Safe contextual engineering values
+    become typed predicates; ambiguous requirements remain unresolved. Suggestions
+    are separate from confirmed results and require a new request.
 
     Freshness Note: counts are computed on the cached catalog snapshot. Search-time live
     price/stock verification happens in search_components, get_product and search_by_mpn.
@@ -1769,63 +1355,23 @@ def count_components(
         if category_err:
             return category_err
         category_keys = _category_spec_keys(conn, category_norm) if category_norm else []
-        coercions: List[Dict[str, Any]] = []
-        promoted_input, auto_vendor, tier_routes = _split_filter_tiers(
-            filters, catalog_specs, conn, category_norm, category_keys,
-            allow_vendor=include_vendor_specs,
-        )
-        explicit_vendor = {
-            normalize_vendor_key(k): v for k, v in (vendor_filters or {}).items()
-        }
-        requested_vendor_input = {**auto_vendor, **explicit_vendor}
-        vendor_meta = _load_vendor_filter_meta(
-            conn, requested_vendor_input, category_norm
-        )
-        missing_vendor_keys = [
-            k for k in requested_vendor_input if k not in vendor_meta
-        ]
-        if missing_vendor_keys:
-            return make_error(
-                error_code="unknown_filter_key",
-                message=(
-                    f"Unknown vendor filter key(s) {missing_vendor_keys}. "
-                    "Use describe_spec(key=..., vendor=True) to inspect vendor attributes."
-                ),
-                valid_keys=sorted(vendor_meta.keys())[:50],
-                suggestions=[{"key": k} for k in missing_vendor_keys[:3]],
-                details={"tier": "vendor", "provided_keys": missing_vendor_keys},
+        try:
+            filter_plan = prepare_filters(
+                conn, filters, metadata=catalog_specs, category=category_norm,
+                category_keys=category_keys, vendor_filters=vendor_filters,
+                include_vendor_specs=include_vendor_specs,
             )
-        norm_vendor_filters, vendor_err = _parse_vendor_filters(
-            requested_vendor_input, vendor_meta
-        )
-        if vendor_err:
-            return vendor_err
-        norm_vendor_filters = norm_vendor_filters or {}
-        routed_filters, alias_applied = _route_filter_aliases(
-            promoted_input, catalog_specs, category_norm, category_keys
-        )
-        norm_filters, err = _parse_and_validate_filters(
-            routed_filters, catalog_specs, category=category_norm, coercions=coercions
-        )
-        if err:
-            return err
-        requested_filters = dict(norm_filters or {})
-        if category_norm:
-            alias_filters: List[Dict[str, Any]] = []
-            alias_disclosed: Dict[str, List[str]] = {}
-        else:
-            norm_filters, alias_filters, alias_disclosed = _expand_unscoped_aliases(
-                norm_filters or {}, catalog_specs
-            )
-        scope_error = validate_filter_scope(norm_filters or {}, category_norm, category_keys)
-        if scope_error:
-            return make_error(
-                error_code=scope_error["error_code"],
-                message=scope_error["message"],
-                suggestions=scope_error.get("suggestions"),
-                details=scope_error.get("details"),
-                diagnosis={"reason": scope_error["error_code"], **(scope_error.get("details") or {})},
-            )
+        except FilterPlanError as exc:
+            return make_error(**exc.error)
+        coercions = filter_plan.coercions
+        norm_filters = filter_plan.filters
+        requested_filters = filter_plan.requested_filters
+        norm_vendor_filters = filter_plan.vendor_filters
+        vendor_meta = filter_plan.vendor_metadata
+        alias_filters = filter_plan.aliases
+        alias_disclosed = filter_plan.alias_disclosed
+        alias_applied = filter_plan.alias_routes
+        tier_routes = filter_plan.tier_routes
 
         require_spec_scope = bool(category_keys)
 
@@ -1846,16 +1392,13 @@ def count_components(
         query_original = (query or "").strip() or None
         price_max_source = "argument" if price_max_norm is not None else None
         category_source = "argument" if category_norm else None
-        if query is not None:
-            cleaned_query, _price_min, query_price_max = parse_price_constraints(str(query))
-            if price_max_norm is None and query_price_max is not None:
-                price_max_norm = query_price_max
-                price_max_source = "query"
-            query = cleaned_query or None
 
         query_plan: Optional[QueryPlan] = None
         if query is not None:
-            query_plan = db.resolve_query_plan(query, conn=conn)
+            query_plan = resolve_query_plan(query, conn=conn, category=category_norm)
+            if query_plan.price_max is not None and (price_max_norm is None or query_plan.price_max < price_max_norm):
+                price_max_norm = query_plan.price_max
+                price_max_source = "query"
 
         # Natural-language queries often name the category in the head term
         # ("battery to power an arduino"). Infer the category only when the
@@ -1866,10 +1409,10 @@ def count_components(
             and not norm_filters
             and query_plan is not None
             and query_plan.resolved
-            and query_plan.head_token
+            and (query_plan.head_token or query_plan.inferred_category)
         ):
             inferred_category, _ = resolve_category(
-                query_plan.head_token, _valid_categories(conn)
+                query_plan.inferred_category or query_plan.head_token, _populated_categories(conn)
             )
             if inferred_category:
                 category_norm = inferred_category
@@ -1900,6 +1443,7 @@ def count_components(
                     "message": "Filter matched 0 catalog rows; see data.suggestions for the closest populated values."
                 })
             return make_response(
+                query_plan=query_plan,
                 data={
                     "count": 0,
                     "suggestions": suggestions,
@@ -1935,14 +1479,16 @@ def count_components(
                 },
             )
 
-        count_sql, params, _, _ = _build_sql_query(
+        count_sql, params, _, _ = build_catalog_statements(
             norm_filters or {},
             catalog_specs,
+            query_plan=query_plan,
             fts_tokens=(query_plan.effective_tokens if query_plan else None),
             fts_relaxed=(query_plan.is_relaxed if query_plan else False),
             price_max=price_max_norm,
             in_stock_only=in_stock_only,
             category=category_norm,
+            include_related=include_related,
             require_spec_scope=require_spec_scope,
             alias_filters=alias_filters,
             hybrid_vendor=bool(include_vendor_specs),
@@ -1983,31 +1529,23 @@ def count_components(
             vendor_filters=norm_vendor_filters,
             vendor_specs_meta=vendor_meta,
             include_vendor_specs=include_vendor_specs,
+            include_related=include_related,
         )
         warnings.extend(recall_warnings)
 
         suggestions: List[Dict[str, Any]] = []
         diagnosis: Optional[Dict[str, Any]] = None
         if total_count == 0:
-            individual_counts: List[int] = []
-            for only_key, only_value in (requested_filters or {}).items():
-                only_sql, only_params, _, _ = _build_sql_query(
-                    {only_key: only_value},
-                    catalog_specs,
-                    fts_tokens=(query_plan.effective_tokens if query_plan else None),
-                    fts_relaxed=(query_plan.is_relaxed if query_plan else False),
-                    price_max=price_max_norm,
-                    in_stock_only=in_stock_only,
-                    category=category_norm,
-                    require_spec_scope=require_spec_scope,
-                )
-                cur.execute(only_sql, only_params)
-                individual_counts.append(int(cur.fetchone()[0]))
-            zero_keys = {
-                key: value for (key, value), count in zip(
-                    (requested_filters or {}).items(), individual_counts
-                ) if count == 0
-            }
+            base_sql, base_params, predicates = _constraint_scope(
+                conn, catalog_specs, norm_filters or {}, query_plan, price_max_norm,
+                in_stock_only, category_norm, _category_spec_keys(conn, category_norm) if category_norm else None, require_spec_scope,
+                alias_filters, norm_vendor_filters, vendor_meta, include_vendor_specs,
+                include_related, "relevance", None,
+            )
+            per_constraint_counts = individual_match_counts(conn, base_sql, base_params, predicates)
+            individual_counts = list(per_constraint_counts.values())
+            zero_keys = {key: value for key, value in (requested_filters or {}).items()
+                         if per_constraint_counts.get(key) == 0}
             if zero_keys:
                 suggestions.extend(
                     _enum_filter_suggestions(
@@ -2038,9 +1576,10 @@ def count_components(
             warnings.extend(query_plan.warnings)
             _scoped_query_warning(warnings, total_count)
         if category_source == "query_head" and category_norm:
-            unscoped_sql, unscoped_params, _, _ = _build_sql_query(
+            unscoped_sql, unscoped_params, _, _ = build_catalog_statements(
                 norm_filters or {},
                 catalog_specs,
+                query_plan=query_plan,
                 fts_tokens=(query_plan.effective_tokens if query_plan else None),
                 fts_relaxed=(query_plan.is_relaxed if query_plan else False),
                 price_max=price_max_norm,
@@ -2077,10 +1616,12 @@ def count_components(
             ),
             "filter_mode": "hybrid" if include_vendor_specs else "promoted",
             "include_vendor_specs": bool(include_vendor_specs),
+            "include_related": bool(include_related),
+            "identity_policy": "discovery" if include_related else "component_when_modeled",
             "query_status": _query_status(query_plan),
             "match_mode": query_plan.match_mode if query_plan else "all_terms",
             "price_zero_excluded": False,
-            "price_zero_policy": "count_includes_zero_price_rows; price-sorted search excludes them",
+            "price_zero_policy": "zero_price_rows_included_in_all_sort_orders",
         }
         if tier_routes:
             filters_applied["filter_routed_to_vendor"] = tier_routes
@@ -2092,14 +1633,17 @@ def count_components(
             per_key_counts: Dict[str, int] = {}
             for entry in alias_filters:
                 for key in entry.get("keys") or []:
-                    key_sql, key_params, _, _ = _build_sql_query(
+                    key_sql, key_params, _, _ = build_catalog_statements(
                         {key: entry.get("value")},
                         catalog_specs,
+                        query_plan=query_plan,
                         fts_tokens=(query_plan.effective_tokens if query_plan else None),
                         fts_relaxed=(query_plan.is_relaxed if query_plan else False),
                         price_max=price_max_norm,
                         in_stock_only=in_stock_only,
-                        category=None,
+                        category=category_norm,
+                        include_related=include_related,
+                        hybrid_vendor=bool(include_vendor_specs),
                         require_spec_scope=False,
                     )
                     cur.execute(key_sql, key_params)
@@ -2122,6 +1666,7 @@ def count_components(
             conn, vendor_meta, category_norm, category_total, total_products
         )
         return make_response(
+            query_plan=query_plan,
             data={
                 "count": total_count,
                 "suggestions": suggestions,
@@ -2181,8 +1726,14 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
     description table/list (tolerance, package, dielectric, dimensions, ...). It is the
     layer to use for fit questions when the taxonomy has no filter for that field.
 
+    Related vendor_offers retain individual listing IDs and grouping reasons. A
+    shared extracted MPN alone does not prove interchangeability; compare prices
+    only when price_comparable is true and inspect comparison_reasons otherwise.
+
     Behavior When No Matches: Returns ok:false with error_code='product_not_found' if the product ID does not exist in the catalog.
     """
+    if isinstance(product_id, bool) or not isinstance(product_id, int) or not 0 < product_id <= 2**63 - 1:
+        return make_error(error_code="invalid_filter_value", message="product_id must be a positive SQLite integer ID.")
     conn = get_db()
     try:
         cur = conn.cursor()
@@ -2247,6 +1798,8 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
             }
             for o in offer_rows
         ]
+        for offer in offers:
+            offer.update(comparison_evidence(p, offer))
 
         # Extracted specs
         cur.execute("""
@@ -2265,6 +1818,7 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
                 "confidence": r[4],
                 "evidence": r[5]
             }
+            extracted_specs[k]["subject"] = spec_subject(p["title"], p.get("category_canonical") or "", k)
             spec_extraction_method[k] = "regex" if r[6] == "rule" else r[6]
 
         raw_meta = json.loads(p["raw_json"]) if p.get("raw_json") else {}
@@ -2305,6 +1859,8 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
             "FROM product_vendor_specs WHERE product_id = ? ORDER BY key;",
             (product_id,),
         ).fetchall():
+            if not vendor_alias_is_current(p.get("category_canonical"), vr[0], vr[5], vr[7]):
+                continue
             normalized_vendor_specs[str(vr[0])] = vr[1]
             normalized_vendor_details[str(vr[0])] = {
                 "value": vr[1],
@@ -2315,11 +1871,26 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
                 "confidence": vr[6],
                 "source": vr[7],
                 "tier": "vendor",
+                "subject": spec_subject(p["title"], p.get("category_canonical") or "", str(vr[0])),
             }
+
+        spec_sources = {key: "promoted" for key in extracted_specs}
+        for key, detail in normalized_vendor_details.items():
+            target = (VENDOR_KEY_ALIASES.get(p.get("category_canonical") or "") or {}).get(key, key)
+            if target != key:
+                continue
+            if key not in extracted_specs:
+                extracted_specs[key] = detail
+                spec_sources[key] = "vendor"
+        if refresh_info is None:
+            refresh_info = PriceStockRefreshInfo(status="skipped", cached_products=len(offers),
+                                                message="Live refresh was not requested; serving cached values.")
 
         data = {
             "product_id": p["id"],
             "title": p["title"],
+            "product_role": classify_role(p["title"], p.get("category_canonical") or ""),
+            "product_identity": identify_product(p["title"], p.get("category_canonical") or "").to_dict(),
             "normalized_title": p.get("normalized_title"),
             "mpn": p.get("mpn"),
             "sku": p.get("sku"),
@@ -2342,13 +1913,18 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
                     "rather than a fabricated date."
                 )
             },
-            "specs": {key: str(value["value"]) for key, value in extracted_specs.items()},
+            "specs": {key: str(value["value"]) for key, value in extracted_specs.items() if value["subject"] == "sold_item"},
+            "related_specs": {key: str(value["value"]) for key, value in extracted_specs.items() if value["subject"] != "sold_item"},
             "spec_details": extracted_specs,
+            "spec_sources": {key: source for key, source in spec_sources.items() if extracted_specs[key]["subject"] == "sold_item"},
+            "spec_subjects": {key: detail["subject"] for key, detail in extracted_specs.items()},
             "extracted_specs": extracted_specs,
             "vendor_specs": vendor_specs,
             "vendor_spec_count": len(vendor_specs),
             "normalized_vendor_specs": normalized_vendor_specs,
+            "available_vendor_spec_keys": sorted(normalized_vendor_specs),
             "normalized_vendor_details": normalized_vendor_details,
+            "vendor_spec_details": normalized_vendor_details,
             "specs_not_extracted": specs_not_extracted,
             "spec_extraction_method": spec_extraction_method,
             "vendor_offers": offers,
@@ -2378,6 +1954,8 @@ def search_components(
     compact: bool = False,
     vendor_filters: Optional[Dict[str, Any]] = None,
     include_vendor_specs: bool = True,
+    include_related: bool = False,
+    include_partial_candidates: bool = False,
 ) -> ToolResponseEnvelope:
     """
     Search electronic components by parametric spec filters and/or full-text query with side-by-side vendor offers and cursor pagination.
@@ -2402,11 +1980,22 @@ def search_components(
       - compact: bool (default: false; return only product_id/title/vendor/price/currency/
         stock_status/mpn/specs/product_url per row, keeping 50 rows under 25 KB)
 
-    Natural-Language Queries: phrases like "battery to power an arduino for 8 hours" are
-    understood: filler words are dropped, an all-terms match is relaxed to an any-term match
-    when nothing matches, and close spellings are corrected from the catalog vocabulary.
-    Check filters_applied.query_effective and warnings (query_relaxed, query_spelling_corrected)
-    to see exactly what was searched.
+    Identity: modeled families require sold-item identity evidence. include_related=True
+    browses the broad category; product_identity and spec_subjects disclose what each
+    listing sells and which entity its attributes describe. Title rules are evidence,
+    not independent verification. describe_catalog.identity_policy lists modeled families.
+
+    Natural-Language Queries: runtime requirements (e.g. "power an Arduino for 8 hours")
+    are preserved in data.unresolved_constraints separately from retrieval terms.
+    requirements_verified=False means the results cannot establish the application fit.
+    Required terms are never dropped or switched to any-term matching. Only
+    missing generic category words may be corrected automatically. Identity
+    changes are suggestions requiring a new request, never confirmed results.
+
+    Partial Discovery: include_partial_candidates=True optionally returns a separate
+    data.partial_candidates section when strict compound filters match nothing. Candidates
+    satisfy at least one constraint, have unknown constraints, and explicitly fail none.
+    They never contribute to total_matches, returned, or pagination.
 
     Rows Are Listings: each result is one vendor listing, so the same physical part may appear
     once per vendor. Compare on mpn/specs instead of assuming one row per part.
@@ -2519,63 +2108,23 @@ def search_components(
         if category_err:
             return category_err
         category_keys = _category_spec_keys(conn, category_norm) if category_norm else []
-        coercions: List[Dict[str, Any]] = []
-        promoted_input, auto_vendor, tier_routes = _split_filter_tiers(
-            filters, catalog_specs, conn, category_norm, category_keys,
-            allow_vendor=include_vendor_specs,
-        )
-        explicit_vendor = {
-            normalize_vendor_key(k): v for k, v in (vendor_filters or {}).items()
-        }
-        requested_vendor_input = {**auto_vendor, **explicit_vendor}
-        vendor_meta = _load_vendor_filter_meta(
-            conn, requested_vendor_input, category_norm
-        )
-        missing_vendor_keys = [
-            k for k in requested_vendor_input if k not in vendor_meta
-        ]
-        if missing_vendor_keys:
-            return make_error(
-                error_code="unknown_filter_key",
-                message=(
-                    f"Unknown vendor filter key(s) {missing_vendor_keys}. "
-                    "Use describe_spec(key=..., vendor=True) to inspect vendor attributes."
-                ),
-                valid_keys=sorted(vendor_meta.keys())[:50],
-                suggestions=[{"key": k} for k in missing_vendor_keys[:3]],
-                details={"tier": "vendor", "provided_keys": missing_vendor_keys},
+        try:
+            filter_plan = prepare_filters(
+                conn, filters, metadata=catalog_specs, category=category_norm,
+                category_keys=category_keys, vendor_filters=vendor_filters,
+                include_vendor_specs=include_vendor_specs,
             )
-        norm_vendor_filters, vendor_err = _parse_vendor_filters(
-            requested_vendor_input, vendor_meta
-        )
-        if vendor_err:
-            return vendor_err
-        norm_vendor_filters = norm_vendor_filters or {}
-        routed_filters, alias_applied = _route_filter_aliases(
-            promoted_input, catalog_specs, category_norm, category_keys
-        )
-        norm_filters, err = _parse_and_validate_filters(
-            routed_filters, catalog_specs, category=category_norm, coercions=coercions
-        )
-        if err:
-            return err
-        requested_filters = dict(norm_filters or {})
-        if category_norm:
-            alias_filters: List[Dict[str, Any]] = []
-            alias_disclosed: Dict[str, List[str]] = {}
-        else:
-            norm_filters, alias_filters, alias_disclosed = _expand_unscoped_aliases(
-                norm_filters or {}, catalog_specs
-            )
-        scope_error = validate_filter_scope(norm_filters or {}, category_norm, category_keys)
-        if scope_error:
-            return make_error(
-                error_code=scope_error["error_code"],
-                message=scope_error["message"],
-                suggestions=scope_error.get("suggestions"),
-                details=scope_error.get("details"),
-                diagnosis={"reason": scope_error["error_code"], **(scope_error.get("details") or {})},
-            )
+        except FilterPlanError as exc:
+            return make_error(**exc.error)
+        coercions = filter_plan.coercions
+        norm_filters = filter_plan.filters
+        requested_filters = filter_plan.requested_filters
+        norm_vendor_filters = filter_plan.vendor_filters
+        vendor_meta = filter_plan.vendor_metadata
+        alias_filters = filter_plan.aliases
+        alias_disclosed = filter_plan.alias_disclosed
+        alias_applied = filter_plan.alias_routes
+        tier_routes = filter_plan.tier_routes
 
         require_spec_scope = bool(category_keys)
 
@@ -2586,17 +2135,14 @@ def search_components(
         query_original = (query or "").strip() or None
         price_max_source = "argument" if price_max_norm is not None else None
         category_source = "argument" if category_norm else None
-        if query is not None:
-            cleaned_query, _price_min, query_price_max = parse_price_constraints(str(query))
-            if price_max_norm is None and query_price_max is not None:
-                price_max_norm = query_price_max
-                price_max_source = "query"
-            query = cleaned_query or None
 
-        # --- query understanding: stop words, typo correction, AND -> OR relaxation ---
+        # --- shared identity-preserving text and engineering query plan ---
         query_plan: Optional[QueryPlan] = None
         if query is not None:
-            query_plan = db.resolve_query_plan(query, conn=conn)
+            query_plan = resolve_query_plan(query, conn=conn, category=category_norm)
+            if query_plan.price_max is not None and (price_max_norm is None or query_plan.price_max < price_max_norm):
+                price_max_norm = query_plan.price_max
+                price_max_source = "query"
         effective_query = query_plan.effective_query if query_plan else (query or "").strip()
         head_token = (
             effective_query
@@ -2611,10 +2157,10 @@ def search_components(
             and not norm_filters
             and query_plan is not None
             and query_plan.resolved
-            and query_plan.head_token
+            and (query_plan.head_token or query_plan.inferred_category)
         ):
             inferred_category, _ = resolve_category(
-                query_plan.head_token, _valid_categories(conn)
+                query_plan.inferred_category or query_plan.head_token, _populated_categories(conn)
             )
             if inferred_category:
                 category_norm = inferred_category
@@ -2625,12 +2171,14 @@ def search_components(
         # --- cursor is bound to the query that produced it ---
         fingerprint = _query_fingerprint(
             requested_filters,
-            effective_query,
+            query_original,
             price_max_norm,
             in_stock_only,
             sort,
             category_norm,
             vendor_filters=norm_vendor_filters,
+            include_related=include_related,
+            include_vendor_specs=include_vendor_specs,
         )
         offset = 0
         if cursor:
@@ -2672,18 +2220,16 @@ def search_components(
             "filter_support": _category_filter_support(conn, category_norm),
             "filter_mode": "hybrid" if include_vendor_specs else "promoted",
             "include_vendor_specs": bool(include_vendor_specs),
+            "include_related": bool(include_related),
+            "identity_policy": "discovery" if include_related else "component_when_modeled",
             "sort": sort,
             "sort_source": "query_intent" if sort_inferred else "argument",
             "limit": effective_limit,
             "offset": offset,
             "refresh": bool(refresh),
             "force_refresh": bool(force_refresh),
-            "price_zero_excluded": sort in ("price_asc", "price_desc"),
-            "price_zero_policy": (
-                "price-sorted search excludes zero-price quote rows"
-                if sort in ("price_asc", "price_desc")
-                else "relevance search may include zero-price quote rows"
-            ),
+            "price_zero_excluded": False,
+            "price_zero_policy": "zero_price_rows_included_in_all_sort_orders",
             "filter_scope": "extracted_only" if (norm_filters or alias_filters or norm_vendor_filters) else "all_products",
         }
         if tier_routes:
@@ -2717,6 +2263,7 @@ def search_components(
                     "message": "Filter value matched 0 catalog rows; see data.suggestions for the closest populated values."
                 })
             return make_response(
+                query_plan=query_plan,
                 data={
                     "items": [],
                     "results": [],
@@ -2754,14 +2301,16 @@ def search_components(
             )
 
         active_category_keys = _category_spec_keys(conn, category_norm) if category_norm else None
-        count_sql, count_params, select_sql, select_params = _build_sql_query(
+        count_sql, count_params, select_sql, select_params = build_catalog_statements(
             norm_filters or {},
             catalog_specs,
+            query_plan=query_plan,
             fts_tokens=(query_plan.effective_tokens if query_plan else None),
             fts_relaxed=(query_plan.is_relaxed if query_plan else False),
             price_max=price_max_norm,
             in_stock_only=in_stock_only,
             category=category_norm,
+            include_related=include_related,
             category_spec_keys=active_category_keys,
             require_spec_scope=require_spec_scope,
             sort=sort,
@@ -2792,6 +2341,8 @@ def search_components(
             vendor_filters=norm_vendor_filters,
             vendor_specs_meta=vendor_meta,
             include_vendor_specs=include_vendor_specs,
+            include_related=include_related,
+            sort=sort, head_token=head_token,
         )
         warnings.extend(recall_warnings)
 
@@ -2819,9 +2370,10 @@ def search_components(
             warnings.extend(query_plan.warnings)
             _scoped_query_warning(warnings, total_matches)
         if category_source == "query_head" and category_norm:
-            unscoped_sql, unscoped_params, _, _ = _build_sql_query(
+            unscoped_sql, unscoped_params, _, _ = build_catalog_statements(
                 norm_filters or {},
                 catalog_specs,
+                query_plan=query_plan,
                 fts_tokens=(query_plan.effective_tokens if query_plan else None),
                 fts_relaxed=(query_plan.is_relaxed if query_plan else False),
                 price_max=price_max_norm,
@@ -2843,25 +2395,16 @@ def search_components(
 
         if total_matches == 0:
             suggestions: List[Dict[str, Any]] = []
-            individual_counts: List[int] = []
-            for only_key, only_value in (requested_filters or {}).items():
-                only_sql, only_params, _, _ = _build_sql_query(
-                    {only_key: only_value},
-                    catalog_specs,
-                    fts_tokens=(query_plan.effective_tokens if query_plan else None),
-                    fts_relaxed=(query_plan.is_relaxed if query_plan else False),
-                    price_max=price_max_norm,
-                    in_stock_only=in_stock_only,
-                    category=category_norm,
-                    require_spec_scope=require_spec_scope,
-                )
-                cur.execute(only_sql, only_params)
-                individual_counts.append(int(cur.fetchone()[0]))
-            zero_keys = {
-                key: value for (key, value), count in zip(
-                    (requested_filters or {}).items(), individual_counts
-                ) if count == 0
-            }
+            base_sql, base_params, predicates = _constraint_scope(
+                conn, catalog_specs, norm_filters or {}, query_plan, price_max_norm,
+                in_stock_only, category_norm, _category_spec_keys(conn, category_norm) if category_norm else None, require_spec_scope,
+                alias_filters, norm_vendor_filters, vendor_meta, include_vendor_specs,
+                include_related, sort, head_token,
+            )
+            per_constraint_counts = individual_match_counts(conn, base_sql, base_params, predicates)
+            individual_counts = list(per_constraint_counts.values())
+            zero_keys = {key: value for key, value in (requested_filters or {}).items()
+                         if per_constraint_counts.get(key) == 0}
             if zero_keys:
                 suggestions.extend(
                     _enum_filter_suggestions(
@@ -2902,6 +2445,17 @@ def search_components(
                 "vendor_coverage": vendor_cov,
                 "vendor_filters": norm_vendor_filters,
             }
+            if include_partial_candidates:
+                base_sql, base_params, predicates = _constraint_scope(
+                    conn, catalog_specs, norm_filters or {}, query_plan, price_max_norm,
+                    in_stock_only, category_norm, active_category_keys, require_spec_scope,
+                    alias_filters, norm_vendor_filters, vendor_meta, include_vendor_specs,
+                    include_related, sort, head_token,
+                )
+                zero_data["confirmed_matches"] = []
+                zero_data["partial_candidates"] = discover_candidates(
+                    conn, base_sql, base_params, predicates, effective_limit,
+                )
             if query_plan is not None and query_plan.suggestions:
                 zero_data["query_suggestions"] = query_plan.suggestions
             if alias_applied:
@@ -2912,6 +2466,7 @@ def search_components(
             if coerced:
                 filters_applied["filter_value_coerced"] = coerced
             return make_response(
+                query_plan=query_plan,
                 data=zero_data,
                 total_matches=0,
                 returned=0,
@@ -2935,20 +2490,27 @@ def search_components(
             and sort == "relevance"
         )
         if rank_mode:
-            pool_limit = min(1000, max(400, offset + effective_limit + 200))
-            _, _, rank_sql, rank_params = _build_sql_query(
+            # Fixed SQL windows give pagination a stable ordering without
+            # loading/ranking the entire catalog on every page. A window's
+            # membership never changes with page size or cursor offset.
+            rank_window = 400
+            pool_offset = (offset // rank_window) * rank_window
+            pool_limit = (((offset + effective_limit - 1) // rank_window) + 1) * rank_window - pool_offset
+            _, _, rank_sql, rank_params = build_catalog_statements(
                 norm_filters or {},
                 catalog_specs,
+                query_plan=query_plan,
                 fts_tokens=query_plan.effective_tokens,
                 fts_relaxed=query_plan.is_relaxed,
                 price_max=price_max_norm,
                 in_stock_only=in_stock_only,
                 category=category_norm,
+                include_related=include_related,
                 category_spec_keys=active_category_keys,
                 require_spec_scope=require_spec_scope,
                 sort=sort,
                 limit=pool_limit,
-                offset=0,
+                offset=pool_offset,
                 head_token=head_token,
                 alias_filters=alias_filters,
                 hybrid_vendor=bool(include_vendor_specs),
@@ -2958,24 +2520,27 @@ def search_components(
             cur.execute(rank_sql, rank_params)
             candidate_rows = cur.fetchall()
             candidate_products = [db.row_to_unified_product(r) for r in candidate_rows]
-            bonus = _category_spec_bonus(
+            bonus = category_spec_bonus(
                 conn,
                 [p.id for p in candidate_products if p.id is not None],
                 active_category_keys,
             )
             if norm_filters or norm_vendor_filters:
                 ids_for_bonus = [p.id for p in candidate_products if p.id is not None]
-                completeness = _spec_completeness_bonus(conn, ids_for_bonus)
+                completeness = spec_completeness_bonus(conn, ids_for_bonus)
                 bonus = {
                     pid: bonus.get(pid, 0.0) + completeness.get(pid, 0.0)
                     for pid in set(bonus) | set(completeness)
                 }
-            ranked = rank_products(
-                candidate_products,
-                effective_query,
-                bonus_by_id=bonus or None,
-            )
-            page_products = ranked[offset:offset + effective_limit]
+            ranked = []
+            for window_start in range(0, len(candidate_products), rank_window):
+                ranked.extend(rank_products(
+                    candidate_products[window_start:window_start + rank_window],
+                    query_original or effective_query, bonus_by_id=bonus or None,
+                    preferences=query_plan.preference_tokens,
+                ))
+            relative_offset = offset - pool_offset
+            page_products = ranked[relative_offset:relative_offset + effective_limit]
             row_by_id = {r["id"]: r for r in candidate_rows}
             rows = [
                 row_by_id[p.id] for p in page_products
@@ -3007,77 +2572,40 @@ def search_components(
 
         ids = [r["id"] for r in rows]
         attribute_counts = db.get_attribute_counts(ids)
-        result_spec_counts: Dict[str, int] = {}
-        if ids:
-            placeholders = ", ".join(["?"] * len(ids))
-            cur.execute(
-                f"SELECT key, COUNT(1) FROM product_specs WHERE product_id IN ({placeholders}) GROUP BY key;",
-                ids
-            )
-            for spec_key, spec_count in cur.fetchall():
-                result_spec_counts[spec_key] = spec_count
-        for group, keys in (alias_disclosed or {}).items():
-            result_spec_counts[group] = sum(result_spec_counts.get(k, 0) for k in keys)
-
-        vendor_keys_for_page = sorted(
-            set((norm_vendor_filters or {}).keys())
-            | set((requested_filters or {}).keys())
-        )
         vendor_specs_by_product: Dict[int, Dict[str, Any]] = {}
-        if ids and vendor_keys_for_page:
+        vendor_details_by_product: Dict[int, Dict[str, Any]] = {}
+        categories_by_id = {int(row["id"]): row["category_canonical"] for row in rows}
+        if ids and include_vendor_specs:
             id_ph = ", ".join(["?"] * len(ids))
-            key_ph = ", ".join(["?"] * len(vendor_keys_for_page))
             cur.execute(
-                f"SELECT product_id, key, value FROM product_vendor_specs "
-                f"WHERE product_id IN ({id_ph}) AND key IN ({key_ph});",
-                list(ids) + vendor_keys_for_page,
+                f"SELECT product_id, key, value, value_num, value_type, unit, raw_key, confidence, source FROM product_vendor_specs "
+                f"WHERE product_id IN ({id_ph}) ORDER BY product_id, key;",
+                list(ids),
             )
-            for pid, key, value in cur.fetchall():
+            for pid, key, value, number, value_type, unit, raw_key, confidence, source in cur.fetchall():
+                if not vendor_alias_is_current(categories_by_id[int(pid)], key, raw_key, source):
+                    continue
                 vendor_specs_by_product.setdefault(int(pid), {})[str(key)] = value
-        for vk in vendor_keys_for_page:
-            fallback_present = sum(
-                1 for row_vendor in vendor_specs_by_product.values() if vk in row_vendor
-            )
-            result_spec_counts[vk] = max(result_spec_counts.get(vk, 0), fallback_present)
-
-        # Spec presence across the returned page: tells the caller whether a field
-        # is genuinely absent from the part or simply never extracted for it.
-        page_coverage = {
-            k: {
-                "present": result_spec_counts.get(k, 0),
-                "of": len(ids),
-                "pct": round(result_spec_counts.get(k, 0) / max(len(ids), 1) * 100, 1),
-            }
-            for k in all_catalog_keys
-        }
-        for fk, entry in coverage.items():
-            entry["page"] = {
-                "present": result_spec_counts.get(fk, 0),
-                "of": len(ids),
-                "pct": round(result_spec_counts.get(fk, 0) / max(len(ids), 1) * 100, 1),
-            }
-        for vk in (norm_vendor_filters or {}):
-            vendor_present = sum(
-                1 for row_vendor in vendor_specs_by_product.values() if vk in row_vendor
-            )
-            page_coverage[vk] = {
-                "present": vendor_present,
-                "of": len(ids),
-                "pct": round(vendor_present / max(len(ids), 1) * 100, 1),
-                "tier": "vendor",
-            }
-
+                vendor_details_by_product.setdefault(int(pid), {})[str(key)] = {
+                    "value": value, "value_num": number, "type": value_type,
+                    "unit": unit, "raw_key": raw_key, "confidence": confidence,
+                    "source": source, "tier": "vendor",
+                }
         results = []
         category_keys_map = _applicable_spec_keys(conn)
         for r in rows:
             pid = r["id"]
             cur.execute(
-                "SELECT key, value, confidence FROM product_specs WHERE product_id = ?;", (pid,)
+                "SELECT key, value, confidence, source, evidence, value_num, value_type FROM product_specs WHERE product_id = ?;", (pid,)
             )
             specs: Dict[str, Any] = {}
             low_confidence_specs: List[str] = []
-            for spec_key, spec_value, conf in cur.fetchall():
+            spec_details: Dict[str, Any] = {}
+            for spec_key, spec_value, conf, source, evidence, number, value_type in cur.fetchall():
                 specs[spec_key] = spec_value
+                spec_details[spec_key] = {"value": spec_value, "value_num": number,
+                                          "type": value_type, "confidence": conf, "source": source,
+                                          "evidence": evidence, "tier": "promoted"}
                 try:
                     if conf is not None and float(conf) < 1.0:
                         low_confidence_specs.append(spec_key)
@@ -3086,10 +2614,30 @@ def search_components(
 
             vendor_for_row = vendor_specs_by_product.get(pid, {})
             spec_sources = {k: "promoted" for k in specs}
+            visible_requested_keys = set(requested_filters) | set(norm_vendor_filters or {})
+            for group in alias_filters:
+                visible_requested_keys.update(group.get("keys") or [])
+            vendor_key_map = VENDOR_KEY_ALIASES.get(r["category_canonical"] or "") or {}
+            visible_requested_keys.update(vendor_key_map.get(key, key) for key in list(visible_requested_keys))
             for vk, vv in vendor_for_row.items():
+                target = (VENDOR_KEY_ALIASES.get(r["category_canonical"] or "") or {}).get(vk, vk)
+                if target != vk:
+                    continue
+                if compact and vk not in visible_requested_keys:
+                    continue
                 if vk not in specs:
                     specs[vk] = vv
                     spec_sources[vk] = "vendor"
+                    spec_details[vk] = vendor_details_by_product[pid][vk]
+                    if float(spec_details[vk].get("confidence") or 0) < 1.0:
+                        low_confidence_specs.append(vk)
+
+            identity = identify_product(r["title"], r["category_canonical"] or "")
+            subjects = {key: spec_subject(r["title"], r["category_canonical"] or "", key) for key in specs}
+            for key, details in spec_details.items():
+                details["subject"] = subjects[key]
+            related_specs = {key: specs.pop(key) for key in list(specs) if subjects[key] != "sold_item"}
+            spec_sources = {key: value for key, value in spec_sources.items() if key in specs}
 
             row_keys = r.keys()
             row_category = r["spec_category"] if "spec_category" in row_keys else None
@@ -3108,6 +2656,10 @@ def search_components(
             results.append({
                 "product_id": pid,
                 "title": r["title"],
+                "product_role": classify_role(r["title"], r["category_canonical"] or ""),
+                "product_identity": identity.to_dict(),
+                "spec_subjects": subjects,
+                "related_specs": related_specs,
                 "vendor": r["vendor_name"] or r["vendor"],
                 "price": float(r["price"]),
                 "currency": "INR",
@@ -3130,12 +2682,28 @@ def search_components(
                 "product_url": r["product_url"],
                 "specs": specs,
                 "spec_sources": spec_sources,
+                "spec_details": spec_details,
                 "spec_count": len(specs),
                 "vendor_specs": vendor_for_row,
+                "vendor_spec_details": vendor_details_by_product.get(pid, {}),
+                "available_vendor_spec_keys": sorted(vendor_for_row),
                 "vendor_spec_count": attribute_counts.get(pid, 0),
                 "specs_not_extracted": specs_not_extracted,
                 "low_confidence_specs": low_confidence_specs,
             })
+
+        # Page coverage measures serialized sold-item key presence, not raw
+        # rows or a sum of overlapping promoted/vendor/alias populations.
+        coverage_keys = set(all_catalog_keys) | set(norm_vendor_filters or {}) | set(alias_disclosed)
+        page_coverage = {}
+        for key in coverage_keys:
+            equivalent = set(alias_disclosed.get(key, [key]))
+            present = sum(bool(equivalent.intersection(row["specs"])) for row in results)
+            page_coverage[key] = {"present": present, "of": len(results),
+                                  "pct": round(present / max(len(results), 1) * 100, 1),
+                                  "measure": "sold_item_key_presence"}
+        for key, entry in coverage.items():
+            entry["page"] = page_coverage.get(key, {"present": 0, "of": len(results), "pct": 0.0})
 
         if compact:
             compact_keys = (
@@ -3196,14 +2764,17 @@ def search_components(
             per_key_counts: Dict[str, int] = {}
             for entry in alias_filters:
                 for key in entry.get("keys") or []:
-                    key_sql, key_params, _, _ = _build_sql_query(
+                    key_sql, key_params, _, _ = build_catalog_statements(
                         {key: entry.get("value")},
                         catalog_specs,
+                        query_plan=query_plan,
                         fts_tokens=(query_plan.effective_tokens if query_plan else None),
                         fts_relaxed=(query_plan.is_relaxed if query_plan else False),
                         price_max=price_max_norm,
                         in_stock_only=in_stock_only,
-                        category=None,
+                        category=category_norm,
+                        include_related=include_related,
+                        hybrid_vendor=bool(include_vendor_specs),
                         require_spec_scope=False,
                     )
                     cur.execute(key_sql, key_params)
@@ -3248,6 +2819,7 @@ def search_components(
             }
 
         return make_response(
+            query_plan=query_plan,
             data=data_payload,
             total_matches=total_matches,
             returned=returned,
@@ -3370,6 +2942,11 @@ def health() -> ToolResponseEnvelope:
         except Exception:  # noqa: BLE001
             dependency_versions = {"python": sys.version.split()[0]}
 
+        product_count = int(cur.execute("SELECT COUNT(*) FROM products").fetchone()[0])
+        spec_product_count = int(cur.execute(
+            "SELECT COUNT(DISTINCT ps.product_id) FROM product_specs ps JOIN products p ON p.id = ps.product_id"
+        ).fetchone()[0])
+        spec_row_count = int(cur.execute("SELECT COUNT(*) FROM product_specs").fetchone()[0])
         data = {
             "status": "ok" if integrity == "ok" else "degraded",
             "db_path": str(getattr(getattr(db, "settings", None), "db_path", "unknown")),
@@ -3383,10 +2960,11 @@ def health() -> ToolResponseEnvelope:
                 "SELECT MAX(updated_at) FROM spec_stats_global;"
             ).fetchone()[0],
             "spec_backfill_pct": round(
-                (cur.execute("SELECT COUNT(1) FROM product_specs;").fetchone()[0] or 0)
-                / max(cur.execute("SELECT COUNT(1) FROM products;").fetchone()[0] or 1, 1)
-                * 100, 2
+                spec_product_count / max(product_count, 1) * 100, 2
             ),
+            "spec_coverage": {"present": spec_product_count, "of": product_count,
+                              "unit": "products", "definition": "Products with at least one promoted specification"},
+            "spec_rows_per_product": round(spec_row_count / max(product_count, 1), 4),
             "spec_backfill_pct_by_key": {
                 str(row[0]): round(
                     float(row[1] or 0)
@@ -3438,8 +3016,10 @@ def search_by_mpn(
       - allow_ambiguous: bool (default: false; return listings even when the "MPN" is a family
         token or is shared by dozens of unrelated titles, with an mpn_ambiguous warning)
 
-    Matching: 'MPU6050', 'mpu-6050' and 'MPU 6050' resolve to the same listings; each listing
-    carries its extracted specs so fit questions can be answered without a second call.
+    Matching: separators and case are ignored. 'MPU6050', 'mpu-6050' and 'MPU 6050'
+    have the same identity decision; this mixed chip/module identifier needs
+    allow_ambiguous=True for broad listing inspection. Related accessories are
+    excluded by default. Each returned listing carries its sold form and specs.
 
     Ambiguity: family tokens (ESP32, ESP8266, STM32, ...) are not part numbers. When one MPN
     value maps to dozens of distinct titles, the tool returns error_code='mpn_family_token' or
@@ -3456,14 +3036,14 @@ def search_by_mpn(
     mpn_ambiguous (one identifier shared by dozens of distinct titles), stale_cursor,
     invalid_filter_value.
 
-    Example Invocation: search_by_mpn(mpn="RMCS-2077")
+    Example Invocation: search_by_mpn(mpn="MY1016ZL")
     """
     needle = (mpn or "").strip()
     if not needle:
         return make_error(
             error_code="invalid_filter_value",
             message="mpn must be a non-empty string.",
-            suggestions=[{"mpn": "RMCS-2077"}]
+            suggestions=[{"mpn": "MY1016ZL"}]
         )
 
     try:
@@ -3510,7 +3090,7 @@ def search_by_mpn(
             },
         )
 
-    fingerprint = _query_fingerprint({"mpn": normalized}, None, None, False, "relevance")
+    fingerprint = _query_fingerprint({"mpn": normalized, "allow_ambiguous": allow_ambiguous}, None, None, False, "relevance")
 
     offset = 0
     if cursor:
@@ -3539,7 +3119,21 @@ def search_by_mpn(
 
     conn = get_db()
     try:
-        rows, total = db.find_products_by_mpn(needle, limit=effective_limit, offset=offset)
+        all_rows, raw_total = db.find_products_by_mpn(needle, limit=1_000_000, offset=0)
+        eligible_rows = all_rows if allow_ambiguous else [r for r in all_rows if sold_form(r["title"]) not in {"accessory", "enclosure", "bundle", "charger"}]
+        forms = {}
+        for r in eligible_rows:
+            forms.setdefault(sold_form(r["title"]), []).append(int(r["id"]))
+        if len(set(forms) - {"unknown"}) > 1 and not allow_ambiguous:
+            return make_error(error_code="mpn_ambiguous",
+                              message="This identifier is shared by different sold forms; select a listing or use allow_ambiguous=True to inspect them.",
+                              details={"sold_forms": forms, "raw_matches": raw_total},
+                              suggestions=[{"allow_ambiguous": True}, {"tool": "search_components", "query": needle}])
+        total = len(eligible_rows)
+        rows = eligible_rows[offset:offset + effective_limit]
+        if total != raw_total:
+            warnings.append({"code": "mpn_related_listings_excluded", "excluded": raw_total - total,
+                             "message": "Accessory, enclosure, charger and kit listings are excluded from exact lookup."})
 
         mpn_stats = db.mpn_match_stats(needle)
         ambiguous = bool(
@@ -3596,7 +3190,9 @@ def search_by_mpn(
                 force=force_refresh,
             )
             if refresh_info.attempted and refresh_info.refreshed_products > 0:
-                rows, total = db.find_products_by_mpn(needle, limit=effective_limit, offset=offset)
+                refreshed, _ = db.find_products_by_mpn(needle, limit=1_000_000, offset=0)
+                selected_ids = {int(r["id"]) for r in rows}
+                rows = [r for r in refreshed if int(r["id"]) in selected_ids]
 
         # Extracted specs for the page: lets an agent answer "will this fit?" in one call.
         specs_by_product: Dict[int, Dict[str, str]] = {}
@@ -3633,6 +3229,16 @@ def search_by_mpn(
             }
             for r in rows
         ]
+        for listing in listings:
+            title = listing["title"]
+            identity = identify_product(title)
+            listing["product_role"] = classify_role(title)
+            listing["product_identity"] = identity.to_dict()
+            listing["sold_form"] = sold_form(title)
+            subjects = {key: spec_subject(title, "", key) for key in listing["specs"]}
+            listing["spec_subjects"] = subjects
+            listing["related_specs"] = {key: value for key, value in listing["specs"].items() if subjects[key] != "sold_item"}
+            listing["specs"] = {key: value for key, value in listing["specs"].items() if subjects[key] == "sold_item"}
 
         suggested_mpns: List[str] = []
         diagnosis: Optional[Dict[str, Any]] = None

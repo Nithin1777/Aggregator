@@ -727,6 +727,10 @@ def check_hardware_conflict(
     7. Multi-component Kit vs Kit & Accessory vs Accessory token similarity.
     8. Extreme Price Gap Veto.
     """
+    from src.search.listing_identity import listing_role_conflict
+    identity_conflict = listing_role_conflict(title_a, title_b)
+    if identity_conflict:
+        return True, f"Product form mismatch: {identity_conflict}"
     # 1. Board model conflict (general field across all microcontroller ecosystems)
     bm_a = specs_a.get("board_model")
     bm_b = specs_b.get("board_model")

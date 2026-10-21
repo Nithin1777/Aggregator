@@ -4,17 +4,18 @@ Shared text-query understanding for catalog search.
 Both the web/API retrieval path (`db.search_products`) and the MCP server
 (`mcp_server.server`) must treat agent-typed queries the same way:
 
-  "battery to power arduino uno for 8 hours" -> drop stop words, relax AND -> OR
-  "esp32 wromm"                              -> correct to "esp32 wroom"
-  "mpu650"                                   -> suggest "mpu6050"
+  "battery to power arduino uno for 8 hours" -> preserve runtime; retrieve batteries
+  "esp32 wromm"                              -> retain identity; suggest spelling separately
+  "LD06"                                     -> require LD06, never LD016
 
-This module is pure (no DB access). `db.resolve_query_plan` probes the live
-FTS index/vocabulary and produces a `QueryPlan`; the callers then build SQL
-with `strict_fts_expr` / `relaxed_fts_expr` / `fts_variations`.
+This module is pure (no DB access). `src.search.planner.resolve_query_plan` probes the live
+FTS index/vocabulary and produces a `QueryPlan`. Active callers use its exact
+expression and eligibility predicates; prefix/relaxation helpers remain for
+older internal callers only.
 """
 from dataclasses import dataclass, field
 import re
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Articles, prepositions, auxiliaries and generic filler that agents include in
 # natural-language requests. Dropping them lets "the battery for my project"
@@ -113,7 +114,7 @@ def content_tokens(query: Optional[str]) -> Tuple[List[str], List[str]]:
 
 def correctable(token: str) -> bool:
     """Only word-like tokens are spell-corrected ("3.7v"/"7ah" are not)."""
-    return bool(_WORDLIKE.match(token.lower()))
+    return bool(re.fullmatch(r"[a-z]{3,}", token.lower()))
 
 
 def _fts_term(token: str) -> str:
@@ -124,6 +125,7 @@ def _fts_term(token: str) -> str:
     "anything containing 4, 40, 4k, ...", which is how a 1-channel timer relay
     became the top "4 channel relay" result.
     """
+    token = re.sub(r"[\x00-\x1f]", " ", token).replace('"', '""')
     if len(token) <= 2:
         return f'"{token}"'
     return f'"{token}"*'
@@ -132,6 +134,12 @@ def _fts_term(token: str) -> str:
 def strict_fts_expr(tokens: Sequence[str]) -> str:
     """All tokens must match (implicit AND), each as a prefix phrase."""
     return " ".join(_fts_term(t) for t in tokens)
+
+
+def exact_fts_expr(tokens: Sequence[str]) -> str:
+    """All complete tokens, with no prefix expansion or user FTS syntax."""
+    return " AND ".join('"' + re.sub(r'[\x00-\x1f]', ' ', t).replace('"', '""') + '"'
+                        for t in tokens)
 
 
 def relaxed_fts_expr(tokens: Sequence[str]) -> str:
@@ -175,20 +183,24 @@ def fts_variations(tokens: Sequence[str]) -> List[str]:
 # Price constraints embedded in a text query
 # ---------------------------------------------------------------------------
 
-_PRICE_NUM = r"(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+_PRICE_NUM = r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
 _PRICE_CURRENCY = r"(?:(?:₹|rs\.?|inr)\s*)?"
+_NON_PRICE_UNIT = (
+    r"(?:v(?:olts?)?|a(?:mps?)?|w(?:atts?)?|rpm|mah|ah|[unpµμ]f|[munµμ]h|"
+    r"[km]?(?:ohms?|Ω)|kg[ .·-]?cm|g(?:b|bytes?)|hours?|hrs?|minutes?|mins?|seconds?|secs?)\b"
+)
 _PRICE_RANGE_RE = re.compile(
-    rf"{_PRICE_CURRENCY}{_PRICE_NUM}\s*(?:-|–|to)\s*{_PRICE_CURRENCY}{_PRICE_NUM}",
+    rf"(?<!\w)(?:₹|rs\.?|inr)\s*{_PRICE_NUM}\s*(?:-|–|to)\s*{_PRICE_CURRENCY}{_PRICE_NUM}(?![\w.,])",
     re.IGNORECASE,
 )
 _PRICE_MAX_RE = re.compile(
     rf"\b(?:under|below|less\s+than|upto|up\s*to|max(?:imum)?|within)\b\s*"
-    rf"{_PRICE_CURRENCY}{_PRICE_NUM}",
+    rf"{_PRICE_CURRENCY}{_PRICE_NUM}(?![\w.,])(?!(?:\s*){_NON_PRICE_UNIT})",
     re.IGNORECASE,
 )
 _PRICE_MIN_RE = re.compile(
     rf"\b(?:over|above|more\s+than|at\s+least|min(?:imum)?)\b\s*"
-    rf"{_PRICE_CURRENCY}{_PRICE_NUM}",
+    rf"{_PRICE_CURRENCY}{_PRICE_NUM}(?![\w.,])(?!(?:\s*){_NON_PRICE_UNIT})",
     re.IGNORECASE,
 )
 
@@ -207,7 +219,7 @@ def parse_price_constraints(
     Pulls an explicit budget out of free text and returns the remaining query.
 
     "resistor under ₹500" -> ("resistor", None, 500.0)
-    "12v motor 300 to 1200" -> ("12v motor", 300.0, 1200.0)
+    "12v motor ₹300 to 1200" -> ("12v motor", 300.0, 1200.0)
     "esp32 over 300" -> ("esp32", 300.0, None)
 
     Only explicit comparison words/ranges are treated as prices, so a part
@@ -244,15 +256,27 @@ class QueryPlan:
     """Outcome of resolving a user/agent query against the live FTS index."""
 
     original: str = ""
+    query_kind: str = "exploratory"
+    protected_tokens: List[str] = field(default_factory=list)
+    identity_policy: Dict[str, Any] = field(default_factory=dict)
+    inferred_filters: Dict[str, Any] = field(default_factory=dict)
+    predicates: List[Any] = field(default_factory=list)
+    engineering_constraints: List[dict] = field(default_factory=list)
+    preference_tokens: List[str] = field(default_factory=list)
+    expression: Optional[str] = None
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
+    inferred_category: Optional[str] = None
+    unresolved_constraints: List[dict] = field(default_factory=list)
     tokens: List[str] = field(default_factory=list)
     ignored: List[str] = field(default_factory=list)
-    mode: str = "empty"  # empty | strict | corrected | corrected_relaxed | relaxed | unresolved
+    mode: str = "empty"  # active: empty | strict | structured | corrected | unresolved
     effective_tokens: List[str] = field(default_factory=list)
     corrections: Dict[str, str] = field(default_factory=dict)
     suggestions: List[str] = field(default_factory=list)
     warnings: List[Dict[str, object]] = field(default_factory=list)
-    # Tokens removed by progressive relaxation, and whether the final query
-    # requires all remaining tokens or any token.
+    # Legacy compatibility fields. The shared planner never drops required
+    # tokens or emits an any-term expression.
     dropped_tokens: List[str] = field(default_factory=list)
     match_mode: str = "all_terms"  # all_terms | any_terms
     operator_tokens: List[str] = field(default_factory=list)
@@ -269,13 +293,34 @@ class QueryPlan:
 
     @property
     def resolved(self) -> bool:
-        return self.mode in ("strict", "corrected", "relaxed", "corrected_relaxed")
+        return self.mode in ("strict", "structured", "corrected", "relaxed", "corrected_relaxed")
 
     @property
     def simple_expr(self) -> Optional[str]:
         """FTS expression for callers that use one AND/OR expression."""
-        if not self.resolved or not self.effective_tokens:
+        if not self.resolved:
             return None
-        if self.is_relaxed:
+        if self.expression:
+            return self.expression
+        if not self.effective_tokens:
+            return None
+        if self.match_mode == "any_terms":
             return relaxed_fts_expr(self.effective_tokens)
-        return strict_fts_expr(self.effective_tokens)
+        return exact_fts_expr(self.effective_tokens)
+
+    def contract(self) -> Dict[str, Any]:
+        return {
+            "policy_version": "identity_preserving_v1", "query_kind": self.query_kind,
+            "original_query": self.original, "effective_query": self.effective_query,
+            "protected_tokens": self.protected_tokens, "identity_policy": self.identity_policy,
+            "identity_preserved": True, "query_relaxed": self.is_relaxed,
+            "corrections": self.corrections, "preferences": self.preference_tokens,
+            "engineering_constraints": self.engineering_constraints,
+            "evidence_scope": "catalog_claims_not_independent_verification",
+            "unresolved_constraints": self.unresolved_constraints,
+            "price_min": self.price_min, "price_max": self.price_max,
+            "suggestions": self.suggestions,
+            "match_tier": ("corrected_terms" if self.corrections else
+                           "identity_terms" if self.protected_tokens else
+                           "structured_constraints" if self.inferred_filters else "all_terms"),
+        }

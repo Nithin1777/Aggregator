@@ -26,7 +26,7 @@ Built with direct JSON querying (zero HTML scraping required), Cloudflare TLS/JA
 ├── search_service.py     # Parallel federation, comparison clustering, price/stock refresh, and continuable ingestion
 ├── main.py               # Typer CLI dashboard and FastAPI Web Application
 ├── src/
-│   ├── search/query_terms.py  # Shared query understanding (stop words, AND->OR relaxation, typo candidates)
+│   ├── search/query_terms.py  # Shared query models and safe FTS expressions
 │   ├── web/                   # Inline SVG icon pack and render helpers
 │   └── spec/             # Taxonomy loader, product classifier, spec extractor and shared filters
 ├── config/
@@ -185,8 +185,8 @@ Open your browser at **http://localhost:8000**:
 ### Ranking and pagination
 The same ranking pipeline runs for **web search and the MCP `search_components` text path** (`src/search/retrieval.py::rank_products`), so an agent and a browser get the same ordering.
 
-1. **Retrieval order** — SQLite FTS5 BM25 (`ORDER BY rank`), after strict/typo-corrected/relaxed query resolution.
-2. **Listing score** — RRF base (`10 * (1 + 50/(60+position+1))`) plus:
+1. **Retrieval order** — SQLite FTS5 field-weighted BM25, after mandatory-term and identity eligibility.
+2. **Listing score** — reciprocal-position base (`10 * (1 + 50/(60+position+1))`) plus:
    - canonical boost (+25 brand/category, +35 exact MPN, +2 other),
    - gentle length penalty (`1 / (1 + 0.035 * max(0, tokens-5))`),
    - keyword repetition penalty (−4 per repeat),
@@ -302,30 +302,35 @@ The same data is available from `GET /api/status` (`price_stock`) and the MCP `h
 
 Agents (and people) rarely type exact keywords. The same query-understanding pipeline now runs for
 the **MCP tools**, the **web UI**, and `GET /api/search?source=local`, driven by
-`src/search/query_terms.py` and `db.resolve_query_plan()`:
+`src/search/query_terms.py` and `src/search/planner.py`.
+See [search consolidation](docs/search_consolidation.md) for module ownership,
+compatibility boundaries and the remaining differences between search surfaces:
 
-1. **Filler words are dropped** — “battery *to power* an arduino *for* 8 hours” searches
-   `battery power arduino 8 hours`.
-2. **All-terms matching relaxes to any-term matching** when nothing matches everything — results
-   stay BM25-ranked and the response says so (`warnings: [{"code": "query_relaxed"}]`).
-3. **Mistyped words are corrected from the catalog vocabulary** (FTS5 vocabulary table):
-   `esp32 wromm` → `esp32 wroom`, `battry 18650` → `battery 18650`
-   (`warnings: query_spelling_corrected`).
-4. **Nothing resembles the query?** You still get `ok: true` with guidance:
-   `warnings: query_unresolved` plus `data.query_suggestions` — never a bare empty page.
+1. **Recognized application requirements are preserved** — “battery to power an
+   Arduino for 8 hours” keeps runtime and load information as unresolved
+   requirements while retrieving batteries; it does not verify runtime.
+2. **Required terms stay required.** The engine does not automatically drop words,
+   prefix-match product identifiers, or switch to any-term retrieval.
+3. **Generic category typos can be corrected.** Brand/model/variant changes are
+   suggestions requiring a new request. `HOTA D6 Pro` cannot become `hot D6 Pro`;
+   `LD06` cannot prefix-match `LD016`.
+4. **Engineering notation becomes typed constraints when its meaning is clear.**
+   Ambiguous electrical properties remain unresolved instead of being guessed.
+5. **No confirmed match is a normal result.** `retrieval_status` distinguishes
+   `no_exact_match`, `no_match`, `matches`, and `corrected_matches`.
+   `query_contract` records the policy and requirements; `alternatives` is separate.
 
 `filters_applied.query` always echoes what the caller typed; `filters_applied.query_effective`
 shows what was actually searched.
 
 **Booleans and quotes are not silently rewritten.** `esp32 OR esp8266` returns
-`error_code: "unsupported_query_syntax"`; run one query per alternative instead. Lowercase
-`or`/`and` are reported as `query_operator_dropped`.
+`error_code: "unsupported_query_syntax"`; run one query per alternative instead. Issue separate requests for alternatives; natural-language negation remains unresolved unless it can be verified.
 
-**Relaxation is progressive, not all-or-nothing.** When a strict query is empty, generic
-modifiers are dropped before the head term; the response exposes `query_tokens_dropped`,
-`query_status` (`exact`, `relaxed`, `low_confidence`, `unresolved`) and `match_ratio_top`.
-A query that matches only a handful of rows while the head term matches thousands also gets a
-`query_narrowed` warning, so a plausible-looking small count is not mistaken for the full answer.
+**Preferences are explicit.** Text following `preferably`, `ideally`, or
+`optionally` is a preference used in ranking. Unmarked terms remain mandatory.
+A `4GB` request excludes `8GB` and titles presenting multiple GB options under a
+single price. These are query-evidence checks, not manufacturer authenticity or
+independent electrical verification. See [query policy](docs/query_policy.md).
 
 **Price intent is honoured.** “cheapest X” sets `sort=price_asc` (`sort_inferred`), price-zero
 quote/fabrication rows are excluded from price sorts, and “under ₹500” is parsed into
@@ -389,10 +394,10 @@ The precedence is fixed: input/type → syntax → taxonomy → applicability �
 `filter_key_not_extracted` (the attribute is absent from every candidate) →
 `filter_value_not_present` (the key exists on some candidates) →
 `no_matching_combination` (each filter is valid, their intersection is empty) →
-`query_unresolved` → `query_relaxed` → `filter_recall_gap` → `null`.
+`query_unresolved` → `filter_recall_gap` → `null`.
 `filter_key_not_extracted` and `filter_recall_gap` carry `missing_spec` and `base_matches`;
-`query_relaxed` carries `dropped_tokens` and `query_effective`; `mpn_not_found` carries
-`suggested_mpns`. `count_components` now emits the same `filter_recall_gap` as search and scopes
+The shared planner no longer emits `query_relaxed` or drops required tokens.
+`mpn_not_found` carries `suggested_mpns`. `count_components` emits the same `filter_recall_gap` as search and scopes
 `coverage[key].category` to the requested category (`present`/`of`/`pct`).
 
 Numeric keys reject non-numeric values (`rpm: "abc"` → `invalid_filter_value` with a base-unit
@@ -441,6 +446,18 @@ python scripts/build_vendor_specs.py      # all vendor attributes -> normalized 
 **76 attribute definitions**, **49 advertised keys**, **168k spec rows**, **69k products with specs**.
 `build_vendor_specs.py` adds the hybrid layer: **924k normalized vendor rows** across **43k vendor keys**.
 Restart the web/MCP processes after changing the taxonomy so their in-memory cache reloads.
+
+### Evidence-aware search (2.3)
+
+The [2.3.1 black-box audit remediation](docs/blackbox_bug_resolution.md) documents
+typed filter validation, usable metadata populations, MPN sold-form handling,
+offer comparability, and corrected vendor-unit normalization.
+
+Search separates sold-item identity from vendor categories and uses shared
+satisfied/failed/unknown constraints for filtering, counts, and candidate discovery.
+Application runtime requirements are preserved as unresolved constraints.
+See [search semantics and API behavior](docs/search_semantics.md) for identity
+coverage, `include_related`, `include_partial_candidates`, and diagnostic definitions.
 
 ### Hybrid specification retrieval
 
@@ -494,9 +511,10 @@ measures the difference:
 python scripts/benchmark_spec_retrieval.py
 ```
 
-Current examples: battery `>=20A` discharge goes from `0` promoted matches to
-`37` hybrid matches; `operating_temperature >= 85C` from `0` to `67`; a
-microcontroller `pins >= 8` query from `0` to its vendor-tier matches.
+Historical 2.2 examples: battery `>=20A` discharge went from `0` promoted matches to
+`37` hybrid matches; `operating_temperature >= 85C` from `0` to `67`.
+Those counts predate entity/ownership enforcement and are not evidence of usable
+component recall. Re-run the benchmarks against the current catalog and policy.
 
 ```python
 # MCP / Python: "I need a 12 V motor, 1000 rpm or less, at least 5 kg-cm"
@@ -548,6 +566,11 @@ of all nine catalog keys. The web equivalents are the same filters through `sour
 `MPU 6050` resolve to the same listings. Listings include extracted `specs` and `price_source`,
 pagination uses `next_cursor` (with `stale_cursor` protection), and a miss returns
 `data.suggested_mpns` (closest catalog part numbers) instead of a dead end.
+
+Mixed chip/module identifiers such as `MPU6050` return `mpn_ambiguous` by default.
+Use `allow_ambiguous=True` to inspect their separate listing forms. Related-item
+matches are excluded by default, and a shared identifier alone does not make
+vendor offers price-comparable.
 
 ### Vendor descriptions and free-form specs
 
@@ -796,7 +819,7 @@ count_components(category="resistors", filters={"resistance_ohm": "10k"})
 search_components(category="motor", filters={"voltage": "12", "rpm": {"lte": 1000}})
 search_components(query="0805", category="resistors", limit=50, compact=True)
 count_components(category="battery", filters={"cells": 3})
-search_by_mpn(mpn="MPU6050")
+search_by_mpn(mpn="MY1016ZL")
 ```
 
 The `category` argument accepts all 32 canonical categories; the three that

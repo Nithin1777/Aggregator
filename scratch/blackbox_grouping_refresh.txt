@@ -1,0 +1,20 @@
+.........FF......F................................                       [100%]
+================================== FAILURES ===================================
+______________ test_mcp_search_components_refreshes_price_stock _______________
+tests\test_price_stock_refresh.py:280: in test_mcp_search_components_refreshes_price_stock
+    assert res.total_matches >= 1
+E   AssertionError: assert 0 >= 1
+E    +  where 0 = ToolResponseEnvelope(ok=True, data={'items': [], 'results': [], 'suggestions': [], 'query_status': 'exact', 'match_mod...iagnosis={'reason': 'no_catalog_match', 'severity': 'info', 'query': 'IG52 motor', 'filters': {}, 'category': 'motor'}).total_matches
+____________ test_mcp_search_components_serves_cache_when_offline _____________
+tests\test_price_stock_refresh.py:301: in test_mcp_search_components_serves_cache_when_offline
+    assert res.data["results"]
+E   assert []
+______________________ test_can_merge_form_mismatch_veto ______________________
+tests\test_option_b_variants.py:65: in test_can_merge_form_mismatch_veto
+    assert "Product form mismatch" in reason
+E   AssertionError: assert 'Product form mismatch' in 'deferred_tier_b:Hard Veto: sold_form_mismatch:component:module'
+=========================== short test summary info ===========================
+FAILED tests/test_price_stock_refresh.py::test_mcp_search_components_refreshes_price_stock
+FAILED tests/test_price_stock_refresh.py::test_mcp_search_components_serves_cache_when_offline
+FAILED tests/test_option_b_variants.py::test_can_merge_form_mismatch_veto - A...
+3 failed, 47 passed in 28.43s

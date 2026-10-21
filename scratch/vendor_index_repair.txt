@@ -1,0 +1,2 @@
+{"backup": "C:\\Users\\nithi\\Downloads\\Platfrom Scrapper\\scratch\\catalog_backups\\components_before_vendor_repair_20261021T160658495691Z.db", "database": "C:\\Users\\nithi\\Downloads\\Platfrom Scrapper\\data\\components.db"}
+{"status": "repaired", "products": 125508, "index": {"attributes": 808477, "rows": 938584, "products": 106293}}

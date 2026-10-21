@@ -1,0 +1,20 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.7, pytest-9.1.1, pluggy-1.7.0 -- C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\nithi\Downloads\Platfrom Scrapper
+plugins: anyio-4.15.1, asyncio-1.4.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 29 items
+
+tests/test_agent_usability_contract.py::test_resistance_suffixes_normalize_to_ohms PASSED [  3%]
+tests/test_agent_usability_contract.py::test_capacitance_suffixes_normalize_to_microfarads PASSED [  6%]
+tests/test_agent_usability_contract.py::test_inductance_suffix_normalizes_to_microhenries PASSED [ 10%]
+tests/test_agent_usability_contract.py::test_invalid_numeric_value_explains_the_base_unit PASSED [ 13%]
+tests/test_agent_usability_contract.py::test_count_reports_filter_recall_gap_like_search PASSED [ 17%]
+tests/test_agent_usability_contract.py::test_count_coverage_is_category_scoped PASSED [ 20%]
+tests/test_agent_usability_contract.py::test_count_echoes_scope_and_query_status PASSED [ 24%]
+tests/test_agent_usability_contract.py::test_servo_voltage_is_reported_as_an_extraction_gap PASSED [ 27%]
+tests/test_agent_usability_contract.py::test_unresolved_engineering_requirement_has_a_diagnosis PASSED [ 31%]
+tests/test_agent_usability_contract.py::test_unknown_mpn_has_a_diagnosis PASSED [ 34%]
+tests/test_agent_usability_contract.py::test_valid_but_empty_intersection_is_no_matching_combination PASSED [ 37%]
+tests/test_agent_usability_contract.py::test_unscoped_voltage_aliases_are_equal_and_disclosed 
