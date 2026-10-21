@@ -219,6 +219,82 @@ def _ensure_category_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_vendor_spec_schema(conn: sqlite3.Connection) -> None:
+    """
+    Materialized, normalized vendor-attribute layer.
+
+    `product_attributes` is vendor-shaped and unit-inconsistent. This table is
+    the queryable bridge: one best row per (product, canonical/raw key), with
+    the value converted into a stable unit so range filters are meaningful.
+    It stays separate from `product_specs` so promoted taxonomy rows keep their
+    authority and provenance.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_vendor_specs (
+            product_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            value_num REAL,
+            value_type TEXT NOT NULL DEFAULT 'string',
+            unit TEXT,
+            raw_key TEXT,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            source TEXT NOT NULL DEFAULT 'vendor',
+            PRIMARY KEY(product_id, key)
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_product_vendor_specs_key_value_num "
+        "ON product_vendor_specs(key, value_num);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_product_vendor_specs_key_value "
+        "ON product_vendor_specs(key, value);"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vendor_spec_stats_global (
+            key TEXT PRIMARY KEY,
+            value_type TEXT,
+            unit TEXT,
+            applicable_count INTEGER NOT NULL DEFAULT 0,
+            value_min REAL,
+            value_max REAL,
+            updated_at TEXT
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vendor_spec_stats (
+            category TEXT NOT NULL,
+            key TEXT NOT NULL,
+            applicable_count INTEGER NOT NULL DEFAULT 0,
+            filled_count INTEGER NOT NULL DEFAULT 0,
+            unit TEXT,
+            value_min REAL,
+            value_max REAL,
+            updated_at TEXT,
+            PRIMARY KEY(category, key)
+        );
+        """
+    )
+
+
+def ensure_vendor_spec_schema(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Creates the normalized vendor-spec tables on an existing database."""
+    own = conn is None
+    conn = conn or get_db_connection()
+    try:
+        with conn:
+            _ensure_vendor_spec_schema(conn)
+    finally:
+        if own:
+            conn.close()
+
+
 def init_db():
     """Initializes schema, indexes, FTS5 virtual table, and checkpoint tracking."""
     conn = get_db_connection()
@@ -266,6 +342,8 @@ def init_db():
 
             # 2c. Vendor descriptions and free-form attributes
             _ensure_description_schema(conn)
+            # 2d. Normalized, queryable vendor-attribute layer
+            _ensure_vendor_spec_schema(conn)
 
             # 2b. Variant families table for Option B
             conn.execute("""
@@ -493,6 +571,7 @@ def ensure_description_schema(conn: Optional[sqlite3.Connection] = None) -> None
     try:
         with conn:
             _ensure_description_schema(conn)
+            _ensure_vendor_spec_schema(conn)
     finally:
         if own:
             conn.close()

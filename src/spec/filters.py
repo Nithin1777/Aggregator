@@ -1125,6 +1125,132 @@ def build_alias_clauses(
     return clauses, params
 
 
+def _value_conditions(
+    alias: str,
+    f_val: Any,
+    spec_meta: Dict[str, Any],
+) -> Tuple[List[str], List[Any]]:
+    """SQL predicates for one filter value against an aliased spec table."""
+    col = filter_column(alias, spec_meta)
+    num_col = filter_column(alias, spec_meta, ordering=True)
+    conditions: List[str] = []
+    params: List[Any] = []
+
+    if isinstance(f_val, dict):
+        if "in" in f_val:
+            values: List[Any] = []
+            for value in f_val["in"]:
+                if spec_meta.get("type") == "enum":
+                    values.extend(_enum_match_values(value, spec_meta))
+                else:
+                    values.append(value)
+            placeholders = ", ".join(["?"] * len(values))
+            conditions.append(f"{col} IN ({placeholders})")
+            params.extend(values)
+        for op, sql_op in (("gte", ">="), ("gt", ">"), ("lte", "<="), ("lt", "<")):
+            if op in f_val:
+                conditions.append(f"{num_col} {sql_op} ?")
+                params.append(float(f_val[op]))
+        if "eq" in f_val:
+            if "tolerance" in f_val:
+                center = float(f_val["eq"])
+                tol = float(f_val["tolerance"])
+                conditions.append(f"{num_col} >= ? AND {num_col} <= ?")
+                params.extend([center * (1.0 - tol), center * (1.0 + tol)])
+            elif spec_meta.get("type") == "float":
+                conditions.append(f"ABS({col} - ?) <= 1e-9 * MAX(1.0, ABS(?))")
+                params.extend([f_val["eq"], f_val["eq"]])
+            else:
+                values = (
+                    _enum_match_values(f_val["eq"], spec_meta)
+                    if spec_meta.get("type") == "enum"
+                    else [f_val["eq"]]
+                )
+                placeholders = ", ".join(["?"] * len(values))
+                conditions.append(f"{col} IN ({placeholders})")
+                params.extend(values)
+    else:
+        values = (
+            _enum_match_values(f_val, spec_meta)
+            if spec_meta.get("type") == "enum"
+            else [f_val]
+        )
+        if spec_meta.get("type") == "float":
+            conditions.append(f"ABS({col} - ?) <= 1e-9 * MAX(1.0, ABS(?))")
+            params.extend([f_val, f_val])
+        else:
+            placeholders = ", ".join(["?"] * len(values))
+            conditions.append(f"{col} IN ({placeholders})")
+            params.extend(values)
+    return conditions, params
+
+
+def build_hybrid_spec_clauses(
+    normalized_filters: Dict[str, Any],
+    advertised_specs: Dict[str, Dict[str, Any]],
+) -> Tuple[List[str], List[Any]]:
+    """
+    Promoted-first filter with a vendor fallback only for products that have no
+    promoted value for that key.
+
+    This is deliberately a fallback, not a union: if the taxonomy already
+    extracted a value, it wins. Vendor rows fill the "unknown" gap without
+    allowing a conflicting vendor value to override a validated one.
+    """
+    where: List[str] = []
+    params: List[Any] = []
+    for i, (key, value) in enumerate(normalized_filters.items()):
+        meta = advertised_specs[key]
+        ps = f"hps_{i}"
+        pv = f"hpv_{i}"
+        pn = f"hpn_{i}"
+        promoted_conditions, promoted_params = _value_conditions(ps, value, meta)
+        vendor_conditions, vendor_params = _value_conditions(pv, value, meta)
+        promoted = (
+            f"EXISTS (SELECT 1 FROM product_specs {ps} "
+            f"WHERE {ps}.product_id = p.id AND {ps}.key = ? AND "
+            + " AND ".join(promoted_conditions)
+            + ")"
+        )
+        vendor = (
+            f"EXISTS (SELECT 1 FROM product_vendor_specs {pv} "
+            f"WHERE {pv}.product_id = p.id AND {pv}.key = ? AND "
+            + " AND ".join(vendor_conditions)
+            + ")"
+        )
+        unknown = (
+            f"NOT EXISTS (SELECT 1 FROM product_specs {pn} "
+            f"WHERE {pn}.product_id = p.id AND {pn}.key = ?)"
+        )
+        where.append(f"({promoted} OR ({unknown} AND {vendor}))")
+        params.extend([str(key)] + promoted_params + [str(key), str(key)] + vendor_params)
+    return where, params
+
+
+def build_vendor_spec_clauses(
+    normalized_filters: Dict[str, Any],
+    vendor_specs: Dict[str, Dict[str, Any]],
+    alias_prefix: str = "pvs",
+) -> Tuple[List[str], List[Any], List[str], List[Any]]:
+    """JOIN/WHERE clauses for explicit vendor-attribute filters."""
+    joins: List[str] = []
+    join_params: List[Any] = []
+    where_clauses: List[str] = []
+    where_params: List[Any] = []
+    for i, (key, value) in enumerate(normalized_filters.items()):
+        alias = f"{alias_prefix}_{i}"
+        meta = vendor_specs[key]
+        joins.append(
+            f"JOIN product_vendor_specs {alias} "
+            f"ON p.id = {alias}.product_id AND {alias}.key = ?"
+        )
+        join_params.append(str(key))
+        conditions, params = _value_conditions(alias, value, meta)
+        where_clauses.extend(conditions)
+        where_params.extend(params)
+    return joins, join_params, where_clauses, where_params
+
+
 def build_spec_clauses(
     normalized_filters: Dict[str, Any],
     advertised_specs: Dict[str, Dict[str, Any]],

@@ -434,11 +434,69 @@ Populate the extension after the vendor descriptions are ingested:
 ```powershell
 python scripts/backfill_specs.py          # definitions + spec_category + curated specs
 python scripts/promote_vendor_specs.py    # vendor/title attributes -> product_specs
+python scripts/build_vendor_specs.py      # all vendor attributes -> normalized vendor index
 ```
 
 `promote_vendor_specs.py` is idempotent and preserves `manual` and `rule` rows. Current result:
-**76 attribute definitions**, **49 advertised keys**, **144k promoted spec rows**, **64k products**.
+**76 attribute definitions**, **49 advertised keys**, **168k spec rows**, **69k products with specs**.
+`build_vendor_specs.py` adds the hybrid layer: **924k normalized vendor rows** across **43k vendor keys**.
 Restart the web/MCP processes after changing the taxonomy so their in-memory cache reloads.
+
+### Hybrid specification retrieval
+
+The promoted taxonomy is authoritative, but it is not the only layer. A second
+materialized layer (`product_vendor_specs`) normalizes every vendor attribute
+found in descriptions, converts units, and keeps provenance:
+
+```text
+promoted taxonomy      product_specs       authoritative, curated
+vendor normalized      product_vendor_specs  broad, vendor-reported
+raw vendor             product_attributes  original evidence
+```
+
+For an advertised key, filters use the promoted value first and fall back to the
+vendor value **only when the promoted value is missing** for that product. This
+fills extraction gaps without letting a conflicting vendor value override a
+validated one.
+
+For a key outside the taxonomy, the filter is routed to the vendor tier when it
+applies to the requested category. An unscoped ambiguous key such as `torque`
+is still rejected (it exists for motor shafts and connector screws); use
+`torque_kgcm` or pass a category.
+
+```python
+# Battery vendor attribute not in the taxonomy: 20A+ continuous discharge
+count_components(category="battery",
+                 filters={"max_discharge_current_a": {"gte": 20}})
+
+# Microcontroller pins/voltage are vendor-tier until the taxonomy catches up
+search_components(category="microcontrollers",
+                  filters={"pins": {"gte": 8}, "supply_voltage_v": {"lte": 3.6}})
+
+# Explicit long-tail vendor filter
+search_components(vendor_filters={"manufacturer": "3peak"}, limit=10)
+```
+
+Responses disclose the tier:
+
+- `filters_applied.filter_mode` = `hybrid` or `promoted`
+- `filters_applied.vendor_filters`
+- `filters_applied.filter_routed_to_vendor`
+- `data.filter_recall.mode`, `promoted_matches`, `vendor_fallback_matches`,
+  `missing_spec`
+- per-row `spec_sources` (`promoted` / `vendor`)
+- `describe_spec(key, vendor=True)` for discovery
+
+Use `include_vendor_specs=False` for a promoted-only query. The benchmark
+measures the difference:
+
+```powershell
+python scripts/benchmark_spec_retrieval.py
+```
+
+Current examples: battery `>=20A` discharge goes from `0` promoted matches to
+`37` hybrid matches; `operating_temperature >= 85C` from `0` to `67`; a
+microcontroller `pins >= 8` query from `0` to its vendor-tier matches.
 
 ```python
 # MCP / Python: "I need a 12 V motor, 1000 rpm or less, at least 5 kg-cm"
@@ -470,8 +528,12 @@ of all nine catalog keys. The web equivalents are the same filters through `sour
   `page`. There is no longer a `result_present / result_of` pair computed from different
   populations.
 - Filters report `filter_scope: "extracted_only"` and `data.filter_recall` with
-  `base_matches`, `missing_spec` and `filtered_out_for_value`, plus a `filter_recall_gap`
+  `base_matches`, `missing_spec`, `promoted_matches`, `vendor_fallback_matches`,
+  `promoted_missing` and `filtered_out_for_value`, plus a `filter_recall_gap`
   warning in both `count_components` and `search_components`.
+- Hybrid filters disclose `filter_mode`, `vendor_filters`,
+  `filter_routed_to_vendor`, `data.vendor_coverage`, and per-row `spec_sources`.
+  `describe_spec(key, vendor=True)` discovers the vendor tier.
 - Price/stock freshness reports `status="live"` only when every returned candidate was refreshed;
   otherwise `partial`, with `refreshed_products`, `cached_products` and `verified_pct`.
 - `search_by_mpn` rejects family tokens (`mpn_family_token`) and shared identifiers
@@ -496,6 +558,8 @@ tolerance, dielectric, package, dimensions, ...), and REES52/Robokits publish pr
 `scripts/backfill_descriptions.py` stores those descriptions in `product_descriptions` and parses
 the tables/lists into `product_attributes`. The curated, filterable layer stays in
 `product_specs`; `vendor_specs` is the larger free-form layer returned by `get_product`.
+`get_product` also returns `normalized_vendor_specs` and `normalized_vendor_details` —
+the same vendor values with converted units, canonical aliases, confidence, and provenance.
 
 ```powershell
 # Shopify: quartzcomponents, makerbazar, rees52 (fast, ~75 catalog pages)
@@ -530,8 +594,8 @@ python scripts/backfill_title_attributes.py --vendors robu
 python scripts/backfill_title_attributes.py --vendors robokits
 ```
 
-Current catalog totals: **18,474 descriptions**, **261,085 vendor attribute rows**, and
-**76,002 products with attributes** (Robu contributes 59k of those from titles alone).
+Current catalog totals: **123,299 descriptions**, **808,477 vendor attribute rows**,
+**106,425 products with attributes**, and **924k normalized vendor spec rows**.
 
 **Robu GraphQL path.** Robu's Next.js frontend exposes
 `POST https://robu.in/api/proxy/graphql/` with a `ProductDetails` operation. It returns
@@ -660,9 +724,9 @@ The MCP server lives in `mcp_server/server.py` and exposes **8 tools**:
 | Tool | What it does |
 |---|---|
 | `describe_catalog` | Catalog size, taxonomy, freshness, alias map; `summary=True` for a sub-6 KB key catalog |
-| `describe_spec` | Value distribution, range and coverage for one spec attribute |
+| `describe_spec` | Value distribution, range, coverage, and vendor-tier discovery (`vendor=True`) |
 | `list_spec_keys` | Deprecated alias for `describe_catalog(summary=True)`; still returns fill counts |
-| `count_components` | Size a query without fetching rows, with the same recall/diagnosis as search |
+| `count_components` | Size a query without fetching rows, with promoted/vendor provenance and recall diagnostics |
 | `search_components` | Search by text and/or spec filters, side-by-side vendor offers, cursor pagination; `compact=True` for small pages |
 | `search_by_mpn` | Resolve a part number (or vendor SKU) to its listings, with typo suggestions |
 | `get_product` | Full record for one product: specs, offers, confidence |

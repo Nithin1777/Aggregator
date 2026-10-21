@@ -47,13 +47,14 @@ def test_rpm_is_rejected_for_battery_category():
     assert res.diagnosis["filter_support"] == "partial"
 
 
-def test_filter_on_category_without_attributes_reports_filter_support_none():
+def test_filter_on_category_without_promoted_attributes_uses_vendor_tier():
+    # Drones has no taxonomy attributes, but its vendor descriptions carry
+    # voltage. The hybrid layer should use it rather than rejecting the filter.
     res = count_components(category="drones", filters={"voltage": "5"})
 
-    assert res.ok is False
-    assert res.error_code == "filter_not_applicable_to_category"
-    assert res.diagnosis["filter_support"] == "none"
-    assert res.diagnosis["applicable_keys"] == []
+    assert res.ok is True
+    assert res.filters_applied["filter_support"] == "partial"
+    assert res.filters_applied["filter_mode"] == "hybrid"
 
 
 def test_relay_advertises_channels_and_contact_attributes():
