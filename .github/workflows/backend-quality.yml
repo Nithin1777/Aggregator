@@ -1,0 +1,42 @@
+name: backend-quality
+
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  quality:
+    name: Backend quality and regression gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GIT_LFS_SKIP_SMUDGE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Test the evaluator
+        run: python -m pytest tests/test_backend_evaluation.py -q
+      - name: Compare with versioned quality baseline
+        run: python scripts/evaluate_backend.py --output reports/backend-quality/current.json
+      - name: Compare PR implementation with its base implementation
+        if: always() && github.event_name == 'pull_request'
+        env:
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/compare_backend_revision.py --ref "$BASE_REVISION"
+      - name: Upload quality reports, including failed cases
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-quality-reports
+          path: reports/backend-quality/
+          if-no-files-found: warn

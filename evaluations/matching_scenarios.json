@@ -1,0 +1,20 @@
+{
+  "version":"1.0.0",
+  "provenance":"Independent compatibility judgments from explicit fixture identities and engineering differences. Saved labels below are adversarial inputs, not ground-truth labels.",
+  "pairs":[
+    {"id":"saved_label_pin_conflict","category":"hard_conflicts","title_a":"ESP32 WiFi Development Board 30 Pins","title_b":"ESP32 WiFi Development Board 38 Pins","should_match":false,"saved_label":"same","critical":true},
+    {"id":"saved_label_ram_conflict","category":"hard_conflicts","title_a":"Raspberry Pi 4 Model B 4GB RAM Board","title_b":"Raspberry Pi 4 Model B 8GB RAM Board","should_match":false,"saved_label":"same","critical":true},
+    {"id":"saved_label_pack_conflict","category":"hard_conflicts","title_a":"ESP32 WiFi Development Board 30 Pins","title_b":"ESP32 WiFi Development Board 30 Pins Pack of 10","should_match":false,"saved_label":"same","critical":true},
+    {"id":"saved_label_sensor_case","category":"hard_conflicts","title_a":"HC-SR04 Ultrasonic Sensor Module","title_b":"Protective case for HC-SR04 ultrasonic sensor","should_match":false,"saved_label":"same","critical":true}
+  ],
+  "groups":[
+    {"id":"sensor_cross_vendor","members":["hcsr04_a","hcsr04_b"],"critical":false},
+    {"id":"esp32_cross_vendor","members":["esp32_30_a","esp32_30_b"],"critical":false},
+    {"id":"esp32_variants","members":["esp32_30_a","esp32_30_b","esp32_38","esp32_s3","esp32_case","esp32_pack"],"critical":true},
+    {"id":"relay_variants","members":["relay2_a","relay2_b","relay4"],"critical":true},
+    {"id":"motor_variants","members":["motor_12_100_a","motor_12_100_b","motor_24_100","motor_12_500","motor_bracket"],"critical":true},
+    {"id":"resistor_packages","members":["res10k_a","res10k_b","res10k_0402","res1k"],"critical":true},
+    {"id":"ram_variants","members":["rpi4_4","rpi4_8"],"critical":true},
+    {"id":"usb_uart_identity","members":["ch340","cp2102"],"critical":true}
+  ]
+}

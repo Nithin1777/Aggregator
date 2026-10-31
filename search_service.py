@@ -13,6 +13,7 @@ import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 from adapters.base import BaseAdapter
+from adapters.flyrobo import FlyroboAdapter
 from adapters.robu import RobuAdapter
 from adapters.robokits import RobokitsAdapter
 from adapters.shopify import ShopifyAdapter
@@ -80,6 +81,7 @@ class AggregatorEngine:
                 base_url=settings.rees52_base_url
             ),
             "robokits": RobokitsAdapter(),
+            "flyrobo": FlyroboAdapter(),
         }
         # Ensure database tables exist
         db.init_db()
@@ -1116,7 +1118,7 @@ class AggregatorEngine:
 
     async def search_live(self, query: str, limit_per_vendor: int = 15) -> SearchResponse:
         """
-        Federated search across Robu, QuartzComponents, and MakerBazar in parallel.
+        Federated search across every configured vendor in parallel.
         Automatically saves/enriches products into local SQLite database.
         """
         clean_q = query.strip()

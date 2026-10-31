@@ -405,6 +405,26 @@ def init_db():
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_robu_registry_status ON robu_catalog_registry(status);")
 
+            # 6b. Generic Ground-Truth Catalog Registry.
+            #     Sitemap-driven vendors (Flyrobo) store every published product URL
+            #     here so ingestion is complete and resumable without re-reading the
+            #     sitemaps on every run. Robu keeps its original table above.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS vendor_catalog_registry (
+                    vendor TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (vendor, slug)
+                );
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_vendor_registry_status "
+                "ON vendor_catalog_registry(vendor, status);"
+            )
+
             # 7. Gray-Zone Telemetry & Audit Log Table (Tracks ambiguous merges and vetoes)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS matcher_gray_zone (
@@ -510,7 +530,7 @@ def upsert_products(products: List[UnifiedProduct]) -> int:
                         title = excluded.title,
                         normalized_title = excluded.normalized_title,
                         mpn = excluded.mpn,
-                        sku = excluded.sku,
+                        sku = COALESCE(NULLIF(excluded.sku, ''), products.sku),
                         price = excluded.price,
                         available = excluded.available,
                         product_url = excluded.product_url,
@@ -1026,6 +1046,184 @@ def sync_robu_registry_with_products() -> int:
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# Generic sitemap registry (Flyrobo and future sitemap-driven vendors)
+#
+# `robu_catalog_registry` predates this table and is still used by the Robu
+# reconciliation loop. New adapters use this vendor-scoped registry:
+#   - `page` in fetch_catalog_page() maps to a deterministic slice of the
+#     registry, so the shared scrape_checkpoints continuation works unchanged.
+#   - status is informational (`pending` / `indexed` / `failed` / `missing`);
+#     enumeration is order-based so one failed product never shifts the list.
+# ---------------------------------------------------------------------------
+
+
+def populate_vendor_registry(vendor: str, slug_url_tuples: List[tuple]) -> int:
+    """Inserts a vendor's sitemap URLs, keeping existing rows and statuses.
+
+    Returns the number of newly added slugs (existing rows are refreshed in place
+    and a product that reappears after being marked `missing` becomes `pending`).
+    """
+    if not slug_url_tuples:
+        return 0
+    conn = get_db_connection()
+    now_str = utc_now_iso()
+    try:
+        with conn:
+            existing = {
+                row["slug"]
+                for row in conn.execute(
+                    "SELECT slug FROM vendor_catalog_registry WHERE vendor = ?;", (vendor,)
+                ).fetchall()
+            }
+            added = 0
+            for slug, url in slug_url_tuples:
+                if slug not in existing:
+                    added += 1
+                conn.execute(
+                    """
+                    INSERT INTO vendor_catalog_registry
+                        (vendor, slug, url, status, created_at, updated_at)
+                    VALUES (?, ?, ?, 'pending', ?, ?)
+                    ON CONFLICT(vendor, slug) DO UPDATE SET
+                        url = excluded.url,
+                        status = CASE
+                            WHEN vendor_catalog_registry.status = 'missing' THEN 'pending'
+                            ELSE vendor_catalog_registry.status
+                        END,
+                        updated_at = excluded.updated_at;
+                    """,
+                    (vendor, slug, url, now_str, now_str),
+                )
+            return added
+    finally:
+        conn.close()
+
+
+def list_vendor_registry_slugs(vendor: str) -> set:
+    """Returns every slug currently recorded for a vendor."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT slug FROM vendor_catalog_registry WHERE vendor = ?;", (vendor,)
+        ).fetchall()
+        return {row["slug"] for row in rows}
+    finally:
+        conn.close()
+
+
+def mark_vendor_slugs_status(vendor: str, slugs, status: str) -> int:
+    """Bulk-updates registry status for a vendor's slugs."""
+    slugs = [str(slug) for slug in slugs if slug]
+    if not slugs:
+        return 0
+    conn = get_db_connection()
+    now_str = utc_now_iso()
+    updated = 0
+    try:
+        with conn:
+            for start in range(0, len(slugs), 500):
+                chunk = slugs[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cursor = conn.execute(
+                    f"""
+                    UPDATE vendor_catalog_registry
+                    SET status = ?, updated_at = ?
+                    WHERE vendor = ? AND slug IN ({placeholders});
+                    """,
+                    (status, now_str, vendor, *chunk),
+                )
+                updated += cursor.rowcount
+    finally:
+        conn.close()
+    return updated
+
+
+def mark_vendor_slug_status(vendor: str, slug: str, status: str) -> None:
+    """Sets the registry status of one vendor slug."""
+    mark_vendor_slugs_status(vendor, [slug], status)
+
+
+def count_vendor_registry(vendor: str, include_missing: bool = False) -> int:
+    """Counts a vendor's registry rows that are part of the current sitemap.
+
+    Pass ``include_missing=True`` when the count backs an offset-based page
+    enumeration: excluded rows would shift every later offset.
+    """
+    conn = get_db_connection()
+    try:
+        if include_missing:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM vendor_catalog_registry WHERE vendor = ?;",
+                (vendor,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM vendor_catalog_registry "
+                "WHERE vendor = ? AND status != 'missing';",
+                (vendor,),
+            ).fetchone()
+        return int(row["total"])
+    finally:
+        conn.close()
+
+
+def get_vendor_registry_page(
+    vendor: str, offset: int, limit: int, include_missing: bool = False
+) -> List[Dict[str, str]]:
+    """Returns a stable, insertion-ordered slice of a vendor's registry."""
+    conn = get_db_connection()
+    try:
+        clause = "" if include_missing else " AND status != 'missing'"
+        rows = conn.execute(
+            f"""
+            SELECT slug, url, status FROM vendor_catalog_registry
+            WHERE vendor = ?{clause}
+            ORDER BY rowid
+            LIMIT ? OFFSET ?;
+            """,
+            (vendor, max(1, int(limit)), max(0, int(offset))),
+        ).fetchall()
+        return [{"slug": row["slug"], "url": row["url"], "status": row["status"]} for row in rows]
+    finally:
+        conn.close()
+
+
+def get_vendor_registry_stats(vendor: str) -> Dict[str, Any]:
+    """Returns coverage counters for one vendor's sitemap registry."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) AS total FROM vendor_catalog_registry WHERE vendor = ?;",
+            (vendor,),
+        )
+        total = int(cursor.fetchone()["total"])
+        cursor.execute(
+            "SELECT status, COUNT(*) AS count FROM vendor_catalog_registry "
+            "WHERE vendor = ? GROUP BY status;",
+            (vendor,),
+        )
+        counts = {row["status"]: int(row["count"]) for row in cursor.fetchall()}
+        indexed = counts.get("indexed", 0)
+        missing = counts.get("missing", 0)
+        failed = counts.get("failed", 0)
+        # Retired URLs stay in the table to keep page offsets stable, but they are
+        # not part of the current catalog, so they do not count against coverage.
+        active_total = max(total - missing, 0)
+        return {
+            "total_registry": total,
+            "active_total": active_total,
+            "indexed": indexed,
+            "pending": max(active_total - indexed - failed, 0),
+            "failed": failed,
+            "missing": missing,
+            "coverage_pct": round(indexed / active_total * 100.0, 1) if active_total else 0.0,
+        }
+    finally:
+        conn.close()
+
 def get_checkpoint(vendor: str) -> ScrapeState:
     """Retrieves current scraping checkpoint for a vendor."""
     conn = get_db_connection()
@@ -1456,6 +1654,7 @@ def get_db_stats() -> Dict[str, Any]:
             "vendors": vendors,
             "checkpoints": checkpoints,
             "robu_registry": get_robu_registry_stats(),
+            "flyrobo_registry": get_vendor_registry_stats("flyrobo"),
             "price_stock": get_price_stock_stats()
         }
         _cache_set(_stats_cache, stats)

@@ -27,6 +27,8 @@ class Settings(BaseModel):
     robu_search_api: str = "https://robu.in/api/search/"
     robokits_base_url: str = "https://robokits.co.in"
     rees52_base_url: str = "https://rees52.com"
+    flyrobo_base_url: str = "https://www.flyrobo.in"
+    flyrobo_sitemap_url: str = "https://www.flyrobo.in/sitemap.xml"
 
     # Robokits lists prices excluding GST. Displayed/comparison prices must be
     # tax-inclusive like every other storefront (Robu, Quartz, ...) show them.
@@ -42,6 +44,7 @@ class Settings(BaseModel):
     shopify_page_delay: float = 0.4
     robu_request_delay: float = 1.2
     robokits_page_delay: float = 0.6
+    flyrobo_request_delay: float = 0.35
     max_retries: int = 5
     backoff_factor: float = 1.5
 
@@ -49,6 +52,12 @@ class Settings(BaseModel):
     shopify_batch_limit: int = 250
     robu_batch_limit: int = 50
     robokits_batch_limit: int = 30
+    # Flyrobo fetches one HTML product page per item (sitemap-driven), so a
+    # smaller batch keeps the continuation checkpoint close to the work. Keep
+    # this value fixed for the duration of a run: checkpoints store page numbers,
+    # and each page maps to `(page - 1) * flyrobo_batch_limit` registry rows.
+    flyrobo_batch_limit: int = 20
+    flyrobo_search_limit: int = 100
 
     # Matching & Classification
     matcher_v2_enabled: bool = True

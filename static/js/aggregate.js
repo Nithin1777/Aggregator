@@ -218,6 +218,7 @@
     if (v === "makerbazar") return "vendor--makerbazar";
     if (v === "robokits") return "vendor--robokits";
     if (v === "rees52") return "vendor--rees52";
+    if (v === "flyrobo") return "vendor--flyrobo";
     return "vendor--default";
   };
 

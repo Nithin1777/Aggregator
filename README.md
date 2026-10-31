@@ -1,13 +1,27 @@
 # Aggregate (Indian Component Aggregator Engine)
 
+Backend changes can be measured with the offline quality gate:
+
+```powershell
+python scripts/evaluate_backend.py
+```
+
+It reports search precision/recall/F1, ranking quality, matching/grouping accuracy,
+and contract regressions against a versioned baseline. See
+[backend quality evaluation](docs/backend_quality.md) for interpretation, Git
+revision comparisons, and baseline updates. Reports distinguish known correctness
+failures from new regressions; controlled-fixture scores are not production-wide
+accuracy estimates.
+
 A high-performance component aggregation search engine that indexes, queries, and compares electronic component pricing and live stock availability across India's primary distributors:
 1. **Robu.in**
 2. **QuartzComponents**
 3. **MakerBazar**
 4. **Robokits**
 5. **REES52**
+6. **Flyrobo**
 
-Built with direct JSON querying (zero HTML scraping required), Cloudflare TLS/JA3 fingerprint impersonation (`curl_cffi` on `chrome120`), SQLite Full-Text Search (FTS5), smart MPN extraction, cross-vendor component clustering, and **resumable / continuable batch catalog ingestion**.
+Built with direct JSON querying where vendors expose it (Robu, Shopify), schema.org JSON-LD parsing for Flyrobo, Cloudflare TLS/JA3 fingerprint impersonation (`curl_cffi` on `chrome120`), SQLite Full-Text Search (FTS5), smart MPN extraction, cross-vendor component clustering, and **resumable / continuable batch catalog ingestion**.
 
 ---
 
@@ -21,8 +35,9 @@ Built with direct JSON querying (zero HTML scraping required), Cloudflare TLS/JA
 ├── adapters/
 │   ├── __init__.py
 │   ├── base.py           # Abstract BaseAdapter interface
-│   ├── shopify.py        # Shopify adapter (QuartzComponents, MakerBazar)
-│   └── robu.py           # Robu Next.js search microservice adapter with session warmup
+│   ├── shopify.py        # Shopify adapter (QuartzComponents, MakerBazar, REES52)
+│   ├── robu.py           # Robu Next.js search microservice adapter with session warmup
+│   └── flyrobo.py        # Flyrobo sitemap + JSON-LD adapter (IoI cookie challenge solver)
 ├── search_service.py     # Parallel federation, comparison clustering, price/stock refresh, and continuable ingestion
 ├── main.py               # Typer CLI dashboard and FastAPI Web Application
 ├── src/
@@ -71,7 +86,7 @@ python -m pytest tests -q
 ## 2. Searching Components
 
 ### A. Real-Time Multi-Vendor Search (Live APIs)
-Queries Robu, QuartzComponents, and MakerBazar simultaneously in parallel, normalizes titles, groups equivalent parts side-by-side, highlights the lowest in-stock price, and automatically caches products to your local database:
+Queries every enabled vendor simultaneously in parallel, normalizes titles, groups equivalent parts side-by-side, highlights the lowest in-stock price, and automatically caches products to your local database:
 
 ```powershell
 python main.py search "esp32"
@@ -111,27 +126,40 @@ The ingestion engine stores progress in SQLite (`scrape_checkpoints` table). Eve
 python main.py ingest quartzcomponents -m 2
 python main.py ingest makerbazar -m 2
 python main.py ingest robu -m 2
+python main.py ingest flyrobo -m 1
 
-# 2. Check current status, checkpoint pages & Robu 100% Parity Tracker
+# 2. Check current status, checkpoint pages & sitemap parity trackers
 python main.py status
 
-# 3. Optional: Sync all 22 Robu ground-truth sitemaps (~22,000 URLs)
-python main.py robu-sync
+# 3. Optional: sync ground-truth sitemap registries
+python main.py robu-sync     # all 22 Robu sitemaps (~22,000 URLs)
+python main.py flyrobo-sync  # all 10 Flyrobo product sitemaps (~4,500 URLs)
 
 # 4. Resume ingestion anytime (picks up exactly from checkpoint.last_page + 1)
 python main.py ingest quartzcomponents -m 5
+python main.py ingest flyrobo -m 5
 
 # 5. Leave running overnight (omitting -m processes until full catalog is completed)
 python main.py ingest quartzcomponents
 python main.py ingest makerbazar
 python main.py ingest robu
+python main.py ingest flyrobo
 
-# 6. Ingest all 3 vendors sequentially
+# 6. Ingest all vendors sequentially
 python main.py ingest
 
 # 7. Optional: Start fresh from page 1 instead of resuming
 python main.py ingest quartzcomponents --fresh
 ```
+
+### Flyrobo (sitemap-driven, ~4,500 products)
+Flyrobo publishes its catalog through `https://www.flyrobo.in/sitemap.xml` (10 product sitemaps). Page 1 of `ingest flyrobo` refreshes the ground-truth URL registry in SQLite, then every page fetches a stable 20-product slice. This keeps the normal `scrape_checkpoints` resume behaviour: if a run stops on page 7, the next run starts at page 8 without re-reading the sitemaps.
+
+- The storefront returns a JavaScript `IoI` cookie challenge. The adapter solves it deterministically (FNV-1a over the embedded token) and retries, so no browser or Playwright is required.
+- Product pages are parsed from schema.org JSON-LD first, with meta/DOM fallbacks for title, price, stock, SKU/model and image.
+- Flyrobo prices are already GST-inclusive; no conversion is applied.
+- Registry rows are `pending`, `indexed`, `failed` or `missing`. A 404 is recorded as `missing` and stays in the page enumeration so later offsets never shift; network failures raise instead of silently ending the catalog.
+- The first page of a fresh run also downloads all 10 sitemaps (about 11 requests), so expect it to take slightly longer than the following pages.
 
 ---
 
@@ -277,10 +305,10 @@ python main.py search "IG52 motor" --local --cache-only # no vendor calls
 | `PRICE_STOCK_TTL` | `180` | Seconds before cached price/stock is considered stale. |
 | `PRICE_STOCK_TIMEOUT` | `8` | Wall-clock budget in seconds for one refresh pass. |
 
-Additional tunables live in `config.py`: `price_stock_offline_cooldown_seconds` (60), `price_stock_max_refresh_queries` (2), `price_stock_live_limit_per_vendor` (15), `price_stock_sync_max_products` (30; broader result sets use the background/cached path), `robokits_gst_rate` (0.18), and `quartz_gst_rate` (0.18).
+Additional tunables live in `config.py`: `price_stock_offline_cooldown_seconds` (60), `price_stock_max_refresh_queries` (2), `price_stock_live_limit_per_vendor` (15), `price_stock_sync_max_products` (30; broader result sets use the background/cached path), `robokits_gst_rate` (0.18), `quartz_gst_rate` (0.18), `flyrobo_request_delay` (0.35s), and `flyrobo_batch_limit` (20 products per sitemap-registry page).
 
 ### Vendor tax handling
-Robokits and QuartzComponents list prices **excluding GST**. The adapters multiply the scraped amount by the vendor's GST rate before storing it, so every vendor's `price` is tax-inclusive and comparisons are like-for-like. The original ex-GST amount is kept in `extra.price_ex_gst` for data/debugging use, but the storefront only displays the final inclusive price.
+Robokits and QuartzComponents list prices **excluding GST**. The adapters multiply the scraped amount by the vendor's GST rate before storing it, so every vendor's `price` is tax-inclusive and comparisons are like-for-like. The original ex-GST amount is kept in `extra.price_ex_gst` for data/debugging use, but the storefront only displays the final inclusive price. Flyrobo already quotes GST-inclusive prices, so its adapter stores the scraped amount unchanged.
 
 Historical rows can be repaired without a full re-scrape:
 ```powershell
