@@ -267,6 +267,7 @@ class QueryPlan:
     price_min: Optional[float] = None
     price_max: Optional[float] = None
     inferred_category: Optional[str] = None
+    category_terms: List[str] = field(default_factory=list)
     unresolved_constraints: List[dict] = field(default_factory=list)
     tokens: List[str] = field(default_factory=list)
     ignored: List[str] = field(default_factory=list)
@@ -316,11 +317,13 @@ class QueryPlan:
             "identity_preserved": True, "query_relaxed": self.is_relaxed,
             "corrections": self.corrections, "preferences": self.preference_tokens,
             "engineering_constraints": self.engineering_constraints,
+            "category_scope": self.inferred_category,
+            "category_terms_interpreted": self.category_terms,
             "evidence_scope": "catalog_claims_not_independent_verification",
             "unresolved_constraints": self.unresolved_constraints,
             "price_min": self.price_min, "price_max": self.price_max,
             "suggestions": self.suggestions,
             "match_tier": ("corrected_terms" if self.corrections else
                            "identity_terms" if self.protected_tokens else
-                           "structured_constraints" if self.inferred_filters else "all_terms"),
+                           "structured_constraints" if self.predicates else "all_terms"),
         }

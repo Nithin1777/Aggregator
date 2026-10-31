@@ -512,6 +512,9 @@ def upsert_products(products: List[UnifiedProduct]) -> int:
         return 0
 
     conn = get_db_connection()
+    from src.spec.enrichment import ensure_enrichment_schema, enrich_listing, refresh_statistics
+    ensure_enrichment_schema(conn)
+    changed_keys, changed_vendor_keys = set(), set()
     count = 0
     now_str = datetime.now(timezone.utc).isoformat()
     try:
@@ -566,7 +569,12 @@ def upsert_products(products: List[UnifiedProduct]) -> int:
                         VALUES (?, ?, 'indexed', ?)
                         ON CONFLICT(slug) DO UPDATE SET status = 'indexed', updated_at = excluded.updated_at;
                     """, (p.extra["slug"], p.product_url, now_str))
+                product_id = conn.execute("SELECT id FROM products WHERE vendor=? AND external_id=?", (p.vendor,p.external_id)).fetchone()[0]
+                enrichment = enrich_listing(conn, product_id, description_html=p.description_html)
+                changed_keys.update(enrichment['keys'])
+                changed_vendor_keys.update(enrichment['vendor_keys'])
                 count += 1
+            refresh_statistics(conn, changed_keys, changed_vendor_keys)
         invalidate_counts_cache()
     finally:
         conn.close()
@@ -683,6 +691,14 @@ def replace_product_attributes(
                     """,
                     rows,
                 )
+            # Attribute backfills/imports must publish queryable evidence too.
+            # Keep the small standalone attribute-store API usable without a
+            # catalog schema (e.g. import staging and schema-only tests).
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='products'").fetchone() and conn.execute("SELECT 1 FROM products WHERE id=?", (int(product_id),)).fetchone():
+                from src.spec.enrichment import ensure_enrichment_schema, enrich_listing, refresh_statistics
+                ensure_enrichment_schema(conn)
+                result = enrich_listing(conn, int(product_id))
+                refresh_statistics(conn, result['keys'], result['vendor_keys'])
             return len(rows)
     finally:
         if own:
@@ -1452,6 +1468,7 @@ def list_products_by_category(
     spec_filters: Optional[Dict[str, Any]] = None,
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
+    vendor_filters: Optional[Dict[str, Any]] = None,
 ) -> List[UnifiedProduct]:
     """Compatibility API for category browsing through the shared search service.
 
@@ -1463,8 +1480,9 @@ def list_products_by_category(
         search = CatalogSearch(connection)
         prepared = search.prepare(
             filters=spec_filters, category=category, vendor=vendor,
-            in_stock_only=in_stock_only, include_related=not bool(spec_filters),
+            in_stock_only=in_stock_only, include_related=not bool(spec_filters or vendor_filters),
             price_min=price_min, price_max=price_max,
+            vendor_filters=vendor_filters,
         )
         return [row_to_unified_product(row) for row in search.rows(
             prepared, limit=max(1, int(limit)), offset=max(0, int(offset)),
@@ -1480,6 +1498,7 @@ def count_products_by_category(
     spec_filters: Optional[Dict[str, Any]] = None,
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
+    vendor_filters: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Count the same browse population used by list_products_by_category."""
     connection = get_db_connection()
@@ -1487,8 +1506,9 @@ def count_products_by_category(
         search = CatalogSearch(connection)
         return search.count(search.prepare(
             filters=spec_filters, category=category, vendor=vendor,
-            in_stock_only=in_stock_only, include_related=not bool(spec_filters),
+            in_stock_only=in_stock_only, include_related=not bool(spec_filters or vendor_filters),
             price_min=price_min, price_max=price_max,
+            vendor_filters=vendor_filters,
         ))
     finally:
         connection.close()

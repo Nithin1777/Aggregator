@@ -120,8 +120,9 @@ def _head_token(tokens: List[str]) -> Optional[str]:
             category_tokens.add(category.id.replace("-", " "))
             category_tokens.update(category.detect_keywords)
         flat = {token for value in category_tokens for token in tokenize(value)}
+        from src.spec.taxonomy_loader import tokens_equivalent
         for token in tokens:
-            if token in flat:
+            if token in flat or any(tokens_equivalent(token, term) for term in flat):
                 return token
             if any(len(term) >= 4 and token.startswith(term) for term in flat):
                 return token
@@ -156,7 +157,19 @@ def resolve_query_plan(query: Optional[str], conn: sqlite3.Connection, category=
         plan.warnings.append({"code": "unsupported_query_syntax" if syntax else "invalid_query",
                               "message": syntax["message"] if syntax else "NUL is not a valid query character."})
         return plan
-    query_text, plan.price_min, plan.price_max = parse_price_constraints(query)
+    # Resolve named properties before budget extraction or spelling correction:
+    # "ADC bits at least 12" is a count, never a minimum price of INR 12.
+    from src.search.spec_language import extract_named_requirements
+    named_category = category
+    if named_category is None:
+        from src.spec.filters import resolve_category
+        hint = _head_token([token.lower() for token in content_tokens(query)[0]])
+        if hint:
+            named_category, _ = resolve_category(hint, list(get_taxonomy().categories))
+    query_text, named_constraints, named_predicates, named_unknown = extract_named_requirements(
+        query or "", conn, named_category,
+    )
+    query_text, plan.price_min, plan.price_max = parse_price_constraints(query_text)
     retrieval, runtime = extract_requirements(query_text)
     plan.unresolved_constraints.extend(runtime)
     taxonomy = get_taxonomy()
@@ -184,7 +197,7 @@ def resolve_query_plan(query: Optional[str], conn: sqlite3.Connection, category=
                 retrieval = re.sub(r"(?<!\w)" + re.escape(source) + r"(?!\w)", target, retrieval)
             tokens = corrected
     head = _head_token([t.lower() for t in tokens])
-    inferred_category = category
+    inferred_category = category or (named_category if named_constraints else None)
     if not inferred_category and head:
         from src.spec.filters import resolve_category
         inferred_category, _ = resolve_category(head, list(taxonomy.categories))
@@ -200,6 +213,10 @@ def resolve_query_plan(query: Optional[str], conn: sqlite3.Connection, category=
         retrieval, conn, inferred_category,
     )
     plan.unresolved_constraints.extend(unknown)
+    plan.engineering_constraints = named_constraints + plan.engineering_constraints
+    plan.predicates = named_predicates + plan.predicates
+    unknown.extend(named_unknown)
+    plan.unresolved_constraints.extend(named_unknown)
     if re.search(r"\b(?:without|excluding|must\s+not|not)\b", retrieval, re.I):
         negative = {"kind": "negative_requirement", "evidence": retrieval,
                     "status": "unknown", "reason": "absence_requires_explicit_evidence"}
@@ -211,6 +228,18 @@ def resolve_query_plan(query: Optional[str], conn: sqlite3.Connection, category=
         plan.inferred_category = None
     tokens, plan.ignored = content_tokens(retrieval)
     policy = classify_retrieval_tokens(tokens, generic_words=generic, catalog_brands=brands)
+    if named_constraints and plan.inferred_category and tokens and not policy['protected_tokens']:
+        from src.spec.taxonomy_loader import tokens_equivalent
+        cat = taxonomy.categories[plan.inferred_category]
+        category_words = {word for phrase in [cat.id.replace('-',' '),*cat.detect_keywords]
+                          for word in tokenize(phrase)}
+        if all(any(tokens_equivalent(token.lower(), word) for word in category_words) for token in tokens):
+            # A category noun in a named parametric request is a category
+            # selector. Requiring its exact title spelling excludes MCU parts
+            # called "Microcontrollers" or described only by their model.
+            plan.category_terms = list(tokens)
+            tokens = []
+            policy = classify_retrieval_tokens(tokens,generic_words=generic,catalog_brands=brands)
     policy["role"] = identify_product(retrieval).role
     plan.protected_tokens = policy["protected_tokens"]
     plan.identity_policy = policy if plan.protected_tokens else {}

@@ -545,6 +545,14 @@ class FlyroboAdapter(BaseAdapter):
                 logger.debug("[%s] Failed to parse search card: %s", self.vendor_name, exc)
         return products
 
+    @staticmethod
+    def _description_html(soup, node):
+        fragment = soup.select_one("#tab-description, [itemprop='description'], .product-description")
+        if fragment is not None:
+            return str(fragment)
+        description = node.get("description")
+        return description if isinstance(description, str) else None
+
     def _parse_product_page(
         self, html: str, url: str, slug: Optional[str] = None
     ) -> Optional[UnifiedProduct]:
@@ -679,6 +687,7 @@ class FlyroboAdapter(BaseAdapter):
                 "stock_note": stock_note,
                 "source": "sitemap",
             },
+            description_html=self._description_html(soup, node),
         )
 
     # ------------------------------------------------------------------

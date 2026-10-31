@@ -287,6 +287,8 @@ def vendor_fallback_key_applies(category, key):
 
 # unit text -> (base dimension, multiplier to base)
 _UNIT_TO_BASE: Dict[str, Tuple[str, float]] = {
+    "s": ("time", 1.0), "ms": ("time", 1e-3), "us": ("time", 1e-6), "ns": ("time", 1e-9),
+    "ppm/c": ("ppm/c", 1.0),
     "v": ("v", 1.0), "mv": ("v", 1e-3), "kv": ("v", 1e3),
     "a": ("a", 1.0), "ma": ("a", 1e-3), "ua": ("a", 1e-6),
     "w": ("w", 1.0), "mw": ("w", 1e-3), "kw": ("w", 1e3),
@@ -306,6 +308,7 @@ _UNIT_TO_BASE: Dict[str, Tuple[str, float]] = {
 
 # base dimension -> (display unit, multiplier from base to display)
 _BASE_DISPLAY: Dict[str, Tuple[str, float]] = {
+    "time": ("s", 1.0), "ppm/c": ("ppm/C", 1.0),
     "v": ("V", 1.0),
     "a": ("A", 1.0),
     "w": ("W", 1.0),
@@ -327,6 +330,7 @@ def target_unit_for_key(key: str) -> Optional[str]:
     """Declared/display unit for a canonical or vendor key, when known."""
     k = normalize_vendor_key(key)
     suffixes = (
+        ("_ppm_per_c", "ppm/C"), ("_ms", "ms"), ("_us", "us"), ("_ns", "ns"),
         ("_v", "V"), ("_a", "A"), ("_w", "W"), ("_ohm", "ohm"),
         ("_uf", "uF"), ("_uh", "uH"), ("_pf", "pF"), ("_mhz", "MHz"),
         ("_mm2", "mm2"), ("_mm", "mm"), ("_mah", "mAh"), ("_pct", "%"),
@@ -377,6 +381,7 @@ _UNIT_ALIASES: Dict[str, str] = {
 
 def _unit_factor(unit: Any) -> Optional[Tuple[str, float]]:
     raw = str(unit or "").strip().lower()
+    raw = raw.replace("\u2103", "c").replace("\u00b0", "").replace("\u00b5", "u").replace("\u03bc", "u")
     raw = raw.replace("µ", "u").replace("μ", "u").replace("ω", "ohm")
     raw = raw.replace("°", "").replace(" ", "")
     raw = raw.strip(" .,;:")
@@ -392,7 +397,7 @@ def _convert_to_target(
     """Converts a numeric value to the target display unit; returns (value, unit)."""
     factor = _unit_factor(raw_unit)
     if factor is None:
-        return float(number), (str(raw_unit).strip().lower() or target_unit)
+        return float(number), (str(raw_unit).strip().lower() if raw_unit is not None else target_unit)
     base_dim, base_mult = factor
     base_value = float(number) * base_mult
     if target_unit:
@@ -471,6 +476,9 @@ def normalize_vendor_value(
     text = str(value or "").strip()
     if _is_string_key(key):
         return canonical_enum_value(text), None, "string", None
+    interval = _numeric_interval(key, value, unit)
+    if interval:
+        return text.lower(), None, "string", interval[2]
 
     number: Optional[float] = None
     if value_num is not None:
@@ -482,6 +490,9 @@ def normalize_vendor_value(
     # "18650"). Only trust it when the unit is understood, the key declares a
     # numeric target, or the value text is a bare number.
     unit_info = _unit_factor(unit)
+    target_info = _unit_factor(target)
+    if unit_info and target_info and unit_info[0] != target_info[0]:
+        return text.lower(), None, "string", str(unit).strip().lower()
     bare_number = bool(re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text))
     starts_number = bool(re.match(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text))
     if number is not None and not (unit_info or _is_integer_key(key) or bare_number or (target and starts_number)):
@@ -504,7 +515,7 @@ def normalize_vendor_value(
             return str(converted), float(converted), "integer", display_unit
         cleaned = float(f"{converted:.12g}")
         return f"{cleaned:g}", cleaned, "float", display_unit
-    return canonical_enum_value(text), None, "string", (str(unit).strip().lower() or None)
+    return canonical_enum_value(text), None, "string", (str(unit).strip().lower() if unit is not None else None)
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +556,14 @@ def _rows_for_attribute(
         product_id, raw_key, raw_value, raw_num, raw_type, raw_unit,
         raw_key, confidence_value, source,
     )]
+    # Preserve source ranges as text; publish their explicit endpoints as
+    # additional fields instead of pretending a range is a scalar rating.
+    interval = _numeric_interval(raw_key, value, unit)
+    if interval:
+        low, high, interval_unit = interval
+        for suffix, number in (("min",low),("max",high)):
+            rows.append((product_id, f"{raw_key}_{suffix}", f"{number:g}", number,
+                         "float", interval_unit, raw_key, confidence_value, "vendor_interval"))
     target = (VENDOR_KEY_ALIASES.get(category or "") or {}).get(raw_key)
     if target and normalize_vendor_key(target) != raw_key:
         target_key = normalize_vendor_key(target)
@@ -557,6 +576,35 @@ def _rows_for_attribute(
                 raw_key, confidence_value, "vendor_alias",
             ))
     return rows
+
+
+def _numeric_interval(key, value, unit):
+    """Only explicit, complete ranges with an understood physical unit."""
+    if _is_string_key(key):
+        return None
+    text = str(value or "").strip()
+    # A stated ± bound is an interval; its sign is retained in the endpoints.
+    symmetric = re.fullmatch(r"±\s*(\d+(?:\.\d+)?)\s*ppm\s*/\s*(?:°?c|℃)", text, re.I)
+    if symmetric:
+        bound = float(symmetric[1])
+        return -bound,bound,"ppm/C"
+    match = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\s*([a-zµμ°℃/%]*)\s*(?:to|~|–|-)\s*([+-]?\d+(?:\.\d+)?)\s*([a-zµμ°℃/%]*)", text, re.I)
+    if not match:
+        return None
+    target = target_unit_for_key(key)
+    source_unit = match[4].strip() or match[2].strip() or unit or target
+    lower_unit = match[2].strip() or source_unit
+    source_factor, lower_factor = _unit_factor(source_unit), _unit_factor(lower_unit)
+    if source_factor is None or lower_factor is None or source_factor[0] != lower_factor[0]:
+        return None
+    target_factor = _unit_factor(target)
+    if target_factor and source_factor[0] != target_factor[0]:
+        return None
+    low, out_unit = _convert_to_target(float(match[1]), lower_unit, target)
+    high, _ = _convert_to_target(float(match[3]), source_unit, target)
+    if not math.isfinite(low) or not math.isfinite(high) or low > high:
+        return None
+    return low,high,out_unit
 
 
 def rebuild_vendor_specs(
@@ -589,9 +637,9 @@ def rebuild_vendor_specs(
         WHERE 1=1 {where}
         ORDER BY
           CASE a.source
-            WHEN 'description_table' THEN 1
+            WHEN 'description_table' THEN 3
             WHEN 'description_text' THEN 2
-            WHEN 'title_heuristic' THEN 3
+            WHEN 'title_heuristic' THEN 1
             ELSE 0
           END ASC,
           COALESCE(a.confidence, 0) ASC,
@@ -638,7 +686,7 @@ def rebuild_vendor_specs(
     return stats
 
 
-def recompute_vendor_stats(conn: sqlite3.Connection) -> None:
+def recompute_vendor_stats(conn: sqlite3.Connection, *, commit: bool = True) -> None:
     """Rebuilds global and per-category statistics from normalized vendor rows."""
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("DELETE FROM vendor_spec_stats_global;")
@@ -678,7 +726,8 @@ def recompute_vendor_stats(conn: sqlite3.Connection) -> None:
         """,
         (now,),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -707,11 +756,14 @@ def load_vendor_specs(
     if category:
         rows = conn.execute(
             f"""
-            SELECT g.key, g.value_type, g.unit, g.applicable_count, g.value_min,
-                   g.value_max, s.filled_count, s.applicable_count
+            SELECT g.key,
+                   CASE WHEN s.value_min IS NOT NULL OR s.value_max IS NOT NULL
+                        THEN 'float' ELSE 'string' END,
+                   s.unit, g.applicable_count, s.value_min,
+                   s.value_max, s.filled_count, s.applicable_count
             FROM vendor_spec_stats_global g
-            LEFT JOIN vendor_spec_stats s ON s.key = g.key AND s.category = ?
-            WHERE g.applicable_count >= ? {key_clause}
+            JOIN vendor_spec_stats s ON s.key = g.key AND s.category = ?
+            WHERE g.applicable_count >= ? AND s.filled_count > 0 {key_clause}
             ORDER BY COALESCE(s.filled_count, 0) DESC, g.applicable_count DESC;
             """,
             [category, max(1, min_count)] + params,

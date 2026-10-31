@@ -39,7 +39,7 @@ from src.search.query_terms import (
 from src.search.ranking import (rank_products, spec_completeness_bonus,
                                 category_spec_bonus)
 from src.search.planner import resolve_query_plan
-from src.search.filter_plan import FilterPlanError, prepare_filters
+from src.search.filter_plan import FilterPlanError, prepare_filters, category_spec_keys
 from src.search.catalog_query import CatalogQuery, build_catalog_statements
 from src.search.product_role import classify_role, identify_product, spec_subject, identity_policy_summary
 from src.search.listing_identity import sold_form, comparison_evidence
@@ -63,10 +63,11 @@ from src.spec.vendor_index import (
     vendor_alias_is_current,
 )
 from src.spec.taxonomy_loader import get_taxonomy
+from src.spec.discovery import discover_specs as discover_spec_fields, spec_values as inspect_spec_values
 
 logger = logging.getLogger(__name__)
 
-SERVER_VERSION = "2.4.0"
+SERVER_VERSION = "2.5.0"
 SCHEMA_VERSION = "2.4.0"
 
 # Hard ceiling on page size. An agent asking for 1000 rows is almost always
@@ -810,12 +811,8 @@ def _valid_categories(conn: sqlite3.Connection) -> List[str]:
 
 
 def _category_spec_keys(conn: sqlite3.Connection, category: str) -> List[str]:
-    """Spec keys owned by a taxonomy category; used to rank genuine components first."""
-    rows = conn.execute(
-        "SELECT DISTINCT key FROM spec_definitions WHERE category = ? ORDER BY key;",
-        (category,),
-    ).fetchall()
-    return [str(r[0]) for r in rows]
+    """Shared applicability includes stored fields without a UI definition."""
+    return category_spec_keys(conn, category)
 
 
 def _resolve_category_or_error(
@@ -1038,7 +1035,9 @@ def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
     """
     Return comprehensive catalog-level metadata, total product counts, vendor distributions, category counts, queryable spec keys with coverage percentages, and data freshness timestamps.
 
-    Recommended Call Order: Call describe_catalog first before running any searches to inspect available attributes and catalog size.
+    Recommended Call Order: Call describe_catalog first, then discover_specs(category=..., search=...)
+    to find all fields, including vendor-only and rare fields. This overview is not
+    the exhaustive field registry. spec_values inspects values and usable coverage.
 
     Using The Output: taxonomy[].id lists accepted categories. taxonomy[].products
     and products_component match default category counts; products_with_related is
@@ -1189,6 +1188,9 @@ def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
                 "spec_index_updated_at": spec_index_updated_at,
                 "vendor_spec_key_count": int(conn.execute("SELECT COUNT(*) FROM vendor_spec_stats_global").fetchone()[0]),
                 "vendor_spec_discovery_min_count": 5,
+                "spec_discovery": {"tool": "discover_specs", "values_tool": "spec_values",
+                                   "complete": True, "min_count": 1,
+                                   "example": {"category": "microcontrollers", "search": "adc"}},
                 "summary": True,
                 "spec_statistics_scope": "stored_promoted_rows; describe_spec gives filterable coverage",
                 "identity_policy": {"version": 1, "details": "describe_catalog(summary=False)"},
@@ -1222,6 +1224,10 @@ def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
             "vendor_spec_key_count": int(conn.execute("SELECT COUNT(*) FROM vendor_spec_stats_global").fetchone()[0]),
                 "vendor_spec_discovery_min_count": 5,
             "vendor_spec_keys": vendor_key_payload,
+            "vendor_spec_keys_truncated": len(vendor_keys) > len(vendor_key_payload),
+            "spec_discovery": {"tool": "discover_specs", "values_tool": "spec_values",
+                               "complete": True, "min_count": 1,
+                               "example": {"category": "motor", "search": "shaft"}},
             "currency": "INR",
             "freshness": {
                 "oldest_crawl": oldest_crawl,
@@ -1841,7 +1847,8 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
 
         stored_description = db.get_product_description(product_id)
         if stored_description and stored_description.get("description"):
-            description = stored_description["description"]
+            from src.spec.description import description_text
+            description = description_text(stored_description["description"])
             description_source = f"vendor_page:{stored_description.get('source') or 'stored'}"
         elif raw_meta.get("body"):
             description, description_source = raw_meta["body"], "vendor_page"
@@ -1960,7 +1967,9 @@ def search_components(
     """
     Search electronic components by parametric spec filters and/or full-text query with side-by-side vendor offers and cursor pagination.
 
-    Recommended Call Order: Call after sizing the query with count_components to retrieve paginated component comparison cards.
+    Recommended Call Order: discover_specs(category=..., search=...) -> spec_values(key=...)
+    -> count_components -> search_components. Discovery includes rare and vendor-only
+    fields; do not infer that a field is unavailable from the catalog overview.
 
     Parameter Syntax:
       - filters: dict (supports scalar equality or operators in, gte, lte, gt, lt, eq, tolerance;
@@ -1979,6 +1988,10 @@ def search_components(
         case-insensitive, plural tolerant; see describe_catalog data.taxonomy, default: null)
       - compact: bool (default: false; return only product_id/title/vendor/price/currency/
         stock_status/mpn/specs/product_url per row, keeping 50 rows under 25 KB)
+      - vendor_filters: dict (same operators as filters; use for fields returned with
+        filter_parameter='vendor_filters' by discover_specs)
+      - include_vendor_specs: bool (default true; use normalized vendor evidence as
+        fallback for curated specifications, with source and uncertainty disclosed)
 
     Identity: modeled families require sold-item identity evidence. include_related=True
     browses the broad category; product_identity and spec_subjects disclose what each
@@ -2834,11 +2847,64 @@ def search_components(
         conn.close()
 
 @mcp.tool()
+def discover_specs(category: Optional[str] = None, search: Optional[str] = None,
+                   tier: str = "all", limit: int = 30,
+                   cursor: Optional[str] = None) -> ToolResponseEnvelope:
+    """Find every stored specification key by category and/or words in its name.
+
+    Call this before constructing filters; do not guess a key from product titles.
+    Includes vendor-only and rare fields with one observation. Follow next_cursor
+    until null for exhaustive discovery; there is no top-100 cutoff. Counts are
+    stored evidence before ownership checks. spec_values gives usable coverage,
+    operators' value distributions and units. Use the returned filter_parameter
+    with search_components/count_components. Example: category='microcontrollers',
+    search='adc'; then vendor_filters={'adc_bits': {'gte':12}}.
+    """
+    conn = get_db()
+    try:
+        data = discover_spec_fields(conn, category=category, search=search, tier=tier,
+                                    limit=limit, cursor=cursor)
+        return make_response(data=data, total_matches=data["total_fields"], returned=data["returned"],
+                             truncated=data["has_more"], next_cursor=data["next_cursor"])
+    except FilterPlanError as exc:
+        return make_error(**exc.error)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def spec_values(key: str, category: Optional[str] = None, tier: str = "auto",
+                search: Optional[str] = None, limit: int = 30,
+                cursor: Optional[str] = None) -> ToolResponseEnvelope:
+    """Inspect a discovered field's usable values and numeric range, with pagination.
+
+    Match the category and tier returned by discover_specs. search filters the
+    value vocabulary. Counts use the same evidence/ownership rules as search;
+    missing_or_unusable is not a negative specification. Filter with the returned
+    key and filter_parameter. Follow next_cursor even on empty pages. Exact
+    total_values/total_matches can be null when alias conflicts require further
+    evaluation; total_value_candidates is explicitly a candidate count. Each
+    returned value's count is exact. Work is bounded to the requested page.
+    """
+    conn = get_db()
+    try:
+        data = inspect_spec_values(conn, key, category=category, tier=tier,
+                                   search=search, limit=limit, cursor=cursor)
+        return make_response(data=data, total_matches=data["total_values"], returned=len(data["values"]),
+                             truncated=data["has_more"], next_cursor=data["next_cursor"])
+    except FilterPlanError as exc:
+        return make_error(**exc.error)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
 def list_spec_keys() -> ToolResponseEnvelope:
     """
-    Return a list of all queryable spec attributes with fill counts and valid values/ranges for backward compatibility.
+    Return the legacy curated-spec overview, not the complete set of queryable fields.
 
-    Recommended Call Order: Maintained for backward compatibility; agents should prefer describe_catalog.
+    Recommended Call Order: use discover_specs for searchable, paginated discovery
+    of all populated fields. spec_values inspects usable values and coverage.
 
     Parameter Syntax: Takes no arguments.
 
@@ -2880,15 +2946,17 @@ def list_spec_keys() -> ToolResponseEnvelope:
                 "spec_keys": spec_keys_list,
                 "spec_key_names": [s["key"] for s in spec_keys_list],
                 "deprecated": True,
-                "replacement": "describe_catalog(summary=True)",
+                "replacement": "discover_specs",
+                "complete": False,
+                "complete_field_registry": "discover_specs",
             },
             total_matches=len(spec_keys_list),
             returned=len(spec_keys_list),
             warnings=[{
                 "code": "deprecated_tool",
                 "message": (
-                    "list_spec_keys is retained for backward compatibility. Use "
-                    "describe_catalog(summary=True) for a compact key/type/unit/coverage catalog."
+                    "This is only the legacy curated overview. Use discover_specs "
+                    "and follow next_cursor to discover all populated vendor and curated fields."
                 ),
             }],
         )

@@ -24,7 +24,7 @@ class CatalogSearch:
 
     def prepare(self, query=None, *, filters=None, category=None, vendor=None,
                 in_stock_only=False, include_related=False, price_min=None,
-                price_max=None, listing_ids=None):
+                price_max=None, listing_ids=None, vendor_filters=None):
         text_plan = None
         expression = None
         original = query.strip() if query is not None else None
@@ -38,7 +38,7 @@ class CatalogSearch:
             category = category or text_plan.inferred_category
         normalized = prepare_filters(
             self.connection, filters, category=category,
-            metadata=None if filters else {},
+            metadata=None if filters else {}, vendor_filters=vendor_filters,
         )
         catalog_query = CatalogQuery.from_filters(
             normalized.filters, normalized.metadata,

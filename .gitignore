@@ -25,6 +25,7 @@ logs/
 /data/backups/
 /scratch/catalog_backups/
 /scratch/blackbox_*/
+/scratch/discovery_tests_*/
 /reports/backend-quality/
 /reports/backend-quality-review/
 

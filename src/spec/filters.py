@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Advertised spec metadata
 # ---------------------------------------------------------------------------
 
-def load_catalog_specs(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+def load_catalog_specs(conn: sqlite3.Connection, min_count: int = 1) -> Dict[str, Dict[str, Any]]:
     """
     Loads all advertised spec key metadata from spec_stats_global.
 
@@ -34,9 +34,9 @@ def load_catalog_specs(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
     cur.execute("""
         SELECT key, value_type, applicable_count, value_min, value_max, value_counts
         FROM spec_stats_global
-        WHERE applicable_count >= 50
+        WHERE applicable_count >= ?
         ORDER BY applicable_count DESC;
-    """)
+    """, (max(1, int(min_count)),))
     specs: Dict[str, Dict[str, Any]] = {}
     for r in cur.fetchall():
         specs[r[0]] = {
@@ -171,6 +171,7 @@ _PREFIX_FACTORS: Dict[str, float] = {
 }
 
 _BASE_UNIT_ALIASES: Dict[str, set] = {
+    "s": {"s", "second", "seconds", "sec"},
     "ohm": {"ohm", "ohms", "r", "ω"},
     "f": {"f", "farad", "farads"},
     "h": {"h", "henry", "henries"},
@@ -192,6 +193,7 @@ _ALIAS_TO_BASE: Dict[str, str] = {
 
 # Target unit -> (base unit, factor that converts base unit into target unit).
 _TARGET_UNITS: Dict[str, Tuple[str, float]] = {
+    "s": ("s", 1.0), "ms": ("s", 1000.0), "us": ("s", 1e6), "ns": ("s", 1e9),
     "ohm": ("ohm", 1.0),
     "ω": ("ohm", 1.0),
     "f": ("f", 1.0),
@@ -226,7 +228,7 @@ _TARGET_UNITS: Dict[str, Tuple[str, float]] = {
     "ghz": ("hz", 1e-3),
     "m": ("m", 1.0),
     "cm": ("m", 100.0),
-    "mm": ("mm", 1.0),
+    "mm": ("m", 1000.0),
     "mm2": ("mm2", 1.0),
     "mm²": ("mm2", 1.0),
     "in": ("in", 1.0),
@@ -309,6 +311,9 @@ def parse_engineering_value(
         return _clean_number(float(text))
 
     base_unit, target_factor = _target_unit(unit)
+    if str(unit or "").casefold() in {"ppm/c", "ppm/°c", "ppm/℃"}:
+        ppm = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*ppm\s*/\s*(?:°?c|℃)\s*", text, re.I)
+        return _clean_number(float(ppm[1])) if ppm else None
 
     # RKM notation: 4k7 == 4.7k, 4R7 == 4.7 ohm.
     rkm = _RKM_RE.match(text)
@@ -345,6 +350,15 @@ def parse_engineering_value(
 
     prefix_factor = _PREFIX_FACTORS.get(prefix, 1.0) if prefix else 1.0
     unit_text = _clean_unit_text(unit_tail)
+    whole_unit = _clean_unit_text(prefix + unit_tail)
+    # The regex splits leading SI prefixes, including the first m in "mm".
+    # Recognize whole length-unit names before interpreting that split.
+    length_units = {"m": 1.0, "meter": 1.0, "meters": 1.0, "metre": 1.0, "metres": 1.0,
+                    "mm": 0.001, "millimeter": 0.001, "millimeters": 0.001,
+                    "millimetre": 0.001, "millimetres": 0.001,
+                    "cm": 0.01, "centimeter": 0.01, "centimeters": 0.01}
+    if whole_unit in length_units and base_unit == "m":
+        return _clean_number(number * length_units[whole_unit] * target_factor)
     if unit_text:
         unit_base = _ALIAS_TO_BASE.get(unit_text)
         if unit_base is None:
@@ -714,6 +728,9 @@ def resolve_category(
     singular = _singular(raw)
     if singular in valid:
         return singular, []
+    equivalents = [category for category in valid if _singular(category) == singular]
+    if len(equivalents) == 1:
+        return equivalents[0], []
 
     close = difflib.get_close_matches(raw, valid, n=limit, cutoff=0.4)
     if not close and singular != raw:
@@ -811,6 +828,7 @@ def parse_and_validate_filters(
     advertised_specs: Dict[str, Dict[str, Any]],
     category: Optional[str] = None,
     coercions: Optional[List[Dict[str, Any]]] = None,
+    _depth: int = 0,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Validates filter keys and operators, rejecting deprecated string range forms.
@@ -819,6 +837,8 @@ def parse_and_validate_filters(
     like the MCP error envelope fields (`error_code`, `message`, `valid_keys`,
     `suggestions`, `details`) so any caller can render it in its own envelope.
     """
+    if _depth > 16:
+        return None, {"error_code": "invalid_filter_value", "message": "Filter conjunction nesting exceeds 16 levels."}
     clean_filters = filters or {}
     if not isinstance(clean_filters, dict):
         return None, {"error_code": "invalid_filter_value", "message": "filters must be an object."}
@@ -845,6 +865,23 @@ def parse_and_validate_filters(
             return None, {"error_code": "invalid_filter_value", "message": f"Filter '{f_key}' requires a non-null scalar or operator object."}
         if isinstance(f_val, dict) and not f_val:
             return None, {"error_code": "invalid_filter_value", "message": f"Filter '{f_key}' has an empty operator set."}
+        if isinstance(f_val, dict) and "all" in f_val:
+            clauses = f_val["all"]
+            if not isinstance(clauses, list) or not clauses:
+                return None, {"error_code": "invalid_filter_value", "message": f"Filter '{f_key}': all requires a nonempty list of requirements."}
+            clauses = list(clauses)
+            other = {operator: value for operator, value in f_val.items() if operator != "all"}
+            if other:
+                clauses.append(other)
+            combined = []
+            for clause in clauses:
+                result, error = parse_and_validate_filters({f_key: clause}, advertised_specs,
+                                                           category=category, coercions=coercions, _depth=_depth+1)
+                if error:
+                    return None, error
+                combined.append(result[f_key])
+            normalized[f_key] = {"all": combined}
+            continue
         raw_scalars = list(f_val.values()) if isinstance(f_val, dict) else [f_val]
         raw_scalars = [item for v in raw_scalars for item in (v if isinstance(v, (list, tuple)) else [v])]
         if any(v is None or isinstance(v, (dict, list, tuple, bool)) for v in raw_scalars):
@@ -872,7 +909,7 @@ def parse_and_validate_filters(
 
         # Operator dictionary
         if isinstance(f_val, dict):
-            allowed_ops = {"in", "gte", "lte", "gt", "lt", "eq", "tolerance"}
+            allowed_ops = {"in", "gte", "lte", "gt", "lt", "eq", "tolerance", "all"}
             unknown_ops = set(f_val.keys()) - allowed_ops
             if unknown_ops:
                 return None, {
@@ -1124,6 +1161,10 @@ def _value_conditions(
     params: List[Any] = []
 
     if isinstance(f_val, dict):
+        for clause in f_val.get("all", []):
+            clause_conditions, clause_params = _value_conditions(alias, clause, spec_meta)
+            conditions.extend(clause_conditions)
+            params.extend(clause_params)
         if "in" in f_val:
             values: List[Any] = []
             for value in f_val["in"]:

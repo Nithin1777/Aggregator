@@ -46,15 +46,27 @@ def _validated(filters, metadata, *, category=None, tier=None, coercions=None):
     return normalized or {}
 
 
+def category_spec_keys(conn, category):
+    """Configured keys plus curated evidence actually stored in this category.
+
+    Storage presence makes a field addressable, not automatically valid evidence;
+    the shared predicates still enforce ownership, type and identity.
+    """
+    if not category:
+        return []
+    return [str(row[0]) for row in conn.execute(
+        "SELECT key FROM spec_definitions WHERE category=? UNION "
+        "SELECT s.key FROM product_specs s JOIN products p ON p.id=s.product_id "
+        "WHERE p.category_canonical=? ORDER BY key", (category,category),
+    )]
+
+
 def prepare_filters(conn, filters=None, *, category=None, category_keys=None,
                     vendor_filters=None, include_vendor_specs=True, metadata=None):
     """Prepare the same engineering requirements for any search surface."""
     metadata = load_catalog_specs(conn) if metadata is None else metadata
     if category_keys is None:
-        category_keys = [str(row[0]) for row in conn.execute(
-            "SELECT DISTINCT key FROM spec_definitions WHERE category = ? ORDER BY key;",
-            (category,),
-        )] if category else []
+        category_keys = category_spec_keys(conn, category)
     if filters is not None and not isinstance(filters, dict):
         raise FilterPlanError({"error_code": "invalid_filter_value", "message": "filters must be an object."})
     if vendor_filters is not None and not isinstance(vendor_filters, dict):
@@ -62,8 +74,13 @@ def prepare_filters(conn, filters=None, *, category=None, category_keys=None,
     promoted, automatic_vendor, tier_routes = split_filter_tiers(
         filters, metadata, conn, category, category_keys, allow_vendor=include_vendor_specs,
     )
-    requested_vendor = {**automatic_vendor,
-                        **{normalize_vendor_key(k): v for k, v in (vendor_filters or {}).items()}}
+    requested_vendor = dict(automatic_vendor)
+    for raw_key, value in (vendor_filters or {}).items():
+        key = normalize_vendor_key(raw_key)
+        if key in requested_vendor and requested_vendor[key] != value:
+            requested_vendor[key] = {"all": [requested_vendor[key], value]}
+        else:
+            requested_vendor[key] = value
     vendor_metadata = load_vendor_filter_meta(conn, requested_vendor, category)
     missing = [key for key in requested_vendor if key not in vendor_metadata]
     if missing:

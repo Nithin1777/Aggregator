@@ -32,6 +32,7 @@ from models import ClickFeedback, SearchResponse
 from search_service import AggregatorEngine
 from src.search.query_terms import parse_price_constraints
 from src.search.filter_plan import FilterPlanError, prepare_filters
+from src.spec.discovery import discover_specs as discover_spec_fields, spec_values as inspect_spec_values
 from src.web.render import icon_svg
 
 # Logging configuration
@@ -314,6 +315,30 @@ async def api_categories(
     }
 
 
+@web_app.get("/api/specs")
+async def api_specs(category: Optional[str] = None, q: Optional[str] = None,
+                    tier: str = "all", limit: int = Query(30, ge=1, le=100),
+                    cursor: Optional[str] = None):
+    """Search and page through every populated specification field."""
+    conn = db.get_db_connection()
+    try:
+        return discover_spec_fields(conn, category=category, search=q, tier=tier, limit=limit, cursor=cursor)
+    finally:
+        conn.close()
+
+
+@web_app.get("/api/specs/values")
+async def api_spec_values(key: str, category: Optional[str] = None, tier: str = "auto",
+                         q: Optional[str] = None, limit: int = Query(30, ge=1, le=100),
+                         cursor: Optional[str] = None):
+    """Inspect usable values, coverage and missingness for a discovered field."""
+    conn = db.get_db_connection()
+    try:
+        return inspect_spec_values(conn, key, category=category, tier=tier, search=q, limit=limit, cursor=cursor)
+    finally:
+        conn.close()
+
+
 @web_app.get("/api/suggest")
 async def api_suggest(
     q: str = Query(..., min_length=1, description="Partially typed query"),
@@ -366,6 +391,7 @@ async def api_search(
         None,
         description='JSON object of spec filters, e.g. {"voltage": {"gte": 12}}',
     ),
+    vendor_filters: Optional[str] = Query(None, description="JSON filters for discovered vendor specification fields"),
 ):
     """
     JSON API endpoint for real-time or local component search.
@@ -381,7 +407,9 @@ async def api_search(
     query = (q or "").strip() if isinstance(q, str) else ""
     original_query = query
     # "resistor under ₹500" / "motor 300 to 1200" carry a budget in the text.
-    query, text_price_min, text_price_max = parse_price_constraints(query)
+    # The shared planner resolves named specifications before price phrases;
+    # pre-stripping "at least 12" here can turn an ADC count into a budget.
+    text_price_min, text_price_max = None, None
     category = _normalize_optional(category)
     vendor = _normalize_optional(vendor)
     in_stock = _normalize_flag(in_stock)
@@ -396,17 +424,18 @@ async def api_search(
     if price_min is not None and price_max is not None and price_min > price_max:
         price_min, price_max = price_max, price_min
     spec_filters = _normalize_spec_filters(spec_filters)
+    vendor_filters = _normalize_spec_filters(vendor_filters)
 
-    if spec_filters:
+    if spec_filters or vendor_filters:
         # Use the same tier/alias validation as catalog execution.
         conn = db.get_db_connection()
         try:
-            prepare_filters(conn, spec_filters, category=category)
+            prepare_filters(conn, spec_filters, category=category, vendor_filters=vendor_filters)
         finally:
             conn.close()
 
     if not query and (
-        category or vendor or spec_filters
+        category or vendor or spec_filters or vendor_filters or in_stock
         or price_min is not None or price_max is not None
     ):
         # Browse mode: list the filtered catalog instead of searching.
@@ -417,6 +446,7 @@ async def api_search(
             vendor=vendor or None,
             in_stock_only=bool(in_stock),
             spec_filters=spec_filters or None,
+            vendor_filters=vendor_filters or None,
             price_min=price_min,
             price_max=price_max,
         )
@@ -433,6 +463,7 @@ async def api_search(
                 refresh_mode=_normalize_refresh_mode(refresh),
                 category=category or None,
                 spec_filters=spec_filters or None,
+                vendor_filters=vendor_filters or None,
                 price_min=price_min,
                 price_max=price_max,
                 background_refresh=True,
@@ -442,6 +473,7 @@ async def api_search(
                 query=query, limit_per_vendor=min(page_size, 25),
                 vendor=vendor, category=category, in_stock_only=in_stock,
                 spec_filters=spec_filters or None, price_min=price_min, price_max=price_max,
+                vendor_filters=vendor_filters or None,
             )
 
         try:

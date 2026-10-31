@@ -6,7 +6,8 @@ from src.spec.filters import build_alias_expansion, canonical_enum_value, parse_
 
 
 def filter_population(conn, key, metadata, *, vendor_metadata=None, hybrid=True,
-                      category=None, include_related=False, vendor=False):
+                      category=None, include_related=False, vendor=False, values_limit=30,
+                      value_offset=0, value_search=None, include_numeric_values=False):
     meta = (vendor_metadata if vendor else metadata)[key]
     expansion = None if vendor else build_alias_expansion(key, {}, metadata)
     predicates = compile_predicates(
@@ -45,7 +46,11 @@ def filter_population(conn, key, metadata, *, vendor_metadata=None, hybrid=True,
         for pid, storage_key, value, number in rows:
             if meta["type"] in {"integer", "float"} and number is not None:
                 value = number
-            canonical = canonical_enum_value(value, {"key": key})
+                # Categorical cleanup strips decoration such as leading hyphens.
+                # Numeric signs are data, especially temperature/range minima.
+                canonical = str(number)
+            else:
+                canonical = canonical_enum_value(value, {"key": key})
             if (pid, canonical) not in seen:
                 values[canonical] += 1
                 seen.add((pid, canonical))
@@ -58,8 +63,12 @@ def filter_population(conn, key, metadata, *, vendor_metadata=None, hybrid=True,
     # Equality distributions must use the same evidence conflict policy as
     # retrieval. Only bounded top values are published; never invented totals.
     matched_values = {}
-    if meta["type"] in {"enum", "string"} or vendor:
-        for value, _ in values.most_common(30):
+    candidates = sorted(values.items(), key=lambda item: (-item[1], str(item[0])))
+    if value_search:
+        candidates = [(v,n) for v,n in candidates if str(value_search).casefold() in str(v).casefold()]
+    selected = candidates[value_offset:None if values_limit is None else value_offset+values_limit]
+    if meta["type"] in {"enum", "string"} or vendor or values_limit is None or include_numeric_values:
+        for value, _ in selected:
             if not expansion and not expand_enum_umbrella(key, value, None if vendor else category):
                 # The rows above already satisfy this single-key predicate's
                 # ownership, precedence and usability checks. Each listing has
@@ -84,9 +93,13 @@ def filter_population(conn, key, metadata, *, vendor_metadata=None, hybrid=True,
             if n:
                 matched_values[value] = n
     return {"coverage_count": count, "values": matched_values or None,
+            "value_candidates_count": len(candidates),
+            "next_value_offset": value_offset+len(selected),
+            "exact_value_count": (len(matched_values) if value_offset==0 and len(selected)==len(candidates)
+                                  else len(candidates) if not expansion else None),
             "range": {"min": min(numbers), "max": max(numbers)} if numbers and meta["type"] in {"integer", "float"} else None,
             "sample_raw_strings": list(matched_values or values)[:5],
             "population": {"measure": "usable_sold_item_evidence", "category": category,
                            "include_related": include_related, "include_vendor_specs": hybrid and not vendor,
                            "tier": "vendor" if vendor else "hybrid" if hybrid else "promoted",
-                           "values_limit": 30}}
+                           "values_limit": values_limit}}

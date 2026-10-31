@@ -35,6 +35,8 @@ class UnifiedProduct(BaseModel):
         description="Human-readable note about how the displayed price was derived (e.g. GST included)",
     )
     extra: Dict[str, Any] = Field(default_factory=dict, description="Vendor-specific metadata")
+    description_html: Optional[str] = Field(None, exclude=True, repr=False,
+        description="Ingestion-only source HTML; persisted separately from search responses")
 
 class VendorOffer(BaseModel):
     """An offer from a specific vendor within a comparison group."""

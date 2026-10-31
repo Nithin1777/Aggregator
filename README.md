@@ -1,5 +1,9 @@
 # Aggregate (Indian Component Aggregator Engine)
 
+MCP specification discovery now includes rare and vendor-only fields through
+`discover_specs` and paginated `spec_values`. See [specification discovery and
+enrichment](docs/spec_discovery.md) for the agent workflow and existing-catalog repair.
+
 Backend changes can be measured with the offline quality gate:
 
 ```powershell

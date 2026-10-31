@@ -177,6 +177,7 @@ class ShopifyAdapter(BaseAdapter):
                     product_url=product_url,
                     image_url=image_url,
                     category=category,
+                    description_html=item.get("body_html"),
                     price_note=self._price_note(price_ex_gst),
                     extra={
                         "handle": handle,

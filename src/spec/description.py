@@ -221,7 +221,7 @@ def description_text(description_html: Optional[str], limit: int = 20000) -> str
 
 def extract_description_attributes(
     description_html: Optional[str],
-    max_attributes: int = 80,
+    max_attributes: Optional[int] = 80,
 ) -> List[Dict[str, Any]]:
     """
     Extracts normalized key/value attributes from a vendor description.
@@ -238,20 +238,20 @@ def extract_description_attributes(
     attributes: Dict[str, Dict[str, Any]] = {}
     for key, value in _table_pairs(soup):
         _add(attributes, key, value, "description_table", 0.95)
-        if len(attributes) >= max_attributes:
+        if max_attributes is not None and len(attributes) >= max_attributes:
             break
 
-    if len(attributes) < max_attributes:
+    if max_attributes is None or len(attributes) < max_attributes:
         for key, value in _block_pairs(soup):
             _add(attributes, key, value, "description_text", 0.8)
-            if len(attributes) >= max_attributes:
+            if max_attributes is not None and len(attributes) >= max_attributes:
                 break
 
-    if len(attributes) < max_attributes:
+    if max_attributes is None or len(attributes) < max_attributes:
         text = soup.get_text("\n")
         for key, value in _text_pairs(text):
             _add(attributes, key, value, "description_text", 0.75)
-            if len(attributes) >= max_attributes:
+            if max_attributes is not None and len(attributes) >= max_attributes:
                 break
 
     return list(attributes.values())

@@ -93,8 +93,9 @@ HTTP discovery and MCP component-identity pagination intentionally have differen
 explicit expectations. Runtime suitability has no invented relevance judgment;
 it is checked as an uncertainty-preservation contract.
 
-Fifty explicit calibration listings populate the production spec-advertisement
-threshold. Their stored statistics are calculated from actual fixture rows;
+Fifty explicit calibration listings preserve the original evaluation population.
+Field discovery now includes single-observation keys rather than using that old
+advertisement threshold. Their stored statistics are calculated from fixture rows;
 search/planning/filtering functions are not patched. These calibration listings
 are nonrelevant to labeled requests.
 

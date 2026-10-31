@@ -990,6 +990,7 @@ class AggregatorEngine:
         page: int = 1,
         page_size: Optional[int] = None,
         background_refresh: bool = False,
+        vendor_filters: Optional[Dict[str, Any]] = None,
     ) -> SearchResponse:
         """
         Local catalog search with group-level pagination and price/stock refresh.
@@ -1008,6 +1009,7 @@ class AggregatorEngine:
             retrieve_catalog, query=query, limit=pool, vendor=vendor,
             in_stock_only=in_stock_only, category=category, spec_filters=spec_filters,
             price_min=price_min, price_max=price_max,
+            vendor_filters=vendor_filters,
         )
         total_matches, products = batch.total_matches, batch.products
         groups = await asyncio.to_thread(self.group_and_compare, products, query=query)
@@ -1050,6 +1052,7 @@ class AggregatorEngine:
                         retrieve_catalog, query=query, limit=pool, vendor=vendor,
                         in_stock_only=in_stock_only, category=category, spec_filters=spec_filters,
                         price_min=price_min, price_max=price_max,
+                        vendor_filters=vendor_filters,
                     )
                     total_matches, products = batch.total_matches, batch.products
                     groups = await asyncio.to_thread(
@@ -1086,6 +1089,7 @@ class AggregatorEngine:
         spec_filters: Optional[Dict[str, Any]] = None,
         price_min: Optional[float] = None,
         price_max: Optional[float] = None,
+        vendor_filters: Optional[Dict[str, Any]] = None,
     ) -> SearchResponse:
         """Paginated category/vendor browse (no text query)."""
         page = max(1, int(page or 1))
@@ -1100,6 +1104,7 @@ class AggregatorEngine:
             spec_filters=spec_filters or None,
             price_min=price_min,
             price_max=price_max,
+            vendor_filters=vendor_filters,
         )
         products = await asyncio.to_thread(
             db.list_products_by_category,
@@ -1110,6 +1115,7 @@ class AggregatorEngine:
             spec_filters=spec_filters or None,
             price_min=price_min,
             price_max=price_max,
+            vendor_filters=vendor_filters,
         )
         groups = await asyncio.to_thread(self.group_and_compare, products, None)
         return self._page_response(
@@ -1127,6 +1133,7 @@ class AggregatorEngine:
         vendor: Optional[str] = None, category: Optional[str] = None,
         in_stock_only: bool = False, spec_filters: Optional[Dict[str, Any]] = None,
         price_min: Optional[float] = None, price_max: Optional[float] = None,
+        vendor_filters: Optional[Dict[str, Any]] = None,
     ) -> SearchResponse:
         """
         Federated search across every configured vendor in parallel.
@@ -1185,7 +1192,8 @@ class AggregatorEngine:
         batch = await asyncio.to_thread(retrieve_catalog, clean_q,
                                         limit=max(1, len(ids)), listing_ids=tuple(ids),
                                         vendor=vendor, category=category, in_stock_only=in_stock_only,
-                                        spec_filters=spec_filters, price_min=price_min, price_max=price_max)
+                                        spec_filters=spec_filters, price_min=price_min, price_max=price_max,
+                                        vendor_filters=vendor_filters)
         eligible = {(product.vendor, str(product.external_id)): product.id for product in batch.products}
         all_products = [product for product in all_products
                         if (product.vendor, str(product.external_id)) in eligible]

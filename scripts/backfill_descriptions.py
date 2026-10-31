@@ -23,6 +23,7 @@ The script is idempotent: an existing description is skipped unless --force.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import sqlite3
@@ -95,18 +96,53 @@ def _persist(
     source: str,
     dry_run: bool,
 ) -> int:
-    attrs = extract_description_attributes(html)
-    text = description_text(html)
+    attrs = extract_description_attributes(html, max_attributes=None)
     if dry_run:
         return len(attrs)
-    db.save_product_description(product_id, text, source=source, conn=conn)
-    return db.replace_product_attributes(
-        product_id,
-        attrs,
-        source="description",
-        conn=conn,
-        source_prefix="description",
-    )
+    from src.spec.enrichment import ensure_enrichment_schema, enrich_listing, refresh_statistics
+    with conn:
+        ensure_enrichment_schema(conn)
+        result = enrich_listing(conn, product_id, description_html=html)
+        refresh_statistics(conn, result['keys'], result['vendor_keys'])
+        conn.execute("UPDATE product_descriptions SET source=? WHERE product_id=?", (source,product_id))
+    return len(attrs)
+
+
+async def _flyrobo(conn, limit, sleep_s, force, dry_run):
+    """Fetch missing descriptions only, without modifying prices or listing IDs."""
+    from adapters.flyrobo import FlyroboAdapter
+    from bs4 import BeautifulSoup
+    adapter = FlyroboAdapter()
+    stats = {"scanned":0,"matched":0,"saved":0,"attributes":0,"skipped":0,"failed":0}
+    rows = conn.execute("SELECT id,product_url FROM products WHERE vendor='flyrobo' ORDER BY id").fetchall()
+    try:
+        for product_id,url in rows:
+            if not force and _already_done(conn,int(product_id)):
+                stats['skipped'] += 1
+                continue
+            if limit and stats['scanned'] >= limit:
+                break
+            stats['scanned'] += 1
+            try:
+                html = await adapter._fetch_text(url)
+                if html is None:
+                    stats['failed'] += 1
+                    continue
+                soup = BeautifulSoup(html,'html.parser')
+                fragment = adapter._description_html(soup,adapter._jsonld_product(soup) or {})
+                if not fragment:
+                    stats['failed'] += 1
+                    continue
+                stats['matched'] += 1
+                stats['attributes'] += _persist(conn,int(product_id),fragment,'flyrobo_product_page',dry_run)
+                stats['saved'] += int(not dry_run)
+            except Exception as exc:
+                stats['failed'] += 1
+                logger.warning('[flyrobo] Description fetch failed for %s: %s',url,exc)
+            await asyncio.sleep(sleep_s)
+    finally:
+        await adapter.close()
+    return stats
 
 
 def _shopify_vendor(
@@ -453,6 +489,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     force=args.force,
                     dry_run=args.dry_run,
                 )
+            elif vendor == "flyrobo":
+                totals[vendor] = asyncio.run(_flyrobo(conn,max(0,args.limit),max(0.0,args.sleep),args.force,args.dry_run))
             elif vendor == "robokits":
                 totals[vendor] = _robokits(
                     conn, max(0, args.limit), max(0.0, args.sleep), args.force, args.dry_run
