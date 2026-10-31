@@ -8,6 +8,45 @@ vocabulary does not inflate every MCP response.
 
 ## MCP workflow
 
+The server sends structured-query guidance in the MCP `initialize` response.
+Search/count tool descriptions and parameter schemas repeat the key guidance for
+hosts that only provide tool definitions to their model. For explicit engineering
+requirements, prefer `category` plus `filters`/`vendor_filters`; reserve `query`
+for remaining required brand, model or variant text. A pure parametric search
+does not need `query`. Known field metadata can be reused within a task; discovery
+and counting are useful when needed, rather than mandatory extra calls every time.
+
+For example, after checking field names and units, a request for a 24 V motor,
+50–120 RPM, at least 80 kg.cm torque, in stock and cheapest first becomes:
+
+```json
+{
+  "category": "motor",
+  "filters": {
+    "voltage": "24",
+    "rpm": {"gte": 50, "lte": 120},
+    "torque_kgcm": {"gte": 80}
+  },
+  "in_stock_only": true,
+  "sort": "price_asc",
+  "limit": 20
+}
+```
+
+If checking feasibility first, use the same requirements in `count_components`
+without `sort` and `limit`. Preserve all constraints in the subsequent search;
+an empty result is not permission to broaden the request. Inspect missingness,
+warnings and provenance before claiming suitability or live availability.
+
+Restart the running server and reconnect/reload tools in an existing MCP client
+after updating. MCP instructions are hints: a host may omit them and its agent
+still chooses calls. The schema descriptions provide another route for guidance;
+for a host you control, also include this structured-query policy in its agent
+instructions. An optional MCP prompt alone would not run automatically on connect.
+The wire test in `tests/test_mcp_guidance.py` checks delivered instructions,
+parameter examples and the example's compound filtering; it does not measure
+compliance by arbitrary third-party models.
+
 1. `discover_specs(category="microcontrollers", search="adc")` returns fields,
    types, units, supported operators, stored coverage and `filter_parameter`.
 2. `spec_values(key="adc_bits", category="microcontrollers", tier="vendor")`

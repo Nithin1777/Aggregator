@@ -27,7 +27,7 @@ jobs:
       - name: Test the evaluator
         run: python -m pytest tests/test_backend_evaluation.py -q
       - name: Test MCP field discovery and transactional enrichment
-        run: python -m pytest tests/test_spec_discovery.py tests/test_spec_enrichment.py -q
+        run: python -m pytest tests/test_spec_discovery.py tests/test_spec_enrichment.py tests/test_mcp_guidance.py -q
       - name: Compare with versioned quality baseline
         run: python scripts/evaluate_backend.py --output reports/backend-quality/current.json
       - name: Compare PR implementation with its base implementation

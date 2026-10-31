@@ -64,10 +64,12 @@ from src.spec.vendor_index import (
 )
 from src.spec.taxonomy_loader import get_taxonomy
 from src.spec.discovery import discover_specs as discover_spec_fields, spec_values as inspect_spec_values
+from mcp_server.guidance import (SERVER_INSTRUCTIONS, CatalogCategory, IdentityQuery,
+                                 SpecFilters, VendorFilters)
 
 logger = logging.getLogger(__name__)
 
-SERVER_VERSION = "2.5.0"
+SERVER_VERSION = "2.5.1"
 SCHEMA_VERSION = "2.4.0"
 
 # Hard ceiling on page size. An agent asking for 1000 rows is almost always
@@ -99,7 +101,7 @@ class EnvelopeMCP(FastMCP):
         return await super().call_tool(name, arguments)
 
 
-mcp = EnvelopeMCP("aggregate-agent-first")
+mcp = EnvelopeMCP("aggregate-agent-first", instructions=SERVER_INSTRUCTIONS)
 _engine = AggregatorEngine()
 
 
@@ -1033,7 +1035,7 @@ def _category_coverage(conn: sqlite3.Connection) -> Dict[str, List[Dict[str, Any
 @mcp.tool()
 def describe_catalog(summary: bool = False) -> ToolResponseEnvelope:
     """
-    Return comprehensive catalog-level metadata, total product counts, vendor distributions, category counts, queryable spec keys with coverage percentages, and data freshness timestamps.
+    Discover category IDs, catalog coverage and freshness; use summary=true for initial orientation.
 
     Recommended Call Order: Call describe_catalog first, then discover_specs(category=..., search=...)
     to find all fields, including vendor-only and rare fields. This overview is not
@@ -1301,30 +1303,35 @@ def describe_spec(key: str, vendor: bool = False, include_vendor_specs: bool = T
 
 @mcp.tool()
 def count_components(
-    filters: Optional[Dict[str, Any]] = None,
-    query: Optional[str] = None,
+    filters: SpecFilters = None,
+    query: IdentityQuery = None,
     price_max: Optional[float] = None,
     in_stock_only: bool = False,
-    category: Optional[str] = None,
-    vendor_filters: Optional[Dict[str, Any]] = None,
+    category: CatalogCategory = None,
+    vendor_filters: VendorFilters = None,
     include_vendor_specs: bool = True,
     include_related: bool = False,
 ) -> ToolResponseEnvelope:
     """
-    Count matching components and inspect filter coverage without fetching product rows.
+    Check structured specification requirements and usable coverage before retrieving listings.
+
+    Prefer category + filters/vendor_filters for engineering requirements. Omit query
+    unless required brand/model/variant text remains. Reuse these same constraints
+    in search_components; sort and limit belong only on the search call.
 
     Identity: modeled component families require sold-item identity evidence by default.
     include_related=True browses the broader vendor category, including accessories and
     unknown identities. See describe_catalog.identity_policy for modeled families.
 
-    Recommended Call Order: Call after describe_catalog and before search_components to size query results and verify filter coverage.
+    Recommended Call Order: discover unknown fields with discover_specs, inspect values
+    with spec_values when needed, then count compound requirements before search_components.
 
     Parameter Syntax:
       - filters: dict (supports scalar equality or operators in, gte, lte, gt, lt, eq, tolerance;
         tolerance is a fraction of eq: 0.05 means +/-5%, must be > 0 and <= 1. Numeric keys accept
         engineering strings in the declared unit, e.g. resistance_ohm="10k", capacitance_uf="100nF".
         Default: null)
-      - query: str (FTS text search string, default: null)
+      - query: str (remaining required brand/model/variant text; omit for pure spec searches)
       - price_max: float (maximum price in INR, must be >= 0; default: null)
       - in_stock_only: bool (default: false)
       - category: str (restrict to a catalog category such as 'battery', 'motor', 'resistors';
@@ -1342,7 +1349,7 @@ def count_components(
     Freshness Note: counts are computed on the cached catalog snapshot. Search-time live
     price/stock verification happens in search_components, get_product and search_by_mpn.
 
-    Example Invocation: count_components(filters={"voltage": "12", "rpm": {"gte": 190, "lte": 210}}, query="motor", category="motor")
+    Example Invocation: count_components(category="motor", filters={"voltage":"24", "rpm":{"gte":50,"lte":120}, "torque_kgcm":{"gte":80}}, in_stock_only=True)
 
     Behavior When No Matches: Returns ok:true with total_matches:0, data: {"count": 0}, and suggestions if an enum value was unmatched.
     """
@@ -1948,8 +1955,8 @@ def get_product(product_id: int, refresh: bool = True, force_refresh: bool = Fal
 
 @mcp.tool()
 def search_components(
-    filters: Optional[Dict[str, Any]] = None,
-    query: Optional[str] = None,
+    filters: SpecFilters = None,
+    query: IdentityQuery = None,
     price_max: Optional[float] = None,
     in_stock_only: bool = False,
     sort: str = "relevance",
@@ -1957,15 +1964,20 @@ def search_components(
     cursor: Optional[str] = None,
     refresh: bool = True,
     force_refresh: bool = False,
-    category: Optional[str] = None,
+    category: CatalogCategory = None,
     compact: bool = False,
-    vendor_filters: Optional[Dict[str, Any]] = None,
+    vendor_filters: VendorFilters = None,
     include_vendor_specs: bool = True,
     include_related: bool = False,
     include_partial_candidates: bool = False,
 ) -> ToolResponseEnvelope:
     """
-    Search electronic components by parametric spec filters and/or full-text query with side-by-side vendor offers and cursor pagination.
+    Find components using structured category + filters/vendor_filters; preferred for specification-based requests.
+
+    Translate the user's explicit specs into structured arguments. Use query only
+    for remaining required brand/model/variant text; omit it for pure spec searches.
+    Put budgets in price_max, required stock in in_stock_only, and cheapest-first
+    in sort="price_asc". Preserve every requirement when reusing a count request.
 
     Recommended Call Order: discover_specs(category=..., search=...) -> spec_values(key=...)
     -> count_components -> search_components. Discovery includes rare and vendor-only
@@ -1976,7 +1988,7 @@ def search_components(
         tolerance is a fraction of eq: 0.05 means +/-5%, must be > 0 and <= 1. Numeric keys accept
         engineering strings in the declared unit, e.g. resistance_ohm="10k", capacitance_uf="100nF".
         Default: null)
-      - query: str (FTS query string, default: null)
+      - query: str (remaining required brand/model/variant text; omit for pure spec searches)
       - price_max: float (max price in INR, must be >= 0; default: null)
       - in_stock_only: bool (default: false; listings flag out-of-stock rather than silently omitting)
       - sort: str (one of 'relevance', 'price_asc', 'price_desc', default: 'relevance')
@@ -2019,13 +2031,12 @@ def search_components(
     last cached price/stock is served instead and data.price_stock_refresh reports the status.
 
     Spec Fields: 'specs' contains only extracted keys. Keys that were never extracted are named
-    in 'specs_not_extracted' (unknown is never reported as null) and are scoped to the product's
-    own category. 'spec_extraction_scope' is "unclassified" for products outside the taxonomy
-    (most of the catalog): for those, specs are not extracted at all — use the title,
-    description/raw_attributes, and price/stock instead. 'low_confidence_specs' lists keys whose
-    extraction confidence is below 1.0.
+    in 'specs_not_extracted' and are scoped to the product's own category. For fields beyond
+    these curated specs, use discover_specs and vendor_filters; inspect get_product for
+    descriptions/raw_attributes. Missing evidence is unknown, not a negative rating.
+    'low_confidence_specs' lists keys whose extraction confidence is below 1.0.
 
-    Example Invocation: search_components(query="12v geared motor", category="motor", filters={"rpm": {"lte": 1000}}, limit=10)
+    Example Invocation: search_components(category="motor", filters={"voltage":"24", "rpm":{"gte":50,"lte":120}, "torque_kgcm":{"gte":80}}, in_stock_only=True, sort="price_asc", limit=20)
 
     Behavior When No Matches: Returns ok:true with total_matches:0, data: {"results": []}, and
     rank-ordered suggestions if an enum value was unmatched (data.query_suggestions when the text
