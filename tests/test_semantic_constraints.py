@@ -148,10 +148,10 @@ def test_vendor_only_uses_same_state_partition(evidence_db):
 
 
 def test_aliases_do_not_turn_conflicting_requirements_into_alternatives(evidence_db):
-    from mcp_server.server import _expand_unscoped_aliases
+    from src.search.filter_plan import expand_unscoped_aliases
     metadata = {"voltage": {"type": "float", "unit": "V"},
                 "voltage_v": {"type": "float", "unit": "V"}}
-    _, aliases, _ = _expand_unscoped_aliases({"voltage": 12, "voltage_v": 24}, metadata)
+    _, aliases, _ = expand_unscoped_aliases({"voltage": 12, "voltage_v": 24}, metadata)
     assert len(aliases) == 2
     evidence_db.execute("INSERT INTO product_specs VALUES (1,'voltage','12',12)")
     predicates = compile_predicates({}, metadata, aliases=aliases)

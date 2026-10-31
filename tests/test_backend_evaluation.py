@@ -233,6 +233,11 @@ def test_missing_baseline_replaces_stale_report(tmp_path):
 def test_invalid_dataset_cannot_reduce_or_duplicate_evaluation_cases(tmp_path, mutation):
     names = ("catalog.json", "search_cases.json", "matching_scenarios.json")
     catalog, searches, matching = [json.loads((ROOT / "evaluations" / name).read_text(encoding="utf-8")) for name in names]
+    # The loader also requires reviewed labels. Include them so each mutation
+    # reaches its intended validation instead of failing on a missing file.
+    (tmp_path / "real_matching_labels.json").write_text(
+        (ROOT / "evaluations/real_matching_labels.json").read_text(encoding="utf-8"), encoding="utf-8",
+    )
     if mutation == "empty":
         searches["queries"] = []
     elif mutation == "duplicate_surface":

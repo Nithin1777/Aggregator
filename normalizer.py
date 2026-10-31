@@ -513,6 +513,22 @@ def extract_hardware_specs(title: str) -> dict:
     if pm:
         specs["pins"] = pm.group(1)
 
+    # Standard imperial SMD case codes are package sizes, not interchangeable
+    # resistor/capacitor variants. Require an explicit passive-component context.
+    if re.search(r"\b(?:resistors?|capacitors?|inductors?)\b", t):
+        package = re.search(r"\b(0201|0402|0603|0805|1206|1210|1812|2010|2512)\b", t)
+        if package:
+            specs["passive_package"] = package.group(1)
+
+    # Continuous battery output current differs from capacity (Ah) and peak
+    # current. Compare only the explicitly named continuous-discharge rating.
+    if re.search(r"\b(?:battery|batteries)\b", t):
+        discharge = re.search(
+            r"\b(\d+(?:\.\d+)?)\s*(?:a|amps?|amperes?)\s+continuous\s+discharge\b", t,
+        )
+        if discharge:
+            specs["continuous_discharge_a"] = float(discharge.group(1))
+
     # RAM capacity
     rm = re.search(r"\b([1248]gb)\b", t)
     if rm:

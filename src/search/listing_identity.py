@@ -1,7 +1,7 @@
 """Sold form and comparison evidence for identifiers shared by several listings."""
 import re
 from src.search.product_role import identify_product
-from normalizer import extract_pack_quantity
+from normalizer import extract_pack_quantity, extract_hardware_specs
 
 
 def sold_form(title):
@@ -24,6 +24,11 @@ def listing_role_conflict(title_a, title_b):
         return f"sold_identity_mismatch:{a.family}/{a.role}:{b.family}/{b.role}"
     if extract_pack_quantity(title_a) != extract_pack_quantity(title_b):
         return "pack_quantity_mismatch"
+    # Saved equivalence labels cannot override incompatible pin counts.
+    specs_a, specs_b = extract_hardware_specs(title_a), extract_hardware_specs(title_b)
+    for key in ("pins", "passive_package", "continuous_discharge_a"):
+        if key in specs_a and key in specs_b and specs_a[key] != specs_b[key]:
+            return f"hardware_mismatch:{key}:{specs_a[key]}:{specs_b[key]}"
     from src.search.query_intent import variant_claims
     from src.search.product_role import sold_title
     va, vb = variant_claims(sold_title(title_a)), variant_claims(sold_title(title_b))

@@ -1044,8 +1044,14 @@ class AggregatorEngine:
                     page_products, query=query, force=(refresh_mode == "force")
                 )
                 if price_refresh.refreshed_products:
-                    # Prices/stock changed: rebuild so best-price badges and stock
-                    # filters reflect the verified values.
+                    # Reapply eligibility to persisted live values and backfill
+                    # the page; regrouping alone leaves ineligible offers visible.
+                    batch = await asyncio.to_thread(
+                        retrieve_catalog, query=query, limit=pool, vendor=vendor,
+                        in_stock_only=in_stock_only, category=category, spec_filters=spec_filters,
+                        price_min=price_min, price_max=price_max,
+                    )
+                    total_matches, products = batch.total_matches, batch.products
                     groups = await asyncio.to_thread(
                         self.group_and_compare, products, query=query
                     )
@@ -1116,7 +1122,12 @@ class AggregatorEngine:
         )
 
 
-    async def search_live(self, query: str, limit_per_vendor: int = 15) -> SearchResponse:
+    async def search_live(
+        self, query: str, limit_per_vendor: int = 15, *,
+        vendor: Optional[str] = None, category: Optional[str] = None,
+        in_stock_only: bool = False, spec_filters: Optional[Dict[str, Any]] = None,
+        price_min: Optional[float] = None, price_max: Optional[float] = None,
+    ) -> SearchResponse:
         """
         Federated search across every configured vendor in parallel.
         Automatically saves/enriches products into local SQLite database.
@@ -1172,7 +1183,9 @@ class AggregatorEngine:
         finally:
             connection.close()
         batch = await asyncio.to_thread(retrieve_catalog, clean_q,
-                                        limit=max(1, len(ids)), listing_ids=tuple(ids))
+                                        limit=max(1, len(ids)), listing_ids=tuple(ids),
+                                        vendor=vendor, category=category, in_stock_only=in_stock_only,
+                                        spec_filters=spec_filters, price_min=price_min, price_max=price_max)
         eligible = {(product.vendor, str(product.external_id)): product.id for product in batch.products}
         all_products = [product for product in all_products
                         if (product.vendor, str(product.external_id)) in eligible]

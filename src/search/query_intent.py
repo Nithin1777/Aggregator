@@ -134,6 +134,10 @@ def classify_retrieval_tokens(tokens, *, generic_words=(), catalog_brands=()):
     phrases = []
     for index, token in enumerate(tokens):
         if token.isdigit() and index:
+            # A measured pin count modifies the board, not the immediately
+            # preceding model token ("ESP32 30 pins" need not be contiguous).
+            if index + 1 < len(tokens) and tokens[index + 1].lower() in {"pin", "pins"}:
+                continue
             phrases.append(tokens[index - 1] + " " + token)
     return {
         "kind": "identity" if identity else "exploratory",

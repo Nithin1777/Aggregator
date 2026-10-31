@@ -17,7 +17,7 @@ if sys.platform == "win32":
         pass
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from rich.console import Console
@@ -31,6 +31,7 @@ import db
 from models import ClickFeedback, SearchResponse
 from search_service import AggregatorEngine
 from src.search.query_terms import parse_price_constraints
+from src.search.filter_plan import FilterPlanError, prepare_filters
 from src.web.render import icon_svg
 
 # Logging configuration
@@ -65,6 +66,11 @@ web_app = FastAPI(
     version="2.0.0",
     lifespan=lifespan
 )
+
+
+@web_app.exception_handler(FilterPlanError)
+async def filter_plan_error_handler(request: Request, exc: FilterPlanError):
+    return JSONResponse(status_code=400, content={"detail": exc.error})
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -187,8 +193,14 @@ def _normalize_spec_filters(value) -> Dict[str, Any]:
     try:
         parsed = json.loads(value)
     except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+        raise HTTPException(status_code=400, detail={
+            "error_code": "invalid_filter_value", "message": "spec_filters must be a valid JSON object.",
+        })
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail={
+            "error_code": "invalid_filter_value", "message": "spec_filters must be a JSON object.",
+        })
+    return parsed
 
 
 # Seed terms shown on the landing page. They are replaced by the live search
@@ -386,25 +398,12 @@ async def api_search(
     spec_filters = _normalize_spec_filters(spec_filters)
 
     if spec_filters:
-        # Validate up front so a bad filter is a clean 400, not a 500.
+        # Use the same tier/alias validation as catalog execution.
+        conn = db.get_db_connection()
         try:
-            with db.get_db_connection() as conn:
-                advertised = db.load_catalog_specs(conn)
-            normalized, error = db.parse_and_validate_filters(spec_filters, advertised)
-        except Exception:  # noqa: BLE001 - validation must not break the request
-            normalized, error = None, None
-        if error:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error_code": error["error_code"],
-                    "message": error["message"],
-                    "valid_keys": error.get("valid_keys"),
-                    "suggestions": error.get("suggestions"),
-                },
-            )
-        if normalized is not None:
-            spec_filters = normalized
+            prepare_filters(conn, spec_filters, category=category)
+        finally:
+            conn.close()
 
     if not query and (
         category or vendor or spec_filters
@@ -440,7 +439,9 @@ async def api_search(
             )
         else:
             resp = await engine.search_live(
-                query=query, limit_per_vendor=min(page_size, 25)
+                query=query, limit_per_vendor=min(page_size, 25),
+                vendor=vendor, category=category, in_stock_only=in_stock,
+                spec_filters=spec_filters or None, price_min=price_min, price_max=price_max,
             )
 
         try:
