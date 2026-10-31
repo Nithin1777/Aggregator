@@ -17,7 +17,7 @@ if sys.platform == "win32":
         pass
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from rich.console import Console
@@ -31,6 +31,7 @@ import db
 from models import ClickFeedback, SearchResponse
 from search_service import AggregatorEngine
 from src.search.query_terms import parse_price_constraints
+from src.search.filter_plan import FilterPlanError, prepare_filters
 from src.web.render import icon_svg
 
 # Logging configuration
@@ -61,10 +62,15 @@ async def lifespan(app: FastAPI):
 
 web_app = FastAPI(
     title="Aggregate - Component Search",
-    description="Multi-vendor electronic component price and stock comparison engine (Robu, QuartzComponents, MakerBazar, Robokits, REES52)",
+    description="Multi-vendor electronic component price and stock comparison engine (Robu, QuartzComponents, MakerBazar, Robokits, REES52, Flyrobo)",
     version="2.0.0",
     lifespan=lifespan
 )
+
+
+@web_app.exception_handler(FilterPlanError)
+async def filter_plan_error_handler(request: Request, exc: FilterPlanError):
+    return JSONResponse(status_code=400, content={"detail": exc.error})
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -187,8 +193,14 @@ def _normalize_spec_filters(value) -> Dict[str, Any]:
     try:
         parsed = json.loads(value)
     except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+        raise HTTPException(status_code=400, detail={
+            "error_code": "invalid_filter_value", "message": "spec_filters must be a valid JSON object.",
+        })
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail={
+            "error_code": "invalid_filter_value", "message": "spec_filters must be a JSON object.",
+        })
+    return parsed
 
 
 # Seed terms shown on the landing page. They are replaced by the live search
@@ -386,25 +398,12 @@ async def api_search(
     spec_filters = _normalize_spec_filters(spec_filters)
 
     if spec_filters:
-        # Validate up front so a bad filter is a clean 400, not a 500.
+        # Use the same tier/alias validation as catalog execution.
+        conn = db.get_db_connection()
         try:
-            with db.get_db_connection() as conn:
-                advertised = db.load_catalog_specs(conn)
-            normalized, error = db.parse_and_validate_filters(spec_filters, advertised)
-        except Exception:  # noqa: BLE001 - validation must not break the request
-            normalized, error = None, None
-        if error:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error_code": error["error_code"],
-                    "message": error["message"],
-                    "valid_keys": error.get("valid_keys"),
-                    "suggestions": error.get("suggestions"),
-                },
-            )
-        if normalized is not None:
-            spec_filters = normalized
+            prepare_filters(conn, spec_filters, category=category)
+        finally:
+            conn.close()
 
     if not query and (
         category or vendor or spec_filters
@@ -440,7 +439,9 @@ async def api_search(
             )
         else:
             resp = await engine.search_live(
-                query=query, limit_per_vendor=min(page_size, 25)
+                query=query, limit_per_vendor=min(page_size, 25),
+                vendor=vendor, category=category, in_stock_only=in_stock,
+                spec_filters=spec_filters or None, price_min=price_min, price_max=price_max,
             )
 
         try:
@@ -482,7 +483,7 @@ async def api_health():
 
 @web_app.post("/api/ingest")
 async def api_ingest(
-    vendor: str = Query(..., description="Vendor to ingest: 'quartzcomponents', 'makerbazar', 'robu', 'robokits', or 'rees52'"),
+    vendor: str = Query(..., description="Vendor to ingest: 'quartzcomponents', 'makerbazar', 'robu', 'robokits', 'rees52', or 'flyrobo'"),
     max_pages: Optional[int] = Query(None, description="Max pages to scrape"),
     resume: bool = Query(True, description="Resume from last checkpoint")
 ):
@@ -522,7 +523,7 @@ def cli_search(
         help="Local mode: verify price/stock live before display (falls back to cached values offline)"
     ),
 ):
-    """Search and compare electronic components across Robu, QuartzComponents, and MakerBazar."""
+    """Search and compare electronic components across all configured vendors."""
     async def _search():
         engine = AggregatorEngine()
         try:
@@ -584,7 +585,8 @@ def cli_search(
                         "quartzcomponents": "magenta",
                         "makerbazar": "yellow",
                         "robokits": "cyan",
-                        "rees52": "green"
+                        "rees52": "green",
+                        "flyrobo": "bright_red"
                     }.get(offer.vendor, "white")
 
                     stock_str = "[green]In Stock[/green]" if offer.available else "[red]Out of Stock[/red]"
@@ -610,7 +612,7 @@ def cli_search(
 def cli_ingest(
     vendor: Optional[str] = typer.Argument(
         None,
-        help="Vendor ID: 'quartzcomponents', 'makerbazar', 'robu', or omit to ingest all sequentially"
+        help="Vendor ID: 'quartzcomponents', 'makerbazar', 'robu', 'robokits', 'rees52', 'flyrobo', or omit to ingest all sequentially"
     ),
     max_pages: Optional[int] = typer.Option(
         None,
@@ -705,7 +707,9 @@ def cli_status():
     table.add_column("Scrape Status")
     table.add_column("Last Updated")
 
-    all_vendor_ids = ["robu", "quartzcomponents", "makerbazar", "robokits", "rees52"]
+    all_vendor_ids = [
+        "robu", "quartzcomponents", "makerbazar", "robokits", "rees52", "flyrobo"
+    ]
     for vid in all_vendor_ids:
         vdata = stats["vendors"].get(vid, {"total": 0, "in_stock": 0})
         chk = stats["checkpoints"].get(vid, {"last_page": 0, "status": "idle", "updated_at": "Never"})
@@ -741,6 +745,24 @@ def cli_status():
                 f"[bold]Remaining Pending Ingestion:[/bold] {reg['pending']:,} products\n"
                 f"[bold]Robu Catalog Coverage:[/bold] [{cov_color}]{cov}% Complete[/{cov_color}]",
                 title="Robu.in 100% Catalog Parity Registry",
+                border_style="magenta"
+            )
+        )
+
+    # Flyrobo Ground-Truth Parity Tracker
+    freg = stats.get("flyrobo_registry", {})
+    if freg.get("total_registry", 0) > 0:
+        cov = freg.get("coverage_pct", 0.0)
+        cov_color = "green" if cov >= 99 else ("yellow" if cov >= 50 else "cyan")
+        console.print(
+            Panel.fit(
+                f"[bold]Ground-Truth Sitemaps Registry:[/bold] {freg['total_registry']:,} URLs\n"
+                f"[bold]Fully Indexed in Database:[/bold] {freg['indexed']:,} products\n"
+                f"[bold]Remaining Pending Ingestion:[/bold] {freg['pending']:,} products\n"
+                f"[bold]Failed Product Pages:[/bold] {freg.get('failed', 0):,}\n"
+                f"[bold]Retired URLs (404):[/bold] {freg.get('missing', 0):,}\n"
+                f"[bold]Flyrobo Catalog Coverage:[/bold] [{cov_color}]{cov}% Complete[/{cov_color}]",
+                title="Flyrobo.in 100% Catalog Parity Registry",
                 border_style="magenta"
             )
         )
@@ -791,6 +813,25 @@ def cli_robu_sync(
                 added = await robu_adapter.sync_sitemaps_to_registry(max_sitemaps=sitemaps)
             stats = db.get_robu_registry_stats()
             console.print(f"[bold green]Registry sync complete! Total registered products: {stats['total_registry']:,} (+{added} new).[/bold green]")
+        finally:
+            await engine.close()
+
+    asyncio.run(_sync())
+
+@cli.command("flyrobo-sync")
+def cli_flyrobo_sync():
+    """Synchronize the Flyrobo ground-truth product registry from its sitemaps (~5,000 URLs)."""
+    async def _sync():
+        engine = AggregatorEngine()
+        try:
+            flyrobo_adapter = engine.adapters.get("flyrobo")
+            with console.status("[bold green]Harvesting Flyrobo XML sitemaps to build the ground-truth registry...[/bold green]"):
+                added = await flyrobo_adapter.sync_sitemaps_to_registry()
+            stats = db.get_vendor_registry_stats("flyrobo")
+            console.print(
+                f"[bold green]Registry sync complete! Total registered products: "
+                f"{stats['total_registry']:,} (+{added} new).[/bold green]"
+            )
         finally:
             await engine.close()
 

@@ -158,7 +158,9 @@ def test_get_product_does_not_fabricate_extraction_timestamps():
     assert detail.ok is True
     ts = detail.data["crawl_timestamps"]
     assert ts["when_specs_extracted"] is None, "extraction timestamp must be null, not invented"
-    assert detail.data["description_source"] in ("vendor_page", "vendor_page_short", "title_fallback")
+    assert detail.data["description_source"].startswith(
+        ("vendor_page", "title_fallback")
+    )
     if detail.data["description_source"] == "title_fallback":
         assert detail.data["description"] == detail.data["title"]
 

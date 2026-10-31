@@ -1,215 +1,55 @@
-"""
-Unified retrieval backend with support for Meilisearch and Enhanced SQLite BM25 + RRF.
-"""
-import json
-import logging
-import math
-from typing import Any, Dict, List, Optional, Tuple
+"""Ranked catalog retrieval through the shared query policy and eligibility engine."""
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 import db
 from models import UnifiedProduct
-from src.search.canonical_boost import adjust_search_score
-from src.search.product_prior import query_category_hint
-from src.search.query_intent import QueryIntentResult, get_query_intent
-
-logger = logging.getLogger(__name__)
-
-class MeiliSearchBackend:
-    """Meilisearch client integration with graceful fallback."""
-
-    def __init__(self, host: str = "http://127.0.0.1:7700", api_key: str = ""):
-        self.host = host
-        self.api_key = api_key
-        self._client = None
-        self._is_available = None
-
-    def check_connection(self) -> bool:
-        if self._is_available is not None:
-            return self._is_available
-        try:
-            import meilisearch
-            self._client = meilisearch.Client(self.host, self.api_key)
-            health = self._client.health()
-            self._is_available = (health.get("status") == "available")
-        except Exception:
-            self._is_available = False
-        return self._is_available
-
-    def search(self, query: str, limit: int = 50) -> Optional[List[Dict[str, Any]]]:
-        if not self.check_connection():
-            return None
-        try:
-            index = self._client.index("products")
-            res = index.search(query, {"limit": limit})
-            return res.get("hits", [])
-        except Exception as e:
-            logger.debug(f"Meilisearch query failed: {e}")
-            return None
+from src.search.ranking import rank_products
+from src.search.service import CatalogSearch
 
 
-class EnhancedSQLiteBackend:
+@dataclass
+class CatalogResults:
+    products: List[UnifiedProduct]
+    total_matches: int
+    query_contract: Dict[str, Any]
+
+
+def retrieve_catalog(query: str, limit: int = 50, vendor: Optional[str] = None,
+                     in_stock_only: bool = False, category: Optional[str] = None,
+                     spec_filters: Optional[Dict[str, Any]] = None,
+                     price_min: Optional[float] = None, price_max: Optional[float] = None,
+                     listing_ids=None) -> CatalogResults:
+    """Count and rank one prepared query on a consistent read snapshot.
+
+    Canonical products receive ranking boosts only after eligibility. There is
+    no second candidate injection or hidden alternate-query search.
     """
-    Enhanced SQLite retrieval with BM25 FTS ranking, RRF (Reciprocal Rank Fusion),
-    and intent-gated ranking adjustments.
-    """
-
-    def search(
-        self,
-        query: str,
-        limit: int = 50,
-        vendor: Optional[str] = None,
-        in_stock_only: bool = False,
-        category: Optional[str] = None,
-        spec_filters: Optional[Dict[str, Any]] = None,
-        price_min: Optional[float] = None,
-        price_max: Optional[float] = None,
-    ) -> List[UnifiedProduct]:
-        intent_res = get_query_intent(query)
-        
-        # 1. Fetch broader candidate pool from DB
-        raw_candidates = db.search_products(
-            query=query,
-            limit=max(100, limit * 3),
-            vendor=vendor,
-            in_stock_only=in_stock_only,
-            category=category,
-            spec_filters=spec_filters,
-            price_min=price_min,
-            price_max=price_max,
+    connection = db.get_db_connection()
+    try:
+        connection.execute("BEGIN")
+        search = CatalogSearch(connection)
+        prepared = search.prepare(
+            query, filters=spec_filters, category=category, vendor=vendor,
+            in_stock_only=in_stock_only, include_related=not bool(spec_filters),
+            price_min=price_min, price_max=price_max, listing_ids=listing_ids,
         )
-
-        if not raw_candidates:
-            # If FTS matched nothing, try matched canonical key directly
-            if intent_res.matched_key:
-                raw_candidates = db.search_products(
-                    query=intent_res.matched_key,
-                    limit=max(100, limit * 3),
-                    vendor=vendor,
-                    in_stock_only=in_stock_only,
-                    category=category,
-                    spec_filters=spec_filters,
-                    price_min=price_min,
-                    price_max=price_max,
-                )
-
-        # Ensure canonical hero product(s) for matched intent key are in candidates pool
-        if intent_res.matched_key:
-            conn = db.get_db_connection()
-            try:
-                cur = conn.cursor()
-                cur.execute("""
-                    SELECT * FROM products 
-                    WHERE is_canonical = 1 
-                      AND (canonical_for = ? OR canonical_for LIKE ? OR canonical_for LIKE ? OR canonical_for LIKE ?)
-                """, (intent_res.matched_key, f"{intent_res.matched_key},%", f"%,{intent_res.matched_key}", f"%,{intent_res.matched_key},%"))
-                can_rows = cur.fetchall()
-                existing_ids = {p.id for p in raw_candidates if p.id is not None}
-                for r in can_rows:
-                    if r["id"] not in existing_ids:
-                        can_prod = UnifiedProduct(
-                            id=r["id"],
-                            vendor=r["vendor"],
-                            vendor_name=r["vendor_name"],
-                            external_id=r["external_id"],
-                            title=r["title"],
-                            normalized_title=r["normalized_title"],
-                            mpn=r["mpn"],
-                            sku=r["sku"],
-                            price=float(r["price"]),
-                            available=bool(r["available"]),
-                            product_url=r["product_url"],
-                            image_url=r["image_url"],
-                            category=r["category"],
-                            category_canonical=r["category_canonical"] if "category_canonical" in r.keys() else None,
-                            is_canonical=bool(r["is_canonical"]) if "is_canonical" in r.keys() and r["is_canonical"] else False,
-                            canonical_for=r["canonical_for"] if "canonical_for" in r.keys() else None,
-                            query_ctr=float(r["query_ctr"]) if "query_ctr" in r.keys() and r["query_ctr"] is not None else None,
-                            updated_at=str(r["updated_at"]) if r["updated_at"] else None,
-                            extra=json.loads(r["raw_json"]) if r["raw_json"] else {}
-                        )
-                        raw_candidates.insert(0, can_prod)
-                        existing_ids.add(r["id"])
-            finally:
-                conn.close()
-
-        if not raw_candidates:
-            return []
-
-        return rank_products(raw_candidates, query, limit=limit)
+        if prepared is None:
+            return CatalogResults([], 0, {})
+        total = search.count(prepared)
+        rows = search.rows(prepared, limit=max(100, limit * 3)) if total else []
+        products = [db.row_to_unified_product(row) for row in rows]
+        plan = prepared.plan
+        products = rank_products(products, query, limit=limit,
+                                 preferences=plan.preference_tokens if plan else ())
+        return CatalogResults(products, total, plan.contract() if plan else {})
+    finally:
+        connection.close()
 
 
-def rank_products(
-    products: List[UnifiedProduct],
-    query: str,
-    limit: Optional[int] = None,
-    bonus_by_id: Optional[Dict[int, float]] = None,
-) -> List[UnifiedProduct]:
-    """
-    Shared relevance ranking for every text-search surface (web and MCP).
-
-    Input order is the retrieval order (BM25). Each candidate gets an RRF base
-    score plus the canonical/length/repetition/product-role adjustments, then
-    the list is sorted. `bonus_by_id` lets a caller preserve an extra signal
-    (the MCP category spec-coverage boost) without duplicating the ranker.
-    """
-    intent_res = get_query_intent(query)
-    category_hint = query_category_hint(query)
-    scored_products: List[Tuple[float, UnifiedProduct]] = []
-    for rank_idx, prod in enumerate(products):
-        # Reciprocal rank from FTS / BM25
-        rrf_base = 1.0 / (60.0 + (rank_idx + 1))
-        base_score = 10.0 * (1.0 + rrf_base * 50.0)
-
-        final_score = adjust_search_score(
-            base_score=base_score,
-            title=prod.title,
-            is_canonical=prod.is_canonical,
-            canonical_for=prod.canonical_for,
-            intent_result=intent_res,
-            query=query,
-        )
-        if bonus_by_id and prod.id is not None:
-            final_score += bonus_by_id.get(prod.id, 0.0)
-        if category_hint and prod.category_canonical == category_hint:
-            final_score += 8.0
-        scored_products.append((final_score, prod))
-
-    scored_products.sort(key=lambda item: item[0], reverse=True)
-    ranked = [product for _, product in scored_products]
-    return ranked[:limit] if limit is not None else ranked
-
-
-_meili_backend = MeiliSearchBackend()
-_sqlite_backend = EnhancedSQLiteBackend()
-
-def search_catalog_ranked(
-    query: str,
-    limit: int = 50,
-    vendor: Optional[str] = None,
-    in_stock_only: bool = False,
-    category: Optional[str] = None,
-    spec_filters: Optional[Dict[str, Any]] = None,
-    price_min: Optional[float] = None,
-    price_max: Optional[float] = None,
-) -> List[UnifiedProduct]:
-    """
-    Main ranked catalog search function.
-    Tries Meilisearch if running; seamlessly uses Enhanced SQLite BM25 + RRF + Adjustments.
-    """
-    # 1. If Meilisearch is active, attempt it
-    if _meili_backend.check_connection():
-        hits = _meili_backend.search(query, limit=limit)
-        if hits is not None:
-            # Map hits to UnifiedProduct models
-            pass
-
-    # 2. SQLite Enhanced BM25 + RRF + Intent Ranking
-    return _sqlite_backend.search(
-        query=query,
-        limit=limit,
-        vendor=vendor,
-        in_stock_only=in_stock_only,
-        category=category,
-        spec_filters=spec_filters,
-        price_min=price_min,
-        price_max=price_max,
-    )
+def search_catalog_ranked(query: str, limit: int = 50, vendor: Optional[str] = None,
+                          in_stock_only: bool = False, category: Optional[str] = None,
+                          spec_filters: Optional[Dict[str, Any]] = None,
+                          price_min: Optional[float] = None, price_max: Optional[float] = None) -> List[UnifiedProduct]:
+    """Compatibility API for callers that only need the matching listings."""
+    return retrieve_catalog(query, limit, vendor, in_stock_only, category,
+                            spec_filters, price_min, price_max).products

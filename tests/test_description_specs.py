@@ -62,6 +62,11 @@ def test_skips_headers_navigation_and_empty_values():
     assert "also_check_these_products" not in attrs
 
 
+def test_urls_are_not_treated_as_key_value_attributes():
+    attrs = extract_description_attributes("<p>https://docs.example.com/core</p>")
+    assert "https" not in {a["key"] for a in attrs}
+
+
 def test_key_aliases_collapse_voltage_variants():
     assert normalize_key("Operating Voltage") == "voltage"
     assert normalize_key("Input Voltage") == "voltage"

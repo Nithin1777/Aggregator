@@ -1,13 +1,27 @@
 # Aggregate (Indian Component Aggregator Engine)
 
+Backend changes can be measured with the offline quality gate:
+
+```powershell
+python scripts/evaluate_backend.py
+```
+
+It reports search precision/recall/F1, ranking quality, matching/grouping accuracy,
+and contract regressions against a versioned baseline. See
+[backend quality evaluation](docs/backend_quality.md) for interpretation, Git
+revision comparisons, and baseline updates. Reports distinguish known correctness
+failures from new regressions; controlled-fixture scores are not production-wide
+accuracy estimates.
+
 A high-performance component aggregation search engine that indexes, queries, and compares electronic component pricing and live stock availability across India's primary distributors:
 1. **Robu.in**
 2. **QuartzComponents**
 3. **MakerBazar**
 4. **Robokits**
 5. **REES52**
+6. **Flyrobo**
 
-Built with direct JSON querying (zero HTML scraping required), Cloudflare TLS/JA3 fingerprint impersonation (`curl_cffi` on `chrome120`), SQLite Full-Text Search (FTS5), smart MPN extraction, cross-vendor component clustering, and **resumable / continuable batch catalog ingestion**.
+Built with direct JSON querying where vendors expose it (Robu, Shopify), schema.org JSON-LD parsing for Flyrobo, Cloudflare TLS/JA3 fingerprint impersonation (`curl_cffi` on `chrome120`), SQLite Full-Text Search (FTS5), smart MPN extraction, cross-vendor component clustering, and **resumable / continuable batch catalog ingestion**.
 
 ---
 
@@ -21,12 +35,13 @@ Built with direct JSON querying (zero HTML scraping required), Cloudflare TLS/JA
 ├── adapters/
 │   ├── __init__.py
 │   ├── base.py           # Abstract BaseAdapter interface
-│   ├── shopify.py        # Shopify adapter (QuartzComponents, MakerBazar)
-│   └── robu.py           # Robu Next.js search microservice adapter with session warmup
+│   ├── shopify.py        # Shopify adapter (QuartzComponents, MakerBazar, REES52)
+│   ├── robu.py           # Robu Next.js search microservice adapter with session warmup
+│   └── flyrobo.py        # Flyrobo sitemap + JSON-LD adapter (IoI cookie challenge solver)
 ├── search_service.py     # Parallel federation, comparison clustering, price/stock refresh, and continuable ingestion
 ├── main.py               # Typer CLI dashboard and FastAPI Web Application
 ├── src/
-│   ├── search/query_terms.py  # Shared query understanding (stop words, AND->OR relaxation, typo candidates)
+│   ├── search/query_terms.py  # Shared query models and safe FTS expressions
 │   ├── web/                   # Inline SVG icon pack and render helpers
 │   └── spec/             # Taxonomy loader, product classifier, spec extractor and shared filters
 ├── config/
@@ -71,7 +86,7 @@ python -m pytest tests -q
 ## 2. Searching Components
 
 ### A. Real-Time Multi-Vendor Search (Live APIs)
-Queries Robu, QuartzComponents, and MakerBazar simultaneously in parallel, normalizes titles, groups equivalent parts side-by-side, highlights the lowest in-stock price, and automatically caches products to your local database:
+Queries every enabled vendor simultaneously in parallel, normalizes titles, groups equivalent parts side-by-side, highlights the lowest in-stock price, and automatically caches products to your local database:
 
 ```powershell
 python main.py search "esp32"
@@ -111,27 +126,40 @@ The ingestion engine stores progress in SQLite (`scrape_checkpoints` table). Eve
 python main.py ingest quartzcomponents -m 2
 python main.py ingest makerbazar -m 2
 python main.py ingest robu -m 2
+python main.py ingest flyrobo -m 1
 
-# 2. Check current status, checkpoint pages & Robu 100% Parity Tracker
+# 2. Check current status, checkpoint pages & sitemap parity trackers
 python main.py status
 
-# 3. Optional: Sync all 22 Robu ground-truth sitemaps (~22,000 URLs)
-python main.py robu-sync
+# 3. Optional: sync ground-truth sitemap registries
+python main.py robu-sync     # all 22 Robu sitemaps (~22,000 URLs)
+python main.py flyrobo-sync  # all 10 Flyrobo product sitemaps (~4,500 URLs)
 
 # 4. Resume ingestion anytime (picks up exactly from checkpoint.last_page + 1)
 python main.py ingest quartzcomponents -m 5
+python main.py ingest flyrobo -m 5
 
 # 5. Leave running overnight (omitting -m processes until full catalog is completed)
 python main.py ingest quartzcomponents
 python main.py ingest makerbazar
 python main.py ingest robu
+python main.py ingest flyrobo
 
-# 6. Ingest all 3 vendors sequentially
+# 6. Ingest all vendors sequentially
 python main.py ingest
 
 # 7. Optional: Start fresh from page 1 instead of resuming
 python main.py ingest quartzcomponents --fresh
 ```
+
+### Flyrobo (sitemap-driven, ~4,500 products)
+Flyrobo publishes its catalog through `https://www.flyrobo.in/sitemap.xml` (10 product sitemaps). Page 1 of `ingest flyrobo` refreshes the ground-truth URL registry in SQLite, then every page fetches a stable 20-product slice. This keeps the normal `scrape_checkpoints` resume behaviour: if a run stops on page 7, the next run starts at page 8 without re-reading the sitemaps.
+
+- The storefront returns a JavaScript `IoI` cookie challenge. The adapter solves it deterministically (FNV-1a over the embedded token) and retries, so no browser or Playwright is required.
+- Product pages are parsed from schema.org JSON-LD first, with meta/DOM fallbacks for title, price, stock, SKU/model and image.
+- Flyrobo prices are already GST-inclusive; no conversion is applied.
+- Registry rows are `pending`, `indexed`, `failed` or `missing`. A 404 is recorded as `missing` and stays in the page enumeration so later offsets never shift; network failures raise instead of silently ending the catalog.
+- The first page of a fresh run also downloads all 10 sitemaps (about 11 requests), so expect it to take slightly longer than the following pages.
 
 ---
 
@@ -185,8 +213,8 @@ Open your browser at **http://localhost:8000**:
 ### Ranking and pagination
 The same ranking pipeline runs for **web search and the MCP `search_components` text path** (`src/search/retrieval.py::rank_products`), so an agent and a browser get the same ordering.
 
-1. **Retrieval order** — SQLite FTS5 BM25 (`ORDER BY rank`), after strict/typo-corrected/relaxed query resolution.
-2. **Listing score** — RRF base (`10 * (1 + 50/(60+position+1))`) plus:
+1. **Retrieval order** — SQLite FTS5 field-weighted BM25, after mandatory-term and identity eligibility.
+2. **Listing score** — reciprocal-position base (`10 * (1 + 50/(60+position+1))`) plus:
    - canonical boost (+25 brand/category, +35 exact MPN, +2 other),
    - gentle length penalty (`1 / (1 + 0.035 * max(0, tokens-5))`),
    - keyword repetition penalty (−4 per repeat),
@@ -277,10 +305,10 @@ python main.py search "IG52 motor" --local --cache-only # no vendor calls
 | `PRICE_STOCK_TTL` | `180` | Seconds before cached price/stock is considered stale. |
 | `PRICE_STOCK_TIMEOUT` | `8` | Wall-clock budget in seconds for one refresh pass. |
 
-Additional tunables live in `config.py`: `price_stock_offline_cooldown_seconds` (60), `price_stock_max_refresh_queries` (2), `price_stock_live_limit_per_vendor` (15), `price_stock_sync_max_products` (30; broader result sets use the background/cached path), `robokits_gst_rate` (0.18), and `quartz_gst_rate` (0.18).
+Additional tunables live in `config.py`: `price_stock_offline_cooldown_seconds` (60), `price_stock_max_refresh_queries` (2), `price_stock_live_limit_per_vendor` (15), `price_stock_sync_max_products` (30; broader result sets use the background/cached path), `robokits_gst_rate` (0.18), `quartz_gst_rate` (0.18), `flyrobo_request_delay` (0.35s), and `flyrobo_batch_limit` (20 products per sitemap-registry page).
 
 ### Vendor tax handling
-Robokits and QuartzComponents list prices **excluding GST**. The adapters multiply the scraped amount by the vendor's GST rate before storing it, so every vendor's `price` is tax-inclusive and comparisons are like-for-like. The original ex-GST amount is kept in `extra.price_ex_gst` for data/debugging use, but the storefront only displays the final inclusive price.
+Robokits and QuartzComponents list prices **excluding GST**. The adapters multiply the scraped amount by the vendor's GST rate before storing it, so every vendor's `price` is tax-inclusive and comparisons are like-for-like. The original ex-GST amount is kept in `extra.price_ex_gst` for data/debugging use, but the storefront only displays the final inclusive price. Flyrobo already quotes GST-inclusive prices, so its adapter stores the scraped amount unchanged.
 
 Historical rows can be repaired without a full re-scrape:
 ```powershell
@@ -302,30 +330,35 @@ The same data is available from `GET /api/status` (`price_stock`) and the MCP `h
 
 Agents (and people) rarely type exact keywords. The same query-understanding pipeline now runs for
 the **MCP tools**, the **web UI**, and `GET /api/search?source=local`, driven by
-`src/search/query_terms.py` and `db.resolve_query_plan()`:
+`src/search/query_terms.py` and `src/search/planner.py`.
+See [search consolidation](docs/search_consolidation.md) for module ownership,
+compatibility boundaries and the remaining differences between search surfaces:
 
-1. **Filler words are dropped** — “battery *to power* an arduino *for* 8 hours” searches
-   `battery power arduino 8 hours`.
-2. **All-terms matching relaxes to any-term matching** when nothing matches everything — results
-   stay BM25-ranked and the response says so (`warnings: [{"code": "query_relaxed"}]`).
-3. **Mistyped words are corrected from the catalog vocabulary** (FTS5 vocabulary table):
-   `esp32 wromm` → `esp32 wroom`, `battry 18650` → `battery 18650`
-   (`warnings: query_spelling_corrected`).
-4. **Nothing resembles the query?** You still get `ok: true` with guidance:
-   `warnings: query_unresolved` plus `data.query_suggestions` — never a bare empty page.
+1. **Recognized application requirements are preserved** — “battery to power an
+   Arduino for 8 hours” keeps runtime and load information as unresolved
+   requirements while retrieving batteries; it does not verify runtime.
+2. **Required terms stay required.** The engine does not automatically drop words,
+   prefix-match product identifiers, or switch to any-term retrieval.
+3. **Generic category typos can be corrected.** Brand/model/variant changes are
+   suggestions requiring a new request. `HOTA D6 Pro` cannot become `hot D6 Pro`;
+   `LD06` cannot prefix-match `LD016`.
+4. **Engineering notation becomes typed constraints when its meaning is clear.**
+   Ambiguous electrical properties remain unresolved instead of being guessed.
+5. **No confirmed match is a normal result.** `retrieval_status` distinguishes
+   `no_exact_match`, `no_match`, `matches`, and `corrected_matches`.
+   `query_contract` records the policy and requirements; `alternatives` is separate.
 
 `filters_applied.query` always echoes what the caller typed; `filters_applied.query_effective`
 shows what was actually searched.
 
 **Booleans and quotes are not silently rewritten.** `esp32 OR esp8266` returns
-`error_code: "unsupported_query_syntax"`; run one query per alternative instead. Lowercase
-`or`/`and` are reported as `query_operator_dropped`.
+`error_code: "unsupported_query_syntax"`; run one query per alternative instead. Issue separate requests for alternatives; natural-language negation remains unresolved unless it can be verified.
 
-**Relaxation is progressive, not all-or-nothing.** When a strict query is empty, generic
-modifiers are dropped before the head term; the response exposes `query_tokens_dropped`,
-`query_status` (`exact`, `relaxed`, `low_confidence`, `unresolved`) and `match_ratio_top`.
-A query that matches only a handful of rows while the head term matches thousands also gets a
-`query_narrowed` warning, so a plausible-looking small count is not mistaken for the full answer.
+**Preferences are explicit.** Text following `preferably`, `ideally`, or
+`optionally` is a preference used in ranking. Unmarked terms remain mandatory.
+A `4GB` request excludes `8GB` and titles presenting multiple GB options under a
+single price. These are query-evidence checks, not manufacturer authenticity or
+independent electrical verification. See [query policy](docs/query_policy.md).
 
 **Price intent is honoured.** “cheapest X” sets `sort=price_asc` (`sort_inferred`), price-zero
 quote/fabrication rows are excluded from price sorts, and “under ₹500” is parsed into
@@ -343,25 +376,63 @@ its extracted voltage.
 
 A filter key must be valid **for that category**. Asking for `chemistry` under `category="motor"`
 is not an empty result — it returns `error_code: "filter_not_applicable_to_category"` with the
-keys that do apply. Categories with no attributes (for example `resistors` today) return
+keys that do apply. Categories with no attributes (for example `drones`) return
 `filter_support: "none"` instead of silently returning zero rows.
+
+### Engineering values and enums
+
+Numeric keys accept engineering strings in the key's declared unit. The parser also handles
+RKM notation (`4k7` = 4.7 kΩ), `ohm`/`Ω` suffixes, and case-sensitive multipliers
+(`m` = milli, `M` = mega):
+
+```python
+count_components(category="resistors", filters={"resistance_ohm": "10k"})      # 10000
+count_components(category="resistors", filters={"resistance_ohm": "4k7"})     # 4700
+count_components(category="capacitors", filters={"capacitance_uf": "100nF"})  # 0.1
+count_components(category="inductors", filters={"inductance_uh": "2.2mH"})    # 2200
+```
+
+Enum values are canonicalized (lowercase, dashes normalized, parenthetical variants collapsed)
+and two unambiguous numeric coercions are applied: `cells: 3` → `"3s"` and `package: 603` →
+`"0603"`. Both are disclosed as `filters_applied.filter_value_coerced`. `package:"through-hole"`
+is an umbrella over the concrete leaded packages for the requested category (for resistors,
+`axial` + `radial`), so it is a real filter instead of an advertised-but-empty value.
+
+`voltage` and `voltage_v` are equivalent aliases. With a category, the key is routed to the one
+that applies and disclosed as `filters_applied.filter_alias_applied`. Without a category, both
+keys are unioned (duplicate products counted once) and disclosed as
+`filters_applied.filter_expanded` with per-key counts. The same `aliases` map is in
+`describe_catalog` for discovery; distinct currents remain distinct keys.
 
 ### Request validation and diagnosis
 
-Every empty/rejected result carries a single `diagnosis` object, so an agent branches on
-`diagnosis.reason` instead of inferring intent from a warning string:
+Every empty/rejected result carries a single `diagnosis` object with a `severity`
+(`error` / `warning` / `info`), so an agent branches on `diagnosis.reason` instead of inferring
+intent from a warning string:
 
 ```json
 {"ok": false, "error_code": "filter_not_applicable_to_category",
- "diagnosis": {"reason": "filter_not_applicable_to_category", "category": "motor",
-               "not_applicable_keys": ["chemistry"],
+ "diagnosis": {"reason": "filter_not_applicable_to_category", "severity": "error",
+               "category": "motor", "not_applicable_keys": ["chemistry"],
                "applicable_keys": ["current_a", "rpm", "torque_kgcm", "voltage"],
                "filter_support": "partial"}}
 ```
 
-Numeric keys reject non-numeric values (`rpm: "abc"` → `invalid_filter_value`) instead of
-returning a confident zero. `tolerance` is a fraction of `eq` (`0.05` = ±5%) and must be
-`0 < tolerance <= 1`; `tolerance: 5` is rejected. `price_max` must be `>= 0`.
+The precedence is fixed: input/type → syntax → taxonomy → applicability →
+`filter_key_not_extracted` (the attribute is absent from every candidate) →
+`filter_value_not_present` (the key exists on some candidates) →
+`no_matching_combination` (each filter is valid, their intersection is empty) →
+`query_unresolved` → `filter_recall_gap` → `null`.
+`filter_key_not_extracted` and `filter_recall_gap` carry `missing_spec` and `base_matches`;
+The shared planner no longer emits `query_relaxed` or drops required tokens.
+`mpn_not_found` carries `suggested_mpns`. `count_components` emits the same `filter_recall_gap` as search and scopes
+`coverage[key].category` to the requested category (`present`/`of`/`pct`).
+
+Numeric keys reject non-numeric values (`rpm: "abc"` → `invalid_filter_value` with a base-unit
+example) instead of returning a confident zero. `tolerance` is a fraction of `eq`
+(`0.05` = ±5%) and must be `0 < tolerance <= 1`; `tolerance: 5` is rejected.
+`price_max` must be `>= 0`. A `count_components` result includes zero-price quote rows and says
+so; a price-sorted search excludes them.
 
 ### Fit filtering (will this part work for my need?)
 
@@ -372,6 +443,106 @@ returning a confident zero. `tolerance` is a fraction of `eq` (`0.05` = ±5%) an
 | `discharge_c` | battery | C | `30` (30C) |
 | `rpm` / `torque_kgcm` / `current_a` | motor | RPM / kg-cm / A | `300`, `4.2`, `2.5` (current is advisory) |
 | `channels` | relay | count | `4` |
+
+The filter layer now extends beyond the original three categories. `config/filter_extension.yaml`
+adds production attributes for resistors, capacitors, inductors, diodes, transistors, MOSFETs,
+ICs, connectors, sensors, displays, LEDs, relays, fuses, crystals, wires, power supplies, thermal
+and hardware.
+
+```python
+# 10k, >=1/4W resistor
+search_components(category="resistors",
+                 filters={"resistance_ohm": {"gte": 1000, "lte": 10000},
+                          "power_w": {"gte": 0.25}},
+                 refresh=False)
+
+# 100uF capacitor, DIP-8 IC, 2.54mm 40-pin header
+search_components(category="capacitors", filters={"capacitance_uf": {"gte": 100}})
+search_components(category="integrated-circuits", filters={"package": "dip", "pins": {"gte": 8}})
+search_components(category="connectors", filters={"pins": {"gte": 20}, "pitch_mm": 2.54})
+```
+
+Populate the extension after the vendor descriptions are ingested:
+
+```powershell
+python scripts/backfill_specs.py          # definitions + spec_category + curated specs
+python scripts/promote_vendor_specs.py    # vendor/title attributes -> product_specs
+python scripts/build_vendor_specs.py      # all vendor attributes -> normalized vendor index
+```
+
+`promote_vendor_specs.py` is idempotent and preserves `manual` and `rule` rows. Current result:
+**76 attribute definitions**, **49 advertised keys**, **168k spec rows**, **69k products with specs**.
+`build_vendor_specs.py` adds the hybrid layer: **924k normalized vendor rows** across **43k vendor keys**.
+Restart the web/MCP processes after changing the taxonomy so their in-memory cache reloads.
+
+### Evidence-aware search (2.3)
+
+The [2.3.1 black-box audit remediation](docs/blackbox_bug_resolution.md) documents
+typed filter validation, usable metadata populations, MPN sold-form handling,
+offer comparability, and corrected vendor-unit normalization.
+
+Search separates sold-item identity from vendor categories and uses shared
+satisfied/failed/unknown constraints for filtering, counts, and candidate discovery.
+Application runtime requirements are preserved as unresolved constraints.
+See [search semantics and API behavior](docs/search_semantics.md) for identity
+coverage, `include_related`, `include_partial_candidates`, and diagnostic definitions.
+
+### Hybrid specification retrieval
+
+The promoted taxonomy is authoritative, but it is not the only layer. A second
+materialized layer (`product_vendor_specs`) normalizes every vendor attribute
+found in descriptions, converts units, and keeps provenance:
+
+```text
+promoted taxonomy      product_specs       authoritative, curated
+vendor normalized      product_vendor_specs  broad, vendor-reported
+raw vendor             product_attributes  original evidence
+```
+
+For an advertised key, filters use the promoted value first and fall back to the
+vendor value **only when the promoted value is missing** for that product. This
+fills extraction gaps without letting a conflicting vendor value override a
+validated one.
+
+For a key outside the taxonomy, the filter is routed to the vendor tier when it
+applies to the requested category. An unscoped ambiguous key such as `torque`
+is still rejected (it exists for motor shafts and connector screws); use
+`torque_kgcm` or pass a category.
+
+```python
+# Battery vendor attribute not in the taxonomy: 20A+ continuous discharge
+count_components(category="battery",
+                 filters={"max_discharge_current_a": {"gte": 20}})
+
+# Microcontroller pins/voltage are vendor-tier until the taxonomy catches up
+search_components(category="microcontrollers",
+                  filters={"pins": {"gte": 8}, "supply_voltage_v": {"lte": 3.6}})
+
+# Explicit long-tail vendor filter
+search_components(vendor_filters={"manufacturer": "3peak"}, limit=10)
+```
+
+Responses disclose the tier:
+
+- `filters_applied.filter_mode` = `hybrid` or `promoted`
+- `filters_applied.vendor_filters`
+- `filters_applied.filter_routed_to_vendor`
+- `data.filter_recall.mode`, `promoted_matches`, `vendor_fallback_matches`,
+  `missing_spec`
+- per-row `spec_sources` (`promoted` / `vendor`)
+- `describe_spec(key, vendor=True)` for discovery
+
+Use `include_vendor_specs=False` for a promoted-only query. The benchmark
+measures the difference:
+
+```powershell
+python scripts/benchmark_spec_retrieval.py
+```
+
+Historical 2.2 examples: battery `>=20A` discharge went from `0` promoted matches to
+`37` hybrid matches; `operating_temperature >= 85C` from `0` to `67`.
+Those counts predate entity/ownership enforcement and are not evidence of usable
+component recall. Re-run the benchmarks against the current catalog and policy.
 
 ```python
 # MCP / Python: "I need a 12 V motor, 1000 rpm or less, at least 5 kg-cm"
@@ -389,20 +560,33 @@ of all nine catalog keys. The web equivalents are the same filters through `sour
 
 ### Response contract (schema 2.0)
 
-- List tools return `data.items` (with `items_are: "listings"` and `total_listings`); `results` /
-  `listings` remain as aliases for older clients.
+- List tools return `data.results` (with `items_are: "listings"` and `total_listings`);
+  `data.items` remains an alias and `search_by_mpn` keeps `data.listings` as a deprecated alias.
+- `search_components(compact=True)` returns only `product_id`, `title`, `vendor`, `price`,
+  `currency`, `stock_status`, `mpn`, `specs` and `product_url` per row; 50 rows stay under 25 KB.
+  Omit the flag to keep the full response.
+- `describe_catalog(summary=True)` returns 49 keys in a compact columnar payload under 6 KB
+  (`key`, `type`, `unit`, `coverage_pct`, `backfill_pct`, `values`, `category_coverage`) plus the
+  alias map. `list_spec_keys` is retained but marked deprecated.
 - Specifications use one shape: `specs` is `{key: value}` everywhere; `get_product` adds
   `spec_details` with value/type/confidence/evidence and keeps `extracted_specs` as an alias.
-- `coverage[key]` has two explicit denominators: `catalog` and `page`. There is no longer a
-  `result_present / result_of` pair computed from different populations.
+- `coverage[key]` has explicit denominators: `catalog`, `category` (when a category is set), and
+  `page`. There is no longer a `result_present / result_of` pair computed from different
+  populations.
 - Filters report `filter_scope: "extracted_only"` and `data.filter_recall` with
-  `base_matches`, `missing_spec` and `filtered_out_for_value`, plus a `filter_recall_gap`
-  warning. The count is “products with extracted specs”, not “all products”.
+  `base_matches`, `missing_spec`, `promoted_matches`, `vendor_fallback_matches`,
+  `promoted_missing` and `filtered_out_for_value`, plus a `filter_recall_gap`
+  warning in both `count_components` and `search_components`.
+- Hybrid filters disclose `filter_mode`, `vendor_filters`,
+  `filter_routed_to_vendor`, `data.vendor_coverage`, and per-row `spec_sources`.
+  `describe_spec(key, vendor=True)` discovers the vendor tier.
 - Price/stock freshness reports `status="live"` only when every returned candidate was refreshed;
   otherwise `partial`, with `refreshed_products`, `cached_products` and `verified_pct`.
 - `search_by_mpn` rejects family tokens (`mpn_family_token`) and shared identifiers
   (`mpn_ambiguous`) unless `allow_ambiguous=True`; listings carry pack quantity, unit price and
-  `price_is_quote`.
+  `price_is_quote`. A miss returns `diagnosis.reason="mpn_not_found"` and `suggested_mpns`.
+- `health` and `describe_catalog` expose `spec_index_updated_at` and per-key `backfill_pct` so a
+  moving filtered count can be distinguished from a query error.
 
 ### MPN resolution
 
@@ -410,6 +594,11 @@ of all nine catalog keys. The web equivalents are the same filters through `sour
 `MPU 6050` resolve to the same listings. Listings include extracted `specs` and `price_source`,
 pagination uses `next_cursor` (with `stale_cursor` protection), and a miss returns
 `data.suggested_mpns` (closest catalog part numbers) instead of a dead end.
+
+Mixed chip/module identifiers such as `MPU6050` return `mpn_ambiguous` by default.
+Use `allow_ambiguous=True` to inspect their separate listing forms. Related-item
+matches are excluded by default, and a shared identifier alone does not make
+vendor offers price-comparable.
 
 ### Vendor descriptions and free-form specs
 
@@ -420,6 +609,8 @@ tolerance, dielectric, package, dimensions, ...), and REES52/Robokits publish pr
 `scripts/backfill_descriptions.py` stores those descriptions in `product_descriptions` and parses
 the tables/lists into `product_attributes`. The curated, filterable layer stays in
 `product_specs`; `vendor_specs` is the larger free-form layer returned by `get_product`.
+`get_product` also returns `normalized_vendor_specs` and `normalized_vendor_details` —
+the same vendor values with converted units, canonical aliases, confidence, and provenance.
 
 ```powershell
 # Shopify: quartzcomponents, makerbazar, rees52 (fast, ~75 catalog pages)
@@ -428,8 +619,11 @@ python scripts/backfill_descriptions.py --vendors quartzcomponents,makerbazar,re
 # Robokits product pages (one request per product)
 python scripts/backfill_descriptions.py --vendors robokits --limit 100
 
-# Robu is Cloudflare-protected; 403s are skipped, so run it where the IP is allowed
-python scripts/backfill_descriptions.py --vendors robu --limit 50
+# Robu: ProductDetails GraphQL (JSON, no HTML/Cloudflare page fetch)
+python scripts/backfill_descriptions.py --vendors robu --limit 50 --batch-size 25
+
+# Robu fallback: product HTML (403s are skipped, resume from an allowed IP)
+python scripts/backfill_descriptions.py --vendors robu --robu-source html --limit 50
 
 # Inspect without writing
 python scripts/backfill_descriptions.py --vendors quartzcomponents --limit 5 --dry-run
@@ -439,6 +633,46 @@ The script is idempotent (existing descriptions are skipped unless `--force`). `
 reports `products_with_descriptions`, `products_with_vendor_attributes` and
 `vendor_attribute_rows`; `get_product` returns `vendor_specs` plus a real `description`
 instead of falling back to the title.
+
+**Robu without a rescrape.** Robu product pages are Cloudflare-protected, but its 85k titles are
+already in SQLite. `scripts/backfill_title_attributes.py` extracts single-value specs from those
+titles (`10K 1/4W`, `100uF 25V`, `3.7V 1300mAh`) into the same `product_attributes` layer, marked
+`source=title_heuristic` and `confidence=0.6`. Kits/ranges are skipped, so the values are honest
+but less rich than a vendor table.
+
+```powershell
+python scripts/backfill_title_attributes.py --vendors robu
+python scripts/backfill_title_attributes.py --vendors robokits
+```
+
+Current catalog totals: **123,299 descriptions**, **808,477 vendor attribute rows**,
+**106,425 products with attributes**, and **924k normalized vendor spec rows**.
+
+**Robu GraphQL path.** Robu's Next.js frontend exposes
+`POST https://robu.in/api/proxy/graphql/` with a `ProductDetails` operation. It returns
+`description`, `short_description`, price and stock as JSON and is not blocked for us. The pipeline
+uses aliased queries to fetch `--batch-size` products per request (default 10), with
+`--update-price-stock` optionally writing the returned price/stock. This replaces 85k HTML page
+fetches with a few thousand JSON calls.
+
+```powershell
+python scripts/backfill_descriptions.py --vendors robu --batch-size 25
+```
+
+**Completing the Robu catalog without the search API.** The sitemap registry still has pending
+slugs after the 403-interrupted catalog run. `scripts/ingest_robu_graphql.py` fetches those slugs by
+slug through ProductDetails, upserts the product, stores its description/attributes, and marks the
+registry entry indexed. It is resumable and idempotent; rerunning continues with the next pending
+slugs.
+
+```powershell
+python scripts/ingest_robu_graphql.py --limit 100 --batch-size 25
+```
+
+Both Robu GraphQL scripts retry timeouts/429/403 with exponential backoff, split a failing
+batch and keep the successful half, and skip a slug only after retries so an overnight run is
+not killed by one slow product. Failed slugs stay pending/undescribed for the next run.
+Tune with `--timeout`, `--retries` and `--backoff`.
 
 ### Keeping the taxonomy current
 
@@ -540,11 +774,11 @@ The MCP server lives in `mcp_server/server.py` and exposes **8 tools**:
 
 | Tool | What it does |
 |---|---|
-| `describe_catalog` | Catalog size, vendor/category distribution, the full taxonomy with filterable attributes, data freshness |
-| `describe_spec` | Value distribution, range and coverage for one spec attribute |
-| `list_spec_keys` | Every queryable spec attribute with fill counts |
-| `count_components` | Size a query without fetching rows + filter coverage |
-| `search_components` | Search by text and/or spec filters, side-by-side vendor offers, cursor pagination |
+| `describe_catalog` | Catalog size, taxonomy, freshness, alias map; `summary=True` for a sub-6 KB key catalog |
+| `describe_spec` | Value distribution, range, coverage, and vendor-tier discovery (`vendor=True`) |
+| `list_spec_keys` | Deprecated alias for `describe_catalog(summary=True)`; still returns fill counts |
+| `count_components` | Size a query without fetching rows, with promoted/vendor provenance and recall diagnostics |
+| `search_components` | Search by text and/or spec filters, side-by-side vendor offers, cursor pagination; `compact=True` for small pages |
 | `search_by_mpn` | Resolve a part number (or vendor SKU) to its listings, with typo suggestions |
 | `get_product` | Full record for one product: specs, offers, confidence |
 | `health` | Liveness, dependency versions, database path |
@@ -608,11 +842,12 @@ the agent is talking to the same catalog you are.
 Once connected, the agent can discover the catalog first and then query it:
 
 ```
-describe_catalog()                                  # taxonomy, counts, filterable attributes
-search_components(category="motor", filters={"voltage": {"gte": 12}, "rpm": {"lte": 1000}})
-search_components(query="0805", category="resistors")
-count_components(category="battery", filters={"chemistry": {"eq": "lipo"}})
-search_by_mpn(mpn="MPU6050")
+describe_catalog(summary=True)                      # compact key/type/unit/coverage catalog
+count_components(category="resistors", filters={"resistance_ohm": "10k"})
+search_components(category="motor", filters={"voltage": "12", "rpm": {"lte": 1000}})
+search_components(query="0805", category="resistors", limit=50, compact=True)
+count_components(category="battery", filters={"cells": 3})
+search_by_mpn(mpn="MY1016ZL")
 ```
 
 The `category` argument accepts all 32 canonical categories; the three that

@@ -3,7 +3,7 @@ Data models and schemas for the Indian Component Aggregator Engine.
 """
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 class UnifiedProduct(BaseModel):
     """Normalized component model across all vendors."""
@@ -93,6 +93,7 @@ class PriceStockRefreshInfo(BaseModel):
       - 'timeout'          : refresh bridge exceeded its wall-clock budget; cached values served
       - 'error'            : unexpected refresh failure; cached values served
       - 'disabled'         : live refresh turned off via configuration
+      - 'skipped'          : caller explicitly disabled refresh
     """
     status: str = "cached"
     attempted: bool = False
@@ -110,6 +111,14 @@ class PriceStockRefreshInfo(BaseModel):
 class SearchResponse(BaseModel):
     """Unified search response covering raw results and side-by-side comparison groups."""
     query: str
+    unresolved_constraints: List[Dict[str, Any]] = Field(default_factory=list)
+    requirements_verified: Optional[bool] = None
+    query_contract: Dict[str, Any] = Field(default_factory=dict)
+    retrieval_status: str = "not_evaluated"
+    identity_preserved: Optional[bool] = None
+    results_kind: str = "vendor_listings"
+    alternatives: List[Dict[str, Any]] = Field(default_factory=list)
+
     total_results: int
     source: str = "live"  # 'live' or 'local_db'
     results: List[UnifiedProduct] = Field(default_factory=list)
@@ -126,6 +135,22 @@ class SearchResponse(BaseModel):
     returned_results: int = Field(0, description="Listings included in this page's groups")
     has_next: bool = Field(False, description="True when another page can be fetched")
     has_prev: bool = Field(False, description="True when this is not the first page")
+
+    @model_validator(mode="after")
+    def preserve_application_requirements(self):
+        from src.search.query_intent import retrieval_response_fields
+        from src.search.requirements import extract_requirements
+        _, parsed = extract_requirements(self.query)
+        if self.query_contract:
+            parsed = list(self.query_contract.get("unresolved_constraints", []))
+            for key, value in retrieval_response_fields(self.query_contract, self.total_results).items():
+                setattr(self, key, value)
+        for requirement in parsed:
+            if requirement not in self.unresolved_constraints:
+                self.unresolved_constraints.append(requirement)
+        if self.unresolved_constraints:
+            self.requirements_verified = False
+        return self
 
 
 class ScrapeState(BaseModel):

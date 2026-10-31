@@ -52,6 +52,8 @@
   --vendor-robokits-bg: #e0f5fa;
   --vendor-rees52: #15803d;
   --vendor-rees52-bg: #e6f6ec;
+  --vendor-flyrobo: #c2410c;
+  --vendor-flyrobo-bg: #ffedd5;
 
   /* Shape & depth */
   --radius-sm: 6px;
@@ -108,6 +110,8 @@
     --vendor-robokits-bg: #0c2830;
     --vendor-rees52: #7ee2a8;
     --vendor-rees52-bg: #10291c;
+    --vendor-flyrobo: #fdba74;
+    --vendor-flyrobo-bg: #331a0b;
 
     --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5);
@@ -1213,6 +1217,7 @@ select.spec-filter__input {
 .vendor--makerbazar { background: var(--vendor-makerbazar-bg); color: var(--vendor-makerbazar); }
 .vendor--robokits { background: var(--vendor-robokits-bg); color: var(--vendor-robokits); }
 .vendor--rees52 { background: var(--vendor-rees52-bg); color: var(--vendor-rees52); }
+.vendor--flyrobo { background: var(--vendor-flyrobo-bg); color: var(--vendor-flyrobo); }
 .vendor--default { background: var(--bg-inset); color: var(--text-muted); }
 
 .tag {

@@ -60,6 +60,31 @@ def test_upsert_and_search_products():
     assert re_fetched[0].price == 285.0
     assert re_fetched[0].available is False
 
+def test_upsert_preserves_existing_sku_when_refresh_has_none():
+    """Live search cards may omit the SKU; a price refresh must not erase it."""
+    product = UnifiedProduct(
+        vendor="flyrobo",
+        vendor_name="Flyrobo",
+        external_id="8",
+        title="L293D Motor Drive Module",
+        normalized_title="l293d motor drive module",
+        mpn="L293D",
+        sku="D-4508",
+        price=83.0,
+        available=True,
+        product_url="https://www.flyrobo.in/l293d_motor_drive_module",
+    )
+    db.upsert_products([product])
+
+    refreshed = product.model_copy(update={"sku": None, "price": 79.0})
+    db.upsert_products([refreshed])
+
+    rows = db.search_products("D-4508")
+    assert len(rows) == 1
+    assert rows[0].sku == "D-4508"
+    assert rows[0].price == 79.0
+
+
 def test_apply_vendor_gst_is_idempotent():
     db.upsert_products([
         UnifiedProduct(

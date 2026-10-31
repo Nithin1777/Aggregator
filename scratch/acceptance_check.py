@@ -100,7 +100,9 @@ try:
     )
     record(
         "categories that carry attributes expose their filters",
-        {c["slug"] for c in with_specs} == {"motor", "battery", "relay"},
+        {"motor", "battery", "relay", "resistors", "capacitors"} <= {
+            c["slug"] for c in with_specs
+        },
         ", ".join(f"{c['slug']}({len(c['filters'])})" for c in with_specs),
     )
 except Exception as exc:

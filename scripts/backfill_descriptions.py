@@ -23,6 +23,7 @@ The script is idempotent: an existing description is skipped unless --force.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sqlite3
 import sys
@@ -34,6 +35,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
 import db
+from adapters.robu_graphql import (
+    RobuGraphQLClient,
+    RobuGraphQLSchemaError,
+    description_html,
+)
 from config import settings
 from src.spec.description import description_text, extract_description_attributes
 
@@ -94,7 +100,13 @@ def _persist(
     if dry_run:
         return len(attrs)
     db.save_product_description(product_id, text, source=source, conn=conn)
-    return db.replace_product_attributes(product_id, attrs, source="description", conn=conn)
+    return db.replace_product_attributes(
+        product_id,
+        attrs,
+        source="description",
+        conn=conn,
+        source_prefix="description",
+    )
 
 
 def _shopify_vendor(
@@ -276,6 +288,121 @@ def _robu(
     return stats
 
 
+def _slug_for(row: sqlite3.Row) -> str:
+    try:
+        raw = json.loads(row["raw_json"] or "{}")
+        slug = (raw.get("slug") or "").strip()
+    except (TypeError, ValueError):
+        slug = ""
+    if not slug:
+        url = (row["product_url"] or "").rstrip("/")
+        slug = url.split("/")[-1] if url else ""
+    return slug
+
+
+def _robu_graphql(
+    conn: sqlite3.Connection,
+    limit: int,
+    batch_size: int,
+    sleep_s: float,
+    force: bool,
+    dry_run: bool,
+    update_price_stock: bool = False,
+    timeout: int = 60,
+    retries: int = 3,
+    backoff: float = 2.0,
+) -> Dict[str, int]:
+    """
+    Robu product descriptions via the frontend's ProductDetails GraphQL API.
+
+    This is the preferred Robu path: JSON, no Cloudflare HTML, and aliases allow
+    `batch_size` products per request.
+    """
+    stats = {"scanned": 0, "matched": 0, "saved": 0, "attributes": 0, "skipped": 0}
+    if force:
+        rows = conn.execute(
+            "SELECT id, raw_json, product_url FROM products WHERE vendor = 'robu' ORDER BY id;"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT p.id, p.raw_json, p.product_url FROM products p "
+            "LEFT JOIN product_descriptions d ON d.product_id = p.id "
+            "WHERE p.vendor = 'robu' AND d.product_id IS NULL ORDER BY p.id;"
+        ).fetchall()
+
+    if limit:
+        rows = rows[:limit]
+    stats["scanned"] = len(rows)
+    stats["matched"] = len(rows)
+    if not rows:
+        return stats
+
+    client = RobuGraphQLClient(timeout=timeout, retries=retries, backoff=backoff)
+    consecutive_failures = 0
+    try:
+        for start in range(0, len(rows), max(1, batch_size)):
+            chunk = rows[start:start + max(1, batch_size)]
+            by_slug = {_slug_for(row): row for row in chunk if _slug_for(row)}
+            if not by_slug:
+                continue
+            try:
+                details = client.fetch_batch(list(by_slug.keys()), batch_size=batch_size)
+            except RobuGraphQLSchemaError as exc:
+                logger.error("[robu-graphql] schema error at offset %s: %s", start, exc)
+                break
+            if client.failures:
+                logger.warning(
+                    "[robu-graphql] skipped %s slug(s) in batch at offset %s; they remain undescribed",
+                    len(client.failures), start,
+                )
+            if not details and client.failures:
+                consecutive_failures += 1
+                if consecutive_failures >= 5:
+                    logger.error(
+                        "[robu-graphql] 5 consecutive failed batches; stopping so the "
+                        "endpoint can recover. Rerun to retry the undescribed products."
+                    )
+                    break
+            else:
+                consecutive_failures = 0
+            for slug, detail in details.items():
+                row = by_slug.get(slug)
+                if row is None:
+                    continue
+                html = description_html(detail)
+                if not html.strip():
+                    stats["skipped"] += 1
+                    continue
+                saved = _persist(
+                    conn, int(row["id"]), html, "robu_graphql", dry_run
+                )
+                stats["saved"] += 1
+                stats["attributes"] += saved
+                if update_price_stock and not dry_run:
+                    price = detail.get("price") or {}
+                    final_price = price.get("final") or price.get("regular")
+                    try:
+                        final_price = float(final_price)
+                    except (TypeError, ValueError):
+                        final_price = None
+                    if final_price and final_price > 0:
+                        db.update_price_stock_batch([{
+                            "id": int(row["id"]),
+                            "price": final_price,
+                            "available": bool(detail.get("in_stock")),
+                            "fetched_at": db.utc_now_iso(),
+                        }])
+            if stats["saved"] and stats["saved"] % 200 < batch_size:
+                logger.info(
+                    "[robu-graphql] saved=%s attrs=%s of %s",
+                    stats["saved"], stats["attributes"], len(rows),
+                )
+            time.sleep(max(0.0, sleep_s))
+    finally:
+        client.close()
+    return stats
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -287,6 +414,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--max-pages", type=int, default=200, help="max Shopify catalog pages")
     parser.add_argument("--page-size", type=int, default=250, help="Shopify page size")
     parser.add_argument("--sleep", type=float, default=0.35, help="delay between requests")
+    parser.add_argument(
+        "--batch-size", type=int, default=10, help="Robu GraphQL products per request"
+    )
+    parser.add_argument(
+        "--robu-source",
+        choices=["graphql", "html"],
+        default="graphql",
+        help="Robu transport: GraphQL API (default) or product pages",
+    )
+    parser.add_argument(
+        "--update-price-stock",
+        action="store_true",
+        help="also write price/stock returned by the Robu GraphQL API",
+    )
+    parser.add_argument("--timeout", type=int, default=60, help="per-request timeout (seconds)")
+    parser.add_argument("--retries", type=int, default=3, help="retries per request")
+    parser.add_argument("--backoff", type=float, default=2.0, help="retry backoff base (seconds)")
     parser.add_argument("--force", action="store_true", help="refetch even if a description exists")
     parser.add_argument("--dry-run", action="store_true", help="parse but do not write")
     args = parser.parse_args(argv)
@@ -314,9 +458,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                     conn, max(0, args.limit), max(0.0, args.sleep), args.force, args.dry_run
                 )
             elif vendor == "robu":
-                totals[vendor] = _robu(
-                    conn, max(0, args.limit), max(0.0, args.sleep), args.force, args.dry_run
-                )
+                if args.robu_source == "graphql":
+                    totals[vendor] = _robu_graphql(
+                        conn,
+                        max(0, args.limit),
+                        max(1, args.batch_size),
+                        max(0.0, args.sleep),
+                        args.force,
+                        args.dry_run,
+                        update_price_stock=args.update_price_stock,
+                        timeout=max(5, args.timeout),
+                        retries=max(1, args.retries),
+                        backoff=max(0.0, args.backoff),
+                    )
+                else:
+                    totals[vendor] = _robu(
+                        conn, max(0, args.limit), max(0.0, args.sleep), args.force, args.dry_run
+                    )
             else:
                 logger.warning("Unknown vendor %r; skipping.", vendor)
 

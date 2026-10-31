@@ -32,14 +32,17 @@ BATTERY_KEYS = {"voltage", "cells", "capacity_mah", "discharge_c", "chemistry"}
 
 # ---------------------------------------------------------------- query recovery
 
-def test_natural_language_query_relaxes_instead_of_returning_nothing():
+def test_natural_language_query_preserves_requirements_instead_of_returning_nothing():
     res = search_components(
         query="battery to power arduino uno for 8 hours", limit=3, refresh=False
     )
     assert res.ok is True
     assert res.total_matches > 0, "natural-language queries must not dead-end"
     codes = [w["code"] for w in (res.warnings or [])]
-    assert "query_relaxed" in codes
+    assert "unresolved_engineering_constraints" in codes
+    assert res.data["unresolved_constraints"][0]["value_hours"] == 8
+    assert res.data["unresolved_constraints"][0]["load_target"] == "arduino uno"
+    assert res.data["requirements_verified"] is False
     assert res.filters_applied.get("query_effective"), (
         "the caller must be able to see what was actually searched"
     )
@@ -156,9 +159,11 @@ def test_specs_not_extracted_is_scoped_to_the_products_category():
 # ---------------------------------------------------------------- MPN resolution
 
 def test_mpn_lookup_ignores_separators():
-    joined = search_by_mpn(mpn="MPU6050", limit=5, refresh=False)
-    hyphened = search_by_mpn(mpn="MPU-6050", limit=5, refresh=False)
-    spaced = search_by_mpn(mpn="MPU 6050", limit=5, refresh=False)
+    # This identifier spans bare chips and breakout modules; broad inspection
+    # is explicit, while separator normalization must remain unchanged.
+    joined = search_by_mpn(mpn="MPU6050", limit=5, refresh=False, allow_ambiguous=True)
+    hyphened = search_by_mpn(mpn="MPU-6050", limit=5, refresh=False, allow_ambiguous=True)
+    spaced = search_by_mpn(mpn="MPU 6050", limit=5, refresh=False, allow_ambiguous=True)
     assert joined.ok and hyphened.ok and spaced.ok
     assert joined.total_matches > 0
     ids = lambda res: {l["product_id"] for l in res.data["listings"]}

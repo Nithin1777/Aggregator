@@ -1,0 +1,107 @@
+Timeout (0:01:00)!
+Thread 0x00002b0c (most recent call first):
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\mcp_server\server.py", line 2934 in search_components
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\tests\test_agent_usability_contract.py", line 260 in test_count_and_search_totals_agree_for_filter_combinations
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\python.py", line 167 in pytest_pyfunc_call
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_execution.py", line 147 in _multicall
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_manager.py", line 183 in _hookexec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_caller.py", line 197 in __call__
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\python.py", line 1707 in runtest
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 184 in pytest_runtest_call
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_execution.py", line 147 in _multicall
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_manager.py", line 183 in _hookexec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_caller.py", line 197 in __call__
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 250 in <lambda>
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 361 in from_call
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 249 in call_and_report
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 139 in runtestprotocol
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 118 in pytest_runtest_protocol
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_execution.py", line 147 in _multicall
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_manager.py", line 183 in _hookexec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_caller.py", line 197 in __call__
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\main.py", line 408 in pytest_runtestloop
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_execution.py", line 147 in _multicall
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_manager.py", line 183 in _hookexec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_caller.py", line 197 in __call__
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\main.py", line 384 in _main
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\main.py", line 330 in wrap_session
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\main.py", line 377 in pytest_cmdline_main
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_execution.py", line 147 in _multicall
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_manager.py", line 183 in _hookexec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_caller.py", line 197 in __call__
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\config\__init__.py", line 229 in _main
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\config\__init__.py", line 253 in _console_main
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pytest\__main__.py", line 9 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 203 in _run_module_as_main
+......................................................................F. [ 67%]
+.....F..FFFFFF.....................                                      [100%]
+================================== FAILURES ===================================
+_____________ test_unclassified_product_has_no_phantom_spec_gaps ______________
+tests\test_mcp_agent_contract.py:369: in test_unclassified_product_has_no_phantom_spec_gaps
+    assert res.data["specs"] == {
+E   AssertionError: assert {} == {'program_pla...thon,arduino'}
+E     
+E     Right contains 1 more item:
+E     {'program_platform': 'uiflow,micropython,arduino'}
+E     Use -v to get more diff
+________________ test_refresh_uses_live_values_and_caches_them ________________
+tests\test_price_stock_refresh.py:135: in test_refresh_uses_live_values_and_caches_them
+    assert info.status == "live"
+E   AssertionError: assert 'disabled' == 'live'
+E     
+E     - live
+E     + disabled
+______________ test_offline_refresh_falls_back_to_cached_values _______________
+tests\test_price_stock_refresh.py:203: in test_offline_refresh_falls_back_to_cached_values
+    assert info.status == "cached"
+E   AssertionError: assert 'disabled' == 'cached'
+E     
+E     - cached
+E     + disabled
+___________________ test_failed_pass_opens_circuit_breaker ____________________
+tests\test_price_stock_refresh.py:227: in test_failed_pass_opens_circuit_breaker
+    assert calls_after_failure >= 1
+E   assert 0 >= 1
+_____________________ test_fresh_cache_skips_vendor_calls _____________________
+tests\test_price_stock_refresh.py:246: in test_fresh_cache_skips_vendor_calls
+    assert info.status == "fresh_cache"
+E   AssertionError: assert 'disabled' == 'fresh_cache'
+E     
+E     - fresh_cache
+E     + disabled
+_____________ test_local_search_refreshed_falls_back_when_offline _____________
+tests\test_price_stock_refresh.py:264: in test_local_search_refreshed_falls_back_when_offline
+    assert resp.price_refresh.status == "cached"
+E   AssertionError: assert 'disabled' == 'cached'
+E     
+E     - cached
+E     + disabled
+______________ test_mcp_search_components_refreshes_price_stock _______________
+tests\test_price_stock_refresh.py:280: in test_mcp_search_components_refreshes_price_stock
+    assert res.total_matches >= 1
+E   AssertionError: assert 0 >= 1
+E    +  where 0 = ToolResponseEnvelope(ok=True, data={'items': [], 'results': [], 'suggestions': [], 'query_status': 'exact', 'match_mod...iagnosis={'reason': 'no_catalog_match', 'severity': 'info', 'query': 'IG52 motor', 'filters': {}, 'category': 'motor'}).total_matches
+____________ test_mcp_search_components_serves_cache_when_offline _____________
+tests\test_price_stock_refresh.py:301: in test_mcp_search_components_serves_cache_when_offline
+    assert res.data["results"]
+E   assert []
+============================= slowest 8 durations =============================
+60.24s call     tests/test_agent_usability_contract.py::test_count_and_search_totals_agree_for_filter_combinations
+58.63s call     tests/test_search_quality_audit.py::test_health_reports_product_coverage_percentage
+43.90s call     tests/test_agent_usability_contract.py::test_health_exposes_spec_index_freshness
+38.51s call     tests/test_agent_usability_contract.py::test_unscoped_voltage_aliases_are_equal_and_disclosed
+30.16s call     tests/test_mcp_agent_contract.py::test_describe_catalog_advertises_filter_support_per_category
+27.86s call     tests/test_agent_usability_contract.py::test_summary_catalog_payload_is_under_6kb_and_exposes_aliases
+27.31s call     tests/test_mcp_agent_contract.py::test_category_filter_uses_canonical_category_not_extraction_scope
+22.68s call     tests/test_agent_usability_contract.py::test_count_echoes_scope_and_query_status
+=========================== short test summary info ===========================
+FAILED tests/test_mcp_agent_contract.py::test_unclassified_product_has_no_phantom_spec_gaps
+FAILED tests/test_price_stock_refresh.py::test_refresh_uses_live_values_and_caches_them
+FAILED tests/test_price_stock_refresh.py::test_offline_refresh_falls_back_to_cached_values
+FAILED tests/test_price_stock_refresh.py::test_failed_pass_opens_circuit_breaker
+FAILED tests/test_price_stock_refresh.py::test_fresh_cache_skips_vendor_calls
+FAILED tests/test_price_stock_refresh.py::test_local_search_refreshed_falls_back_when_offline
+FAILED tests/test_price_stock_refresh.py::test_mcp_search_components_refreshes_price_stock
+FAILED tests/test_price_stock_refresh.py::test_mcp_search_components_serves_cache_when_offline
+8 failed, 99 passed in 595.62s (0:09:55)

@@ -112,7 +112,8 @@ class ShopifyAdapter(BaseAdapter):
         Returns: (List[UnifiedProduct], has_more)
         """
         url = f"{self._base_url}/products.json"
-        params = {"limit": min(limit, settings.shopify_batch_limit), "page": page}
+        effective_limit = min(limit, settings.shopify_batch_limit)
+        params = {"limit": effective_limit, "page": page}
 
         # Rate-limiting polite delay between batch pages
         await asyncio.sleep(settings.shopify_page_delay)
@@ -120,7 +121,7 @@ class ShopifyAdapter(BaseAdapter):
         data = await self._fetch_with_backoff(url, params=params)
         if data is None:  # 404 only: genuine end of catalog
             return [], False
-        if "products" not in data:
+        if not isinstance(data, dict) or not isinstance(data.get("products"), list):
             # A 200 response without the expected envelope means the endpoint or its
             # schema changed. Treat as an error rather than as an empty last page.
             raise VendorFetchError(
@@ -191,7 +192,7 @@ class ShopifyAdapter(BaseAdapter):
                 continue
 
         # If count returned is less than requested limit, this is the last page
-        has_more = len(raw_items) >= limit
+        has_more = len(raw_items) >= effective_limit
         return products, has_more
 
     async def search_live(self, query: str, limit: int = 20) -> List[UnifiedProduct]:

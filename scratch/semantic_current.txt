@@ -1,0 +1,12 @@
+........................................................................ [ 51%]
+....................................................................     [100%]
+============================= slowest 8 durations =============================
+49.13s call     tests/test_search_quality_audit.py::test_health_reports_product_coverage_percentage
+41.13s call     tests/test_agent_usability_contract.py::test_health_exposes_spec_index_freshness
+21.35s call     tests/test_agent_usability_contract.py::test_unscoped_voltage_aliases_are_equal_and_disclosed
+17.98s call     tests/test_agent_usability_contract.py::test_resistance_suffixes_normalize_to_ohms
+16.78s call     tests/test_agent_usability_contract.py::test_count_and_search_totals_agree_for_filter_combinations
+14.56s call     tests/test_agent_usability_contract.py::test_count_echoes_scope_and_query_status
+9.72s call     tests/test_agent_usability_contract.py::test_query_narrowed_count_matches_the_returned_total
+8.86s call     tests/test_mcp_agent_contract.py::test_real_mpn_is_still_exact
+140 passed in 327.11s (0:05:27)

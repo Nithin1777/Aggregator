@@ -47,21 +47,25 @@ def test_rpm_is_rejected_for_battery_category():
     assert res.diagnosis["filter_support"] == "partial"
 
 
-def test_filter_on_category_without_attributes_reports_filter_support_none():
-    res = count_components(category="resistors", filters={"voltage": "5"})
+def test_filter_on_category_without_promoted_attributes_uses_vendor_tier():
+    # Drones has no taxonomy attributes, but its vendor descriptions carry
+    # voltage. The hybrid layer should use it rather than rejecting the filter.
+    res = count_components(category="drones", filters={"voltage": "5"})
 
-    assert res.ok is False
-    assert res.error_code == "filter_not_applicable_to_category"
-    assert res.diagnosis["filter_support"] == "none"
-    assert res.diagnosis["applicable_keys"] == []
+    assert res.ok is True
+    assert res.filters_applied["filter_support"] == "partial"
+    assert res.filters_applied["filter_mode"] == "hybrid"
 
 
-def test_relay_only_advertises_channels():
+def test_relay_advertises_channels_and_contact_attributes():
     res = count_components(category="relay", filters={"current_a": {"gte": 10}})
 
     assert res.ok is False
     assert res.error_code == "filter_not_applicable_to_category"
-    assert res.diagnosis["applicable_keys"] == ["channels"]
+    assert {"channels", "coil_voltage_v", "contact_current_a"} <= set(
+        res.diagnosis["applicable_keys"]
+    )
+    assert "current_a" not in res.diagnosis["applicable_keys"]
 
 
 def test_applicable_filter_still_works():
@@ -236,9 +240,10 @@ def test_natural_language_query_relaxes_to_a_category_not_the_whole_catalog():
     assert res.total_matches < 10000, (
         "relaxation must not fall back to a near-whole-catalog result"
     )
-    assert res.data["query_status"] in ("relaxed", "low_confidence")
-    assert "query_relaxed" in _codes(res)
-    assert res.data["query_tokens_dropped"]
+    assert res.data["query_status"] == "exact"
+    assert "unresolved_engineering_constraints" in _codes(res)
+    assert res.data["unresolved_constraints"][0]["load_target"] == "arduino"
+    assert res.data["requirements_verified"] is False
 
 
 def test_over_narrow_query_gets_a_narrowing_warning():
@@ -264,15 +269,16 @@ def test_cheapest_intent_changes_sort_to_price_asc():
         assert "relay" in row["title"].lower()
 
 
-def test_price_sort_excludes_zero_price_services():
+def test_price_sort_preserves_the_filtered_population():
     res = search_components(
         query="ESP32", sort="price_asc", refresh=False, limit=20
     )
 
     assert res.ok is True
     assert res.data["results"]
-    assert all(row["price"] > 0 for row in res.data["results"])
-    assert res.filters_applied["price_zero_excluded"] is True
+    count = count_components(query="ESP32")
+    assert res.total_matches == count.total_matches
+    assert res.filters_applied["price_zero_excluded"] is False
 
 
 def test_budget_in_query_is_applied_as_price_max():
@@ -297,12 +303,18 @@ def test_family_token_is_not_an_mpn():
 
 
 def test_real_mpn_is_still_exact():
-    res = search_by_mpn(mpn="MPU6050", refresh=False, limit=2)
+    res = search_by_mpn(mpn="MY1016ZL", refresh=False, limit=2)
 
     assert res.ok is True
     assert res.total_matches > 0
     assert res.data["items_are"] == "listings"
     assert res.data["total_listings"] == res.total_matches
+
+
+def test_chip_and_breakout_sharing_an_identifier_are_ambiguous():
+    res = search_by_mpn(mpn="MPU6050", refresh=False)
+    assert not res.ok and res.error_code == "mpn_ambiguous"
+    assert set(res.details["sold_forms"]) >= {"component", "module"}
 
 
 def test_ambiguous_mpn_can_be_opted_into_with_a_warning():
@@ -338,15 +350,29 @@ def test_list_tools_expose_items_and_keep_legacy_alias():
 
 
 def test_unclassified_product_has_no_phantom_spec_gaps():
-    # 72 is the QuartzComponents 18AWG wire: classifiable as `wires`, but the
-    # taxonomy has no attribute set for it, so no "missing battery spec" list.
-    res = get_product(product_id=72, refresh=False)
+    import db
+
+    conn = db.get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT id FROM products WHERE spec_category IS NULL LIMIT 1;"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, "need at least one unclassified product for this test"
+
+    res = get_product(product_id=int(row[0]), refresh=False)
 
     assert res.ok is True
     assert res.data["spec_extraction_scope"] == "unclassified"
     assert res.data["specs_not_extracted"] == []
     assert res.data["specs"] == {
         key: str(value["value"]) for key, value in res.data["spec_details"].items()
+        if value["subject"] == "sold_item"
+    }
+    assert res.data["related_specs"] == {
+        key: str(value["value"]) for key, value in res.data["spec_details"].items()
+        if value["subject"] != "sold_item"
     }
 
 
@@ -379,9 +405,12 @@ def test_filtered_search_reports_products_dropped_for_missing_specs():
     assert res.ok is True
     assert res.filters_applied["filter_scope"] == "extracted_only"
     recall = res.data["filter_recall"]
-    assert recall["scope"] == "extracted_only"
-    assert recall["base_matches"] == 704
-    assert recall["missing_spec"] > 500
+    assert recall["scope"] == "usable_evidence"
+    assert recall["base_matches"] == sum(recall[k] for k in (
+        "confirmed_matches", "filtered_out_for_value", "missing_spec"
+    ))
+    assert recall["base_matches"] > res.total_matches
+    assert recall["missing_spec"] > 0
     assert recall["missing_spec"] + res.total_matches <= recall["base_matches"]
     assert "filter_recall_gap" in _codes(res)
 
@@ -415,4 +444,5 @@ def test_describe_catalog_advertises_filter_support_per_category():
         c["id"]: c["filter_support"] for c in res.data["taxonomy"]
     }
     assert support["battery"] == "partial"
-    assert support["resistors"] == "none"
+    assert support["resistors"] == "partial"
+    assert support["drones"] == "none"

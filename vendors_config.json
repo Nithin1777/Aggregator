@@ -24,6 +24,11 @@
       "name": "Robokits India",
       "base_url": "https://robokits.co.in",
       "adapter": "RobokitsAdapter"
+    },
+    "flyrobo": {
+      "name": "Flyrobo",
+      "base_url": "https://www.flyrobo.in",
+      "adapter": "FlyroboAdapter"
     }
   }
 }

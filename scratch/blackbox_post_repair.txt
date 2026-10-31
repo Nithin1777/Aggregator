@@ -1,0 +1,42 @@
+Timeout (0:01:30)!
+Thread 0x000065a0 (most recent call first):
+  File "C:\Users\nithi\AppData\Local\Python\pythoncore-3.14-64\Lib\re\__init__.py", line 208 in sub
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\src\spec\filters.py", line 410 in canonical_enum_value
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\src\search\product_role.py", line 130 in <lambda>
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\src\spec\introspection.py", line 70 in filter_population
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\mcp_server\server.py", line 1598 in describe_spec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\tests\test_hybrid_specs.py", line 91 in test_vendor_layer_is_discoverable_through_describe_spec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\python.py", line 167 in pytest_pyfunc_call
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_execution.py", line 147 in _multicall
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_manager.py", line 183 in _hookexec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_caller.py", line 197 in __call__
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\python.py", line 1707 in runtest
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 184 in pytest_runtest_call
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_execution.py", line 147 in _multicall
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_manager.py", line 183 in _hookexec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_caller.py", line 197 in __call__
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 250 in <lambda>
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 361 in from_call
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 249 in call_and_report
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 139 in runtestprotocol
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\runner.py", line 118 in pytest_runtest_protocol
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_execution.py", line 147 in _multicall
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_manager.py", line 183 in _hookexec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_caller.py", line 197 in __call__
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\main.py", line 408 in pytest_runtestloop
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_execution.py", line 147 in _multicall
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_manager.py", line 183 in _hookexec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_caller.py", line 197 in __call__
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\main.py", line 384 in _main
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\main.py", line 330 in wrap_session
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\main.py", line 377 in pytest_cmdline_main
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_execution.py", line 147 in _multicall
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_manager.py", line 183 in _hookexec
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pluggy\_caller.py", line 197 in __call__
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\config\__init__.py", line 229 in _main
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\_pytest\config\__init__.py", line 253 in _console_main
+  File "C:\Users\nithi\Downloads\Platfrom Scrapper\.venv\Lib\site-packages\pytest\__main__.py", line 9 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 203 in _run_module_as_main
+..............................................................F..F...F.. [ 67%]
+.

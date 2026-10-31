@@ -8,30 +8,17 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from config import settings
-from src.search.query_terms import (
-    QueryPlan,
-    content_tokens,
-    correctable,
-    detect_unsupported_syntax,
-    fts_variations,
-    relaxed_fts_expr,
-    strict_fts_expr,
-)
+from src.search.query_terms import QueryPlan
+from src.search.planner import resolve_query_plan as _resolve_query_plan, suggest_query_token
 from models import ScrapeState, UnifiedProduct
-from src.spec.filters import (
-    build_spec_clauses,
-    load_catalog_specs,
-    parse_and_validate_filters,
-)
 from src.spec.taxonomy_loader import (
     classify_product,
     get_taxonomy,
-    is_junk_raw,
-    tokenize,
 )
+from src.search.product_role import register_semantics
+from src.search.service import CatalogSearch
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +37,7 @@ def get_db_connection() -> sqlite3.Connection:
     # always writable (sandboxes, locked-down CI) and makes SQLite fail with
     # "unable to open database file" on perfectly valid statements.
     conn.execute("PRAGMA temp_store = MEMORY;")
+    register_semantics(conn)
     return conn
 
 
@@ -219,6 +207,82 @@ def _ensure_category_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_vendor_spec_schema(conn: sqlite3.Connection) -> None:
+    """
+    Materialized, normalized vendor-attribute layer.
+
+    `product_attributes` is vendor-shaped and unit-inconsistent. This table is
+    the queryable bridge: one best row per (product, canonical/raw key), with
+    the value converted into a stable unit so range filters are meaningful.
+    It stays separate from `product_specs` so promoted taxonomy rows keep their
+    authority and provenance.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_vendor_specs (
+            product_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            value_num REAL,
+            value_type TEXT NOT NULL DEFAULT 'string',
+            unit TEXT,
+            raw_key TEXT,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            source TEXT NOT NULL DEFAULT 'vendor',
+            PRIMARY KEY(product_id, key)
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_product_vendor_specs_key_value_num "
+        "ON product_vendor_specs(key, value_num);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_product_vendor_specs_key_value "
+        "ON product_vendor_specs(key, value);"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vendor_spec_stats_global (
+            key TEXT PRIMARY KEY,
+            value_type TEXT,
+            unit TEXT,
+            applicable_count INTEGER NOT NULL DEFAULT 0,
+            value_min REAL,
+            value_max REAL,
+            updated_at TEXT
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vendor_spec_stats (
+            category TEXT NOT NULL,
+            key TEXT NOT NULL,
+            applicable_count INTEGER NOT NULL DEFAULT 0,
+            filled_count INTEGER NOT NULL DEFAULT 0,
+            unit TEXT,
+            value_min REAL,
+            value_max REAL,
+            updated_at TEXT,
+            PRIMARY KEY(category, key)
+        );
+        """
+    )
+
+
+def ensure_vendor_spec_schema(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Creates the normalized vendor-spec tables on an existing database."""
+    own = conn is None
+    conn = conn or get_db_connection()
+    try:
+        with conn:
+            _ensure_vendor_spec_schema(conn)
+    finally:
+        if own:
+            conn.close()
+
+
 def init_db():
     """Initializes schema, indexes, FTS5 virtual table, and checkpoint tracking."""
     conn = get_db_connection()
@@ -266,6 +330,8 @@ def init_db():
 
             # 2c. Vendor descriptions and free-form attributes
             _ensure_description_schema(conn)
+            # 2d. Normalized, queryable vendor-attribute layer
+            _ensure_vendor_spec_schema(conn)
 
             # 2b. Variant families table for Option B
             conn.execute("""
@@ -338,6 +404,26 @@ def init_db():
                 );
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_robu_registry_status ON robu_catalog_registry(status);")
+
+            # 6b. Generic Ground-Truth Catalog Registry.
+            #     Sitemap-driven vendors (Flyrobo) store every published product URL
+            #     here so ingestion is complete and resumable without re-reading the
+            #     sitemaps on every run. Robu keeps its original table above.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS vendor_catalog_registry (
+                    vendor TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (vendor, slug)
+                );
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_vendor_registry_status "
+                "ON vendor_catalog_registry(vendor, status);"
+            )
 
             # 7. Gray-Zone Telemetry & Audit Log Table (Tracks ambiguous merges and vetoes)
             conn.execute("""
@@ -444,7 +530,7 @@ def upsert_products(products: List[UnifiedProduct]) -> int:
                         title = excluded.title,
                         normalized_title = excluded.normalized_title,
                         mpn = excluded.mpn,
-                        sku = excluded.sku,
+                        sku = COALESCE(NULLIF(excluded.sku, ''), products.sku),
                         price = excluded.price,
                         available = excluded.available,
                         product_url = excluded.product_url,
@@ -493,6 +579,7 @@ def ensure_description_schema(conn: Optional[sqlite3.Connection] = None) -> None
     try:
         with conn:
             _ensure_description_schema(conn)
+            _ensure_vendor_spec_schema(conn)
     finally:
         if own:
             conn.close()
@@ -548,21 +635,31 @@ def replace_product_attributes(
     attributes: List[Dict[str, Any]],
     source: str = "description",
     conn: Optional[sqlite3.Connection] = None,
+    source_prefix: Optional[str] = None,
 ) -> int:
     """
     Replaces the free-form attributes for one product. Idempotent.
 
     `attributes` items use the `src.spec.description` shape:
     key, label, value, value_num, unit, confidence.
+
+    `source_prefix` scopes the delete (e.g. "title" for title-derived rows), so
+    a title refresh never destroys description-table attributes.
     """
     own = conn is None
     conn = conn or get_db_connection()
     try:
         with conn:
-            conn.execute(
-                "DELETE FROM product_attributes WHERE product_id = ?;",
-                (int(product_id),),
-            )
+            if source_prefix:
+                conn.execute(
+                    "DELETE FROM product_attributes WHERE product_id = ? AND source LIKE ?;",
+                    (int(product_id), f"{source_prefix}%"),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM product_attributes WHERE product_id = ?;",
+                    (int(product_id),),
+                )
             rows = [
                 (
                     int(product_id),
@@ -913,15 +1010,20 @@ def get_pending_robu_slugs(limit: int = 100) -> List[Dict[str, str]]:
 
 def mark_robu_slug_indexed(slug: str) -> None:
     """Marks a slug as indexed or checked in the registry."""
+    mark_robu_slug_status(slug, "indexed")
+
+
+def mark_robu_slug_status(slug: str, status: str) -> None:
+    """Sets a registry status (indexed, pending, missing) for one slug."""
     conn = get_db_connection()
     now_str = datetime.now(timezone.utc).isoformat()
     try:
         with conn:
             conn.execute("""
                 UPDATE robu_catalog_registry
-                SET status = 'indexed', updated_at = ?
+                SET status = ?, updated_at = ?
                 WHERE slug = ?;
-            """, (now_str, slug))
+            """, (status, now_str, slug))
     finally:
         conn.close()
 
@@ -941,6 +1043,184 @@ def sync_robu_registry_with_products() -> int:
                 );
             """, (now_str,))
             return cursor.rowcount
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Generic sitemap registry (Flyrobo and future sitemap-driven vendors)
+#
+# `robu_catalog_registry` predates this table and is still used by the Robu
+# reconciliation loop. New adapters use this vendor-scoped registry:
+#   - `page` in fetch_catalog_page() maps to a deterministic slice of the
+#     registry, so the shared scrape_checkpoints continuation works unchanged.
+#   - status is informational (`pending` / `indexed` / `failed` / `missing`);
+#     enumeration is order-based so one failed product never shifts the list.
+# ---------------------------------------------------------------------------
+
+
+def populate_vendor_registry(vendor: str, slug_url_tuples: List[tuple]) -> int:
+    """Inserts a vendor's sitemap URLs, keeping existing rows and statuses.
+
+    Returns the number of newly added slugs (existing rows are refreshed in place
+    and a product that reappears after being marked `missing` becomes `pending`).
+    """
+    if not slug_url_tuples:
+        return 0
+    conn = get_db_connection()
+    now_str = utc_now_iso()
+    try:
+        with conn:
+            existing = {
+                row["slug"]
+                for row in conn.execute(
+                    "SELECT slug FROM vendor_catalog_registry WHERE vendor = ?;", (vendor,)
+                ).fetchall()
+            }
+            added = 0
+            for slug, url in slug_url_tuples:
+                if slug not in existing:
+                    added += 1
+                conn.execute(
+                    """
+                    INSERT INTO vendor_catalog_registry
+                        (vendor, slug, url, status, created_at, updated_at)
+                    VALUES (?, ?, ?, 'pending', ?, ?)
+                    ON CONFLICT(vendor, slug) DO UPDATE SET
+                        url = excluded.url,
+                        status = CASE
+                            WHEN vendor_catalog_registry.status = 'missing' THEN 'pending'
+                            ELSE vendor_catalog_registry.status
+                        END,
+                        updated_at = excluded.updated_at;
+                    """,
+                    (vendor, slug, url, now_str, now_str),
+                )
+            return added
+    finally:
+        conn.close()
+
+
+def list_vendor_registry_slugs(vendor: str) -> set:
+    """Returns every slug currently recorded for a vendor."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT slug FROM vendor_catalog_registry WHERE vendor = ?;", (vendor,)
+        ).fetchall()
+        return {row["slug"] for row in rows}
+    finally:
+        conn.close()
+
+
+def mark_vendor_slugs_status(vendor: str, slugs, status: str) -> int:
+    """Bulk-updates registry status for a vendor's slugs."""
+    slugs = [str(slug) for slug in slugs if slug]
+    if not slugs:
+        return 0
+    conn = get_db_connection()
+    now_str = utc_now_iso()
+    updated = 0
+    try:
+        with conn:
+            for start in range(0, len(slugs), 500):
+                chunk = slugs[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cursor = conn.execute(
+                    f"""
+                    UPDATE vendor_catalog_registry
+                    SET status = ?, updated_at = ?
+                    WHERE vendor = ? AND slug IN ({placeholders});
+                    """,
+                    (status, now_str, vendor, *chunk),
+                )
+                updated += cursor.rowcount
+    finally:
+        conn.close()
+    return updated
+
+
+def mark_vendor_slug_status(vendor: str, slug: str, status: str) -> None:
+    """Sets the registry status of one vendor slug."""
+    mark_vendor_slugs_status(vendor, [slug], status)
+
+
+def count_vendor_registry(vendor: str, include_missing: bool = False) -> int:
+    """Counts a vendor's registry rows that are part of the current sitemap.
+
+    Pass ``include_missing=True`` when the count backs an offset-based page
+    enumeration: excluded rows would shift every later offset.
+    """
+    conn = get_db_connection()
+    try:
+        if include_missing:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM vendor_catalog_registry WHERE vendor = ?;",
+                (vendor,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM vendor_catalog_registry "
+                "WHERE vendor = ? AND status != 'missing';",
+                (vendor,),
+            ).fetchone()
+        return int(row["total"])
+    finally:
+        conn.close()
+
+
+def get_vendor_registry_page(
+    vendor: str, offset: int, limit: int, include_missing: bool = False
+) -> List[Dict[str, str]]:
+    """Returns a stable, insertion-ordered slice of a vendor's registry."""
+    conn = get_db_connection()
+    try:
+        clause = "" if include_missing else " AND status != 'missing'"
+        rows = conn.execute(
+            f"""
+            SELECT slug, url, status FROM vendor_catalog_registry
+            WHERE vendor = ?{clause}
+            ORDER BY rowid
+            LIMIT ? OFFSET ?;
+            """,
+            (vendor, max(1, int(limit)), max(0, int(offset))),
+        ).fetchall()
+        return [{"slug": row["slug"], "url": row["url"], "status": row["status"]} for row in rows]
+    finally:
+        conn.close()
+
+
+def get_vendor_registry_stats(vendor: str) -> Dict[str, Any]:
+    """Returns coverage counters for one vendor's sitemap registry."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) AS total FROM vendor_catalog_registry WHERE vendor = ?;",
+            (vendor,),
+        )
+        total = int(cursor.fetchone()["total"])
+        cursor.execute(
+            "SELECT status, COUNT(*) AS count FROM vendor_catalog_registry "
+            "WHERE vendor = ? GROUP BY status;",
+            (vendor,),
+        )
+        counts = {row["status"]: int(row["count"]) for row in cursor.fetchall()}
+        indexed = counts.get("indexed", 0)
+        missing = counts.get("missing", 0)
+        failed = counts.get("failed", 0)
+        # Retired URLs stay in the table to keep page offsets stable, but they are
+        # not part of the current catalog, so they do not count against coverage.
+        active_total = max(total - missing, 0)
+        return {
+            "total_registry": total,
+            "active_total": active_total,
+            "indexed": indexed,
+            "pending": max(active_total - indexed - failed, 0),
+            "failed": failed,
+            "missing": missing,
+            "coverage_pct": round(indexed / active_total * 100.0, 1) if active_total else 0.0,
+        }
     finally:
         conn.close()
 
@@ -1007,332 +1287,15 @@ def reset_checkpoint(vendor: str):
 # ---------------------------------------------------------------------------
 
 
-def _ensure_fts_vocab(conn: sqlite3.Connection) -> bool:
-    """
-    Lazily creates the FTS5 vocabulary table used for spelling suggestions.
-
-    fts5vocab is a view over the FTS index and costs nothing to keep; creation
-    is skipped silently on SQLite builds without the module (results still work,
-    only typo suggestions are lost).
-    """
-    try:
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS products_fts_vocab "
-            "USING fts5vocab('products_fts', 'row')"
-        )
-        return True
-    except sqlite3.Error as exc:  # noqa: BLE001 - suggestions are best-effort
-        logger.debug("FTS vocabulary unavailable (%s); typo suggestions disabled.", exc)
-        return False
-
-
-def _fts_match_count(conn: sqlite3.Connection, expr: str) -> int:
-    """Number of indexed rows matching an FTS5 expression."""
-    if not expr:
-        return 0
-    row = conn.execute(
-        "SELECT COUNT(1) FROM products_fts WHERE products_fts MATCH ?;", (expr,)
-    ).fetchone()
-    return int(row[0]) if row else 0
-
-
-def _vocab_has_term(conn: sqlite3.Connection, term: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM products_fts_vocab WHERE term = ? LIMIT 1;", (term,)
-    ).fetchone()
-    return row is not None
-
-
-def suggest_query_token(conn: sqlite3.Connection, token: str, limit: int = 3) -> List[str]:
-    """Closest index vocabulary terms to a mistyped word-like token."""
-    if not correctable(token):
-        return []
-    lowered = token.lower()
-    if _vocab_has_term(conn, lowered):
-        return []
-
-    candidates: List[str] = []
-    for prefix_len in (3, 2):
-        prefix = lowered[:prefix_len]
-        if len(prefix) < 2:
-            break
-        rows = conn.execute(
-            "SELECT DISTINCT term FROM products_fts_vocab WHERE term LIKE ? LIMIT 4000;",
-            (prefix + "%",),
-        ).fetchall()
-        candidates = [str(r[0]) for r in rows]
-        if len(candidates) >= 5:
-            break
-    if not candidates:
-        return []
-    return difflib.get_close_matches(lowered, candidates, n=limit, cutoff=0.75)
-
-
-def _fts_term_doc_count(conn: sqlite3.Connection, token: str) -> int:
-    """Document frequency of one token in the FTS vocabulary."""
-    row = conn.execute(
-        "SELECT doc FROM products_fts_vocab WHERE term = ? LIMIT 1;", (token.lower(),)
-    ).fetchone()
-    return int(row[0]) if row and row[0] else 1
-
-
-def _head_token(tokens: List[str]) -> Optional[str]:
-    """
-    The earliest token that names a taxonomy category ("battery", "motor", ...).
-
-    The head term is the anchor of a natural-language component query. It must
-    never be relaxed away; the modifiers around it may be.
-    """
-    try:
-        taxonomy = get_taxonomy()
-        category_tokens = set()
-        for category in taxonomy.categories.values():
-            category_tokens.add(category.id.replace("-", " "))
-            category_tokens.update(category.detect_keywords)
-        flat = {token for value in category_tokens for token in tokenize(value)}
-        for token in tokens:
-            if token in flat:
-                return token
-            if any(len(term) >= 4 and token.startswith(term) for term in flat):
-                return token
-    except Exception:  # noqa: BLE001 - head detection is best-effort
-        return None
-    return None
-
-
-def _spec_like_token(token: str) -> bool:
-    """Numeric/unit tokens are constraints; drop them only after plain modifiers."""
-    if re.fullmatch(r"\d{1,2}", token):
-        # A bare "8" is far more likely to be "8 hours" than "8V"; do not keep
-        # it as a hard constraint after relaxation.
-        return False
-    return bool(re.search(r"\d", token)) or token.lower() in {
-        "v", "a", "w", "mah", "ah", "rpm", "kgcm", "kg", "mm", "cm", "nm", "ohm",
-    }
-
-
-def _progressive_relaxation(
-    conn: sqlite3.Connection,
-    tokens: List[str],
-    head: Optional[str],
-) -> Tuple[Optional[List[str]], List[str]]:
-    """
-    Drops plain modifiers first, then numeric constraints, never the head term.
-
-    This replaces the old all-or-nothing AND -> OR switch, which turned
-    "battery to power an arduino for 8 hours" into 30,119 rows. "hours" must not
-    survive as the last token: it would match capacitor lifetimes, not batteries.
-    """
-    remaining = list(tokens)
-    dropped: List[str] = []
-
-    while len(remaining) > 1:
-        candidates = [t for t in remaining if t != head]
-        if not candidates:
-            break
-        modifiers = [t for t in candidates if not _spec_like_token(t)]
-        pool = modifiers or candidates
-        drop = max(pool, key=lambda t: (_fts_term_doc_count(conn, t), t))
-        remaining.remove(drop)
-        dropped.append(drop)
-        if _fts_match_count(conn, strict_fts_expr(remaining)) > 0:
-            return remaining, dropped
-
-    if remaining and _fts_match_count(conn, strict_fts_expr(remaining)) > 0:
-        return remaining, dropped
-    return None, dropped
-
-
 def resolve_query_plan(query: Optional[str], conn: Optional[sqlite3.Connection] = None) -> QueryPlan:
-    """
-    Resolves how a free-text query should hit the FTS index.
-
-    Order of preference (first that matches wins):
-      1. strict    - every content token matches (precision)
-      2. corrected - spell-corrected tokens match (typo recovery)
-      3. corrected_relaxed / relaxed - any token matches (recall)
-    The returned plan carries explicit warnings so callers can tell the agent
-    what was actually searched.
-    """
-    plan = QueryPlan(original=query or "")
-    syntax = detect_unsupported_syntax(query)
-    if syntax:
-        plan.mode = "unresolved"
-        plan.tokens = content_tokens(query)[0]
-        plan.effective_tokens = plan.tokens
-        plan.operator_tokens = list(syntax["operators"])
-        plan.warnings.append({
-            "code": "unsupported_query_syntax",
-            "message": syntax["message"],
-            "operators": syntax["operators"],
-            "characters": syntax["characters"],
-        })
-        return plan
-
-    tokens, ignored = content_tokens(query)
-    plan.tokens = tokens
-    plan.ignored = ignored
-    operator_tokens = [
-        token for token in ignored if token.lower() in ("or", "and", "not")
-    ]
-    plan.operator_tokens = operator_tokens
-    head = _head_token(tokens)
-    plan.head_token = head or ""
-    if not tokens:
-        return plan
-
-    own_conn = conn is None
-    if own_conn:
-        conn = get_db_connection()
+    """Compatibility entry point; text planning lives in src.search.planner."""
+    if conn is not None:
+        return _resolve_query_plan(query, conn)
+    connection = get_db_connection()
     try:
-        strict_count = _fts_match_count(conn, strict_fts_expr(tokens))
-        if strict_count > 0:
-            plan.mode = "strict"
-            plan.effective_tokens = tokens
-            if operator_tokens:
-                plan.warnings.append(_operator_warning(plan, operator_tokens))
-            if head and len(tokens) > 1:
-                head_count = _fts_match_count(conn, strict_fts_expr([head]))
-                plan.head_match_count = head_count
-                if strict_count <= 20 and head_count >= 50 and head_count >= strict_count * 20:
-                    plan.warnings.append({
-                        "code": "query_narrowed",
-                        "message": (
-                            f"Only {strict_count} listing(s) matched all query terms, but "
-                            f"{head_count} match '{head}' alone. This may be over-narrow: drop a "
-                            "modifier or add spec filters to narrow deliberately."
-                        ),
-                        "head_token": head,
-                        "head_matches": head_count,
-                        "query_effective": plan.effective_query,
-                    })
-            return plan
-
-        if not _ensure_fts_vocab(conn):
-            # No vocabulary: relax token-wise so natural-language queries still work.
-            if len(tokens) > 1 and _fts_match_count(conn, relaxed_fts_expr(tokens)) > 0:
-                plan.mode = "relaxed"
-                plan.effective_tokens = tokens
-                plan.match_mode = "any_terms"
-                plan.warnings.append(_relaxed_warning(plan))
-                return plan
-            plan.mode = "unresolved"
-            plan.effective_tokens = tokens
-            return plan
-
-        corrections: Dict[str, str] = {}
-        for token in tokens:
-            fixes = suggest_query_token(conn, token, limit=1)
-            if fixes:
-                corrections[token] = fixes[0]
-
-        if corrections:
-            corrected = [corrections.get(t, t) for t in tokens]
-            plan.corrections = corrections
-            if _fts_match_count(conn, strict_fts_expr(corrected)) > 0:
-                plan.mode = "corrected"
-                plan.effective_tokens = corrected
-                plan.warnings.append(_corrected_warning(plan))
-                if operator_tokens:
-                    plan.warnings.append(_operator_warning(plan, operator_tokens))
-                return plan
-            if len(corrected) > 1 and _fts_match_count(conn, relaxed_fts_expr(corrected)) > 0:
-                plan.mode = "corrected_relaxed"
-                plan.effective_tokens = corrected
-                plan.match_mode = "any_terms"
-                plan.warnings.append(_corrected_warning(plan))
-                plan.warnings.append(_relaxed_warning(plan))
-                return plan
-
-        # Progressive relaxation: drop the most generic token first, so a
-        # natural-language modifier ("robot", "arduino") does not collapse the
-        # result set to a near-empty list.
-        if len(tokens) > 1:
-            subset, dropped = _progressive_relaxation(conn, tokens, head)
-            if subset:
-                plan.mode = "relaxed"
-                plan.effective_tokens = subset
-                plan.dropped_tokens = dropped
-                plan.match_mode = "all_terms"
-                plan.warnings.append(_relaxed_warning(plan))
-                if operator_tokens:
-                    plan.warnings.append(_operator_warning(plan, operator_tokens))
-                return plan
-
-        # Last resort: any-term matching. The MCP layer flags this as
-        # low-confidence because a single matching token is not a search.
-        if len(tokens) > 1 and _fts_match_count(conn, relaxed_fts_expr(tokens)) > 0:
-            plan.mode = "relaxed"
-            plan.effective_tokens = tokens
-            plan.match_mode = "any_terms"
-            plan.warnings.append(_relaxed_warning(plan))
-            if operator_tokens:
-                plan.warnings.append(_operator_warning(plan, operator_tokens))
-            return plan
-
-        plan.mode = "unresolved"
-        plan.effective_tokens = tokens
-        for token, fix in corrections.items():
-            variant = [fix if t == token else t for t in tokens]
-            candidate = " ".join(variant)
-            if candidate not in plan.suggestions:
-                plan.suggestions.append(candidate)
-        plan.warnings.append({
-            "code": "query_unresolved",
-            "message": (
-                "None of the query terms matched the catalog index. Check the spelling or "
-                "broaden the query; data.query_suggestions lists close alternatives when known."
-            ),
-            "suggestions": list(plan.suggestions),
-        })
-        return plan
+        return _resolve_query_plan(query, connection)
     finally:
-        if own_conn:
-            conn.close()
-
-
-def _corrected_warning(plan: QueryPlan) -> Dict[str, Any]:
-    fixes = ", ".join(f"'{src}' -> '{dst}'" for src, dst in plan.corrections.items())
-    return {
-        "code": "query_spelling_corrected",
-        "message": f"No listing matched the query spelling; corrected {fixes}.",
-        "corrections": dict(plan.corrections),
-        "query_effective": plan.effective_query,
-    }
-
-
-def _operator_warning(plan: QueryPlan, operators: List[str]) -> Dict[str, Any]:
-    return {
-        "code": "query_operator_dropped",
-        "message": (
-            f"The word(s) {operators} were treated as filler, not as boolean operators. "
-            "This server does not implement OR/AND/NOT; issue separate searches instead."
-        ),
-        "operators": operators,
-        "query_effective": plan.effective_query,
-    }
-
-
-def _relaxed_warning(plan: QueryPlan) -> Dict[str, Any]:
-    if plan.match_mode == "any_terms":
-        message = (
-            "No listing matched the query terms together; results match any single term and "
-            "are ranked by relevance. Treat this as a broad discovery result, not an exact match."
-        )
-    else:
-        dropped = ", ".join(plan.dropped_tokens) or "none"
-        message = (
-            "No listing matched every query term; the most generic term(s) were dropped "
-            f"(dropped: {dropped}) and the remaining terms are matched together. "
-            "Narrow the query or add spec filters for exact matches."
-        )
-    return {
-        "code": "query_relaxed",
-        "message": message,
-        "query_effective": plan.effective_query,
-        "match_mode": plan.match_mode,
-        "dropped_tokens": list(plan.dropped_tokens),
-    }
+        connection.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1480,52 +1443,6 @@ def suggest_mpns(needle: str, limit: int = 5, cutoff: float = 0.72) -> List[str]
         conn.close()
 
 
-def _browse_filter_clauses(
-    category: Optional[str],
-    vendor: Optional[str],
-    in_stock_only: bool,
-    spec_filters: Optional[Dict[str, Any]],
-    price_min: Optional[float] = None,
-    price_max: Optional[float] = None,
-) -> Tuple[List[str], List[Any], List[str], List[Any]]:
-    """Shared WHERE/JOIN builder for category browsing and its total count."""
-    clauses: List[str] = []
-    where_params: List[Any] = []
-
-    if category:
-        clauses.append("category_canonical = ?")
-        where_params.append(category)
-    if vendor:
-        clauses.append("vendor = ?")
-        where_params.append(vendor)
-    if in_stock_only:
-        clauses.append("available = 1")
-    if price_min is not None:
-        clauses.append("price >= ?")
-        where_params.append(float(price_min))
-    if price_max is not None:
-        clauses.append("price <= ?")
-        where_params.append(float(price_max))
-
-    joins: List[str] = []
-    join_params: List[Any] = []
-    if spec_filters:
-        conn = get_db_connection()
-        try:
-            advertised = load_catalog_specs(conn)
-        finally:
-            conn.close()
-        norm_filters, error = parse_and_validate_filters(spec_filters, advertised)
-        if error:
-            raise ValueError(error["message"])
-        joins, join_params, spec_where, spec_where_params = build_spec_clauses(
-            norm_filters, advertised
-        )
-        clauses.extend(spec_where)
-        where_params.extend(spec_where_params)
-    return joins, join_params, clauses, where_params
-
-
 def list_products_by_category(
     category: Optional[str] = None,
     vendor: Optional[str] = None,
@@ -1536,36 +1453,24 @@ def list_products_by_category(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
 ) -> List[UnifiedProduct]:
-    """
-    Lists catalog entries for browsing (no text query).
+    """Compatibility API for category browsing through the shared search service.
 
-    Used by the category pages: the most relevant, best-priced listings of a
-    category so a user can browse without typing anything. `spec_filters`
-    applies the same shared spec-attribute filters as the search path.
+    Unfiltered category pages retain their broad discovery population. Supplying
+    specifications requires sold-item evidence, as in the existing web contract.
     """
-    joins, join_params, clauses, where_params = _browse_filter_clauses(
-        category, vendor, in_stock_only, spec_filters,
-        price_min=price_min, price_max=price_max,
-    )
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    params: List[Any] = join_params + where_params
-    params.extend([max(1, int(limit)), max(0, int(offset))])
-
-    conn = get_db_connection()
+    connection = get_db_connection()
     try:
-        rows = conn.execute(
-            f"""
-            SELECT p.* FROM products p
-            {" ".join(joins)}
-            {where}
-            ORDER BY p.available DESC, p.price ASC, p.id ASC
-            LIMIT ? OFFSET ?;
-            """,
-            params,
-        ).fetchall()
-        return [row_to_unified_product(r) for r in rows]
+        search = CatalogSearch(connection)
+        prepared = search.prepare(
+            filters=spec_filters, category=category, vendor=vendor,
+            in_stock_only=in_stock_only, include_related=not bool(spec_filters),
+            price_min=price_min, price_max=price_max,
+        )
+        return [row_to_unified_product(row) for row in search.rows(
+            prepared, limit=max(1, int(limit)), offset=max(0, int(offset)),
+        )]
     finally:
-        conn.close()
+        connection.close()
 
 
 def count_products_by_category(
@@ -1576,99 +1481,17 @@ def count_products_by_category(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
 ) -> int:
-    """Total listings in a browse filter (drives the pager's total count)."""
-    joins, join_params, clauses, where_params = _browse_filter_clauses(
-        category, vendor, in_stock_only, spec_filters,
-        price_min=price_min, price_max=price_max,
-    )
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    conn = get_db_connection()
+    """Count the same browse population used by list_products_by_category."""
+    connection = get_db_connection()
     try:
-        row = conn.execute(
-            f"SELECT COUNT(DISTINCT p.id) FROM products p {' '.join(joins)} {where};",
-            join_params + where_params,
-        ).fetchone()
-        return int(row[0]) if row else 0
+        search = CatalogSearch(connection)
+        return search.count(search.prepare(
+            filters=spec_filters, category=category, vendor=vendor,
+            in_stock_only=in_stock_only, include_related=not bool(spec_filters),
+            price_min=price_min, price_max=price_max,
+        ))
     finally:
-        conn.close()
-
-
-
-def _prepare_search_query(
-    conn: sqlite3.Connection,
-    query: str,
-    vendor: Optional[str],
-    in_stock_only: bool,
-    category: Optional[str],
-    spec_filters: Optional[Dict[str, Any]],
-    price_min: Optional[float] = None,
-    price_max: Optional[float] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Resolves a text query into the exact SQL fragments shared by search and count.
-
-    Returns None when the query is empty or nothing in the index resembles it
-    (callers must return [] / 0 instead of silently matching the whole catalog).
-    """
-    clean_q = query.strip() if query else ""
-    if not clean_q:
-        return None
-
-    plan = resolve_query_plan(clean_q, conn=conn)
-    if not plan.resolved or not plan.effective_tokens:
-        return None
-
-    # Relaxed/corrected plans match any term; strict plans use the wider
-    # variation set (all terms, concatenation, bigram merges).
-    if plan.is_relaxed:
-        fts_query = relaxed_fts_expr(plan.effective_tokens)
-    else:
-        fts_query = " OR ".join(fts_variations(plan.effective_tokens))
-
-    # Spec-attribute filters (voltage, rpm, capacity_mah, ...) reuse the exact
-    # same builder the MCP server uses, so a filter means the same thing in both.
-    spec_joins: List[str] = []
-    spec_join_params: List[Any] = []
-    spec_where: List[str] = []
-    spec_where_params: List[Any] = []
-    if spec_filters:
-        advertised = load_catalog_specs(conn)
-        norm_filters, error = parse_and_validate_filters(spec_filters, advertised)
-        if error:
-            raise ValueError(error["message"])
-        spec_joins, spec_join_params, spec_where, spec_where_params = build_spec_clauses(
-            norm_filters, advertised
-        )
-
-    where_clauses = ["products_fts MATCH ?"]
-    where_params: List[Any] = [fts_query]
-    if vendor:
-        where_clauses.append("p.vendor = ?")
-        where_params.append(vendor)
-    if in_stock_only:
-        where_clauses.append("p.available = 1")
-    if category:
-        where_clauses.append("p.category_canonical = ?")
-        where_params.append(category)
-    if price_min is not None:
-        where_clauses.append("p.price >= ?")
-        where_params.append(float(price_min))
-    if price_max is not None:
-        where_clauses.append("p.price <= ?")
-        where_params.append(float(price_max))
-    where_clauses.extend(spec_where)
-
-    return {
-        "clean_q": clean_q,
-        "plan": plan,
-        "fts_query": fts_query,
-        "where_clauses": where_clauses,
-        "where_params": where_params,
-        "spec_joins": spec_joins,
-        "spec_join_params": spec_join_params,
-        "spec_where": spec_where,
-        "spec_where_params": spec_where_params,
-    }
+        connection.close()
 
 
 def search_products(
@@ -1682,68 +1505,18 @@ def search_products(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
 ) -> List[UnifiedProduct]:
-    """
-    Performs search using FTS5 with fallback to LIKE pattern matching.
-
-    Text queries go through `resolve_query_plan` first: stop words are dropped,
-    natural-language requests fall back from AND to OR matching, and mistyped
-    terms are spell-corrected against the index vocabulary. When even that
-    fails the search returns [] instead of the whole catalog.
-
-    `category` filters on the canonical category slug (see
-    `config/taxonomy.yaml`). `spec_filters` applies the shared spec-attribute
-    filters (voltage, rpm, capacity_mah, ...) from `src/spec/filters.py`.
-    """
-    conn = get_db_connection()
-    results: List[UnifiedProduct] = []
+    """Compatibility API; planning and retrieval live in src.search.service."""
+    connection = get_db_connection()
     try:
-        prepared = _prepare_search_query(
-            conn, query, vendor, in_stock_only, category, spec_filters,
+        search = CatalogSearch(connection)
+        prepared = search.prepare(
+            query, filters=spec_filters, category=category, vendor=vendor,
+            in_stock_only=in_stock_only, include_related=not bool(spec_filters),
             price_min=price_min, price_max=price_max,
         )
-        if prepared is None:
-            return []
-
-        sql = f"""
-            SELECT p.* FROM products p
-            JOIN products_fts fts ON p.id = fts.rowid
-            {" ".join(prepared["spec_joins"])}
-            WHERE {" AND ".join(prepared["where_clauses"])}
-            ORDER BY rank
-            LIMIT ? OFFSET ?;
-        """
-        # Parameter order follows the SQL text: join params, then WHERE params.
-        params: List[Any] = (
-            prepared["spec_join_params"]
-            + prepared["where_params"]
-            + prepared["spec_where_params"]
-        )
-        params.extend([limit, offset])
-
-        cursor = conn.cursor()
-        try:
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-        except sqlite3.OperationalError:
-            rows = _search_products_like(
-                cursor,
-                prepared["clean_q"],
-                (limit, offset),
-                vendor,
-                in_stock_only,
-                category,
-                spec_joins=prepared["spec_joins"],
-                spec_join_params=prepared["spec_join_params"],
-                spec_where=prepared["spec_where"],
-                spec_where_params=prepared["spec_where_params"],
-            )
-
-        for r in rows:
-            results.append(row_to_unified_product(r))
+        return [row_to_unified_product(row) for row in search.rows(prepared, limit=limit, offset=offset)]
     finally:
-        conn.close()
-
-    return results
+        connection.close()
 
 
 def count_search_products(
@@ -1755,103 +1528,18 @@ def count_search_products(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
 ) -> int:
-    """Total listings matching a search (used for pager totals, not just the page)."""
-    conn = get_db_connection()
+    """Count the same prepared query used by search_products, including fallback."""
+    connection = get_db_connection()
     try:
-        prepared = _prepare_search_query(
-            conn, query, vendor, in_stock_only, category, spec_filters,
+        search = CatalogSearch(connection)
+        return search.count(search.prepare(
+            query, filters=spec_filters, category=category, vendor=vendor,
+            in_stock_only=in_stock_only, include_related=not bool(spec_filters),
             price_min=price_min, price_max=price_max,
-        )
-        if prepared is None:
-            return 0
-
-        sql = f"""
-            SELECT COUNT(DISTINCT p.id) FROM products p
-            JOIN products_fts fts ON p.id = fts.rowid
-            {" ".join(prepared["spec_joins"])}
-            WHERE {" AND ".join(prepared["where_clauses"])};
-        """
-        params: List[Any] = (
-            prepared["spec_join_params"]
-            + prepared["where_params"]
-            + prepared["spec_where_params"]
-        )
-        try:
-            row = conn.execute(sql, params).fetchone()
-            return int(row[0]) if row else 0
-        except sqlite3.OperationalError:
-            like = f"%{prepared['clean_q']}%"
-            like_where = [
-                "(p.title LIKE ? OR p.normalized_title LIKE ? OR p.mpn LIKE ? OR p.sku LIKE ?)"
-            ]
-            like_params: List[Any] = [like, like, like, like]
-            if vendor:
-                like_where.append("p.vendor = ?")
-                like_params.append(vendor)
-            if in_stock_only:
-                like_where.append("p.available = 1")
-            if category:
-                like_where.append("p.category_canonical = ?")
-                like_params.append(category)
-            if price_min is not None:
-                like_where.append("p.price >= ?")
-                like_params.append(float(price_min))
-            if price_max is not None:
-                like_where.append("p.price <= ?")
-                like_params.append(float(price_max))
-            like_where.extend(prepared["spec_where"])
-            like_params.extend(prepared["spec_where_params"])
-            row = conn.execute(
-                f"SELECT COUNT(DISTINCT p.id) FROM products p "
-                f"{' '.join(prepared['spec_joins'])} "
-                f"WHERE {' AND '.join(like_where)};",
-                prepared["spec_join_params"] + like_params,
-            ).fetchone()
-            return int(row[0]) if row else 0
+        ))
     finally:
-        conn.close()
+        connection.close()
 
-
-
-def _search_products_like(
-    cursor: sqlite3.Cursor,
-    clean_q: str,
-    page: Tuple[int, int],
-    vendor: Optional[str],
-    in_stock_only: bool,
-    category: Optional[str] = None,
-    spec_joins: Optional[List[str]] = None,
-    spec_join_params: Optional[List[Any]] = None,
-    spec_where: Optional[List[str]] = None,
-    spec_where_params: Optional[List[Any]] = None,
-) -> List[sqlite3.Row]:
-    """LIKE fallback used when FTS5 rejects a query (malformed token, etc.)."""
-    like_clauses = ["(p.title LIKE ? OR p.normalized_title LIKE ? OR p.mpn LIKE ? OR p.sku LIKE ?)"]
-    like_pat = f"%{clean_q}%"
-    where_params: List[Any] = [like_pat, like_pat, like_pat, like_pat]
-    if vendor:
-        like_clauses.append("p.vendor = ?")
-        where_params.append(vendor)
-    if in_stock_only:
-        like_clauses.append("p.available = 1")
-    if category:
-        like_clauses.append("p.category_canonical = ?")
-        where_params.append(category)
-
-    where_clauses = list(spec_where or [])
-    where_params.extend(spec_where_params or [])
-
-    sql_like = f"""
-        SELECT p.* FROM products p
-        {" ".join(spec_joins or [])}
-        WHERE {" AND ".join(like_clauses + where_clauses)}
-        ORDER BY p.available DESC, p.price ASC
-        LIMIT ? OFFSET ?;
-    """
-    params: List[Any] = list(spec_join_params or []) + where_params
-    params.extend(list(page))
-    cursor.execute(sql_like, params)
-    return cursor.fetchall()
 
 def apply_vendor_gst(
     vendor: str,
@@ -1966,6 +1654,7 @@ def get_db_stats() -> Dict[str, Any]:
             "vendors": vendors,
             "checkpoints": checkpoints,
             "robu_registry": get_robu_registry_stats(),
+            "flyrobo_registry": get_vendor_registry_stats("flyrobo"),
             "price_stock": get_price_stock_stats()
         }
         _cache_set(_stats_cache, stats)

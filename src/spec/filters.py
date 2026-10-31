@@ -1,13 +1,10 @@
 """
 Shared spec-attribute filtering.
 
-This module holds the filtering logic that used to live only inside
-`mcp_server/server.py`: loading the advertised spec keys, validating a filter
-expression against them, and turning it into SQL over the `product_specs`
-table.
-
-Both the MCP tools and the web UI use it, so a filter like
-`{"voltage": {"gte": 12}}` means exactly the same thing in both places.
+Loads advertised specification metadata, validates typed values and operators,
+and renders value comparisons. Cross-tier routing belongs to search.filter_plan;
+evidence precedence and eligibility belong to spec.constraints. The legacy JOIN
+adapter at the end is retained for compatibility and is not used by retrieval.
 """
 from __future__ import annotations
 
@@ -83,6 +80,28 @@ def load_catalog_specs(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
             meta["enum_values"] = definitions[0]
         else:
             meta["enum_values"] = None  # divergent vocabularies: stay open
+
+    # Canonicalize the advertised vocabulary. Vendor descriptions contain many
+    # spelling variants of the same package ("sot-23(surface mount device)" vs
+    # "sot-23"); exposing all of them teaches an agent values that are not
+    # independent packages. Keep the raw -> canonical map so SQL can still match
+    # rows written before the canonicalization migration.
+    for key, meta in specs.items():
+        counts = meta.get("value_counts") or {}
+        if not counts:
+            continue
+        canonical_counts: Dict[str, int] = {}
+        variants: Dict[str, List[str]] = {}
+        for raw_value, count in counts.items():
+            canonical = canonical_enum_value(raw_value, meta)
+            canonical_counts[str(canonical)] = canonical_counts.get(str(canonical), 0) + int(count or 0)
+            variants.setdefault(str(canonical), []).append(str(raw_value))
+        meta["value_counts"] = canonical_counts
+        meta["variant_map"] = {
+            canonical: sorted(set(values))
+            for canonical, values in variants.items()
+            if len(values) > 1 or values[0] != canonical
+        }
     return specs
 
 
@@ -95,7 +114,7 @@ def enum_is_numeric(spec_meta: Dict[str, Any]) -> bool:
     unguarded `value_num >= x` silently matches nothing.
     """
     if spec_meta.get("type") != "enum":
-        return True
+        return spec_meta.get("type") in {"integer", "float"}
 
     samples: List[str] = []
     enum_vals = spec_meta.get("enum_values")
@@ -111,7 +130,7 @@ def enum_is_numeric(spec_meta: Dict[str, Any]) -> bool:
         try:
             float(str(s).strip())
             numeric += 1
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pass
     # Tolerate a few stray non-numeric members (e.g. an "N/A" bucket).
     return numeric >= max(1, int(len(samples) * 0.9))
@@ -129,28 +148,454 @@ def filter_column(alias: str, spec_meta: Dict[str, Any], ordering: bool = False)
         return f"{alias}.value_num"
     if ordering and enum_is_numeric(spec_meta):
         return f"CAST({alias}.value AS REAL)"
+    if spec_meta.get("type") in {"string", "enum"}:
+        return f"aggregate_canonical_value({alias}.value, {alias}.key)"
     return f"{alias}.value"
+
+
+# ---------------------------------------------------------------------------
+# Engineering-value parsing and enum canonicalization
+# ---------------------------------------------------------------------------
+
+# Prefix multipliers. Case matters: "m" is milli, "M" is mega.
+_PREFIX_FACTORS: Dict[str, float] = {
+    "p": 1e-12,
+    "n": 1e-9,
+    "u": 1e-6,
+    "m": 1e-3,
+    "c": 1e-2,
+    "k": 1e3,
+    "K": 1e3,
+    "M": 1e6,
+    "G": 1e9,
+}
+
+_BASE_UNIT_ALIASES: Dict[str, set] = {
+    "ohm": {"ohm", "ohms", "r", "ω"},
+    "f": {"f", "farad", "farads"},
+    "h": {"h", "henry", "henries"},
+    "v": {"v", "volt", "volts", "vdc", "vac"},
+    "a": {"a", "amp", "amps", "ampere", "amperes"},
+    "ah": {"ah", "amperehour", "amperehours"},
+    "w": {"w", "watt", "watts"},
+    "hz": {"hz", "hertz"},
+    "m": {"m", "meter", "meters", "metre", "metres"},
+    "mm": {"mm", "millimeter", "millimeters", "millimetre", "millimetres"},
+    "mm2": {"mm2", "mm²", "sqmm", "sq.mm"},
+    "in": {"in", "inch", "inches", '"'},
+    "percent": {"%", "percent", "pct"},
+}
+
+_ALIAS_TO_BASE: Dict[str, str] = {
+    alias: base for base, aliases in _BASE_UNIT_ALIASES.items() for alias in aliases
+}
+
+# Target unit -> (base unit, factor that converts base unit into target unit).
+_TARGET_UNITS: Dict[str, Tuple[str, float]] = {
+    "ohm": ("ohm", 1.0),
+    "ω": ("ohm", 1.0),
+    "f": ("f", 1.0),
+    "uf": ("f", 1e6),
+    "µf": ("f", 1e6),
+    "μf": ("f", 1e6),
+    "nf": ("f", 1e9),
+    "pf": ("f", 1e12),
+    "mf": ("f", 1e3),
+    "h": ("h", 1.0),
+    "uh": ("h", 1e6),
+    "µh": ("h", 1e6),
+    "μh": ("h", 1e6),
+    "nh": ("h", 1e9),
+    "mh": ("h", 1e3),
+    "v": ("v", 1.0),
+    "mv": ("v", 1e3),
+    "kv": ("v", 1e-3),
+    "a": ("a", 1.0),
+    "ah": ("ah", 1.0),
+    "mah": ("ah", 1e3),
+    "ma": ("a", 1e3),
+    "ua": ("a", 1e6),
+    "µa": ("a", 1e6),
+    "μa": ("a", 1e6),
+    "w": ("w", 1.0),
+    "mw": ("w", 1e3),
+    "kw": ("w", 1e-3),
+    "hz": ("hz", 1.0),
+    "khz": ("hz", 1e3),
+    "mhz": ("hz", 1e6),
+    "ghz": ("hz", 1e-3),
+    "m": ("m", 1.0),
+    "cm": ("m", 100.0),
+    "mm": ("mm", 1.0),
+    "mm2": ("mm2", 1.0),
+    "mm²": ("mm2", 1.0),
+    "in": ("in", 1.0),
+    "inch": ("in", 1.0),
+    "%": ("percent", 1.0),
+    "percent": ("percent", 1.0),
+    "pct": ("percent", 1.0),
+}
+
+_NUM_UNIT_RE = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*"
+    r"([pnuµmkKMGc]?)\s*([a-zA-Z%°Ωµμ\"]*)\s*$"
+)
+_RKM_RE = re.compile(
+    r"^\s*([+-]?)(\d+)([pnuµmkKMGRc])(\d+)\s*([a-zA-Z%°Ωµμ\"]*)\s*$"
+)
+_UNIT_WORD_RE = re.compile(r"[a-zA-Z%°Ωµμ\"]+")
+
+
+def _clean_unit_text(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = text.replace("µ", "u").replace("μ", "u").replace("°", "")
+    text = text.replace("ohms", "ohm").replace("ohm", "ohm")
+    return text
+
+
+def _target_unit(unit: Optional[str]) -> Tuple[Optional[str], float]:
+    """Returns (base_unit, factor_from_base_to_target) for a declared unit."""
+    raw = _clean_unit_text(unit or "")
+    if not raw:
+        return None, 1.0
+    raw = raw.replace(" ", "")
+    if raw in _TARGET_UNITS:
+        return _TARGET_UNITS[raw]
+    # A target unit such as "ohm" or "V" that only appears in the alias table.
+    if raw in _ALIAS_TO_BASE:
+        return _ALIAS_TO_BASE[raw], 1.0
+    # An explicitly declared non-SI unit (e.g. RPM) is its own dimension.
+    # It may match itself, but cannot become an unrelated recognized unit.
+    return raw, 1.0
+
+
+def _clean_number(value: float) -> Optional[float]:
+    """Removes binary-float noise (100nF -> 0.1, not 0.09999999999999999)."""
+    if not math.isfinite(value):
+        return None
+    return float(f"{value:.12g}")
+
+
+def parse_engineering_value(
+    key: str,
+    value: Any,
+    unit: Optional[str] = None,
+) -> Optional[float]:
+    """
+    Parses an engineering value into the key's declared unit.
+
+    Examples:
+      resistance_ohm: "10k" -> 10000, "4k7" -> 4700, "1M" -> 1000000
+      capacitance_uf: "100nF" -> 0.1, "1000pF" -> 0.001, "100 uF" -> 100
+      inductance_uh: "2.2mH" -> 2200
+
+    Case matters for the multiplier: "m" is milli, "M" is mega.
+    Returns None when the text is not a number with understood units.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace("µ", "u").replace("μ", "u").replace("Ω", "Ω")
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", text):
+        return _clean_number(float(text))
+
+    base_unit, target_factor = _target_unit(unit)
+
+    # RKM notation: 4k7 == 4.7k, 4R7 == 4.7 ohm.
+    rkm = _RKM_RE.match(text)
+    if rkm:
+        sign, whole, prefix, fraction, unit_tail = rkm.groups()
+        try:
+            number = float(f"{whole}.{fraction}")
+        except ValueError:
+            return None
+        if sign == "-":
+            number = -number
+        prefix_factor = 1.0 if prefix == "R" else _PREFIX_FACTORS.get(prefix)
+        if prefix_factor is None:
+            return None
+        unit_text = _clean_unit_text(unit_tail)
+        if unit_text:
+            unit_base = _ALIAS_TO_BASE.get(unit_text)
+            if base_unit is not None and unit_base is not None and unit_base != base_unit:
+                return None
+            base_factor = 1.0
+        else:
+            base_factor = 1.0
+        result = number * prefix_factor * base_factor * target_factor
+        return _clean_number(result)
+
+    match = _NUM_UNIT_RE.match(text)
+    if not match:
+        return None
+    number_text, prefix, unit_tail = match.groups()
+    try:
+        number = float(number_text)
+    except ValueError:
+        return None
+
+    prefix_factor = _PREFIX_FACTORS.get(prefix, 1.0) if prefix else 1.0
+    unit_text = _clean_unit_text(unit_tail)
+    if unit_text:
+        unit_base = _ALIAS_TO_BASE.get(unit_text)
+        if unit_base is None:
+            # Accept the declared unit itself even if it is not in the alias table.
+            declared = _clean_unit_text(unit or "")
+            if unit_base is None and declared and unit_text == declared:
+                unit_base = base_unit
+            if unit_base is None:
+                return None
+        if base_unit is not None and unit_base != base_unit:
+            return None
+        base_factor = 1.0
+    else:
+        base_factor = 1.0
+
+    result = number * prefix_factor * base_factor * target_factor
+    return _clean_number(result)
+
+
+def _base_unit_example(key: str, unit: Optional[str]) -> str:
+    """A concrete, correct example for an invalid numeric filter."""
+    samples = {
+        "resistance_ohm": "10000 or 10k",
+        "capacitance_uf": "0.1 or 100nF",
+        "inductance_uh": "2200 or 2.2mH",
+        "voltage_v": "12 or 12V",
+        "current_a": "0.5 or 500mA",
+        "power_w": "0.25 or 250mW",
+    }
+    example = samples.get(key, "10")
+    if unit:
+        return f"{example} (base unit: {unit})"
+    return example
+
+
+def canonical_enum_value(value: Any, spec_meta: Optional[Dict[str, Any]] = None) -> Any:
+    """Canonicalizes a categorical enum value for storage and filtering."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return text
+    text = text.lower()
+    key = (spec_meta or {}).get("key")
+    if key in {"voltage", "voltage_v"}:
+        m = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?:v(?:dc)?)?", text)
+        if m:
+            return f"{float(m[1]):g}"
+    if key == "cells":
+        m = re.fullmatch(r"(\d+)\s*s?(?:\s+(?:lipo|li-ion))?", text)
+        if m:
+            return f"{int(m[1])}s"
+    if key == "package" and re.fullmatch(r"\d{3}", text):
+        text = text.zfill(4)
+    if key == "channel_type":
+        channel = re.fullmatch(r"([np])[ _-]*(?:ch(?:annel)?)?", text)
+        if channel:
+            return channel[1] + "_channel"
+    if key == "resolution":
+        text = re.sub(r"\s*(?:×|x)\s*", "x", text)
+        text = re.sub(r"\s*pixels?\s*$", "", text)
+    text = text.replace("–", "-").replace("—", "-").replace("−", "-")
+    text = text.replace("µ", "u").replace("μ", "u").replace("Ω", "ohm")
+    # Drop parenthetical detail: "sot-23(surface mount device)" -> "sot-23".
+    text = re.sub(r"\s*\([^)]*\)", "", text)
+    text = text.replace("surfacemountdevice", "smd")
+    text = text.replace("surface mount device", "smd")
+    text = text.replace("surface-mount", "smd")
+    text = text.replace("surface mount", "smd")
+    text = text.replace("through-hole", "throughhole").replace("through hole", "throughhole")
+    text = re.sub(r"\s+", "", text)
+    # Common compound spellings: "to92throughhole", "axialleadthroughhole".
+    # Keep a standalone "through-hole" intact: it is an advertised umbrella.
+    if text != "throughhole":
+        text = re.sub(r"throughhole$", "", text)
+    text = re.sub(r"(?:smd|surfacemount|surfacemountdevice)$", "", text)
+    text = text.replace("axiallead", "axial")
+    text = re.sub(r"-+", "-", text).strip("-")
+    text = {
+        "sot23": "sot-23",
+        "sot223": "sot-223",
+        "to220": "to-220",
+        "to247": "to-247",
+        "to92": "to-92",
+        "to252": "to-252",
+        "to263": "to-263",
+        "do41": "do-41",
+        "do15": "do-15",
+        "hc49": "hc-49",
+    }.get(text, text)
+    # SOT-23/SOT-23-5/SOT-23-6 are distinct packages only when a pin count
+    # suffix is present. The bare family is the canonical surface-mount part.
+    if text in ("sot-23smd", "sot-23surfacemount"):
+        text = "sot-23"
+    return text
+
+
+def coerce_enum_value(key: str, value: Any) -> Tuple[Any, bool]:
+    """Coerces unambiguous numeric enum spellings ("603" -> "0603", 3 -> "3s")."""
+    if value is None:
+        return value, False
+    text = str(value).strip()
+    if key == "cells" and re.fullmatch(r"\d+", text):
+        return f"{int(text)}s", True
+    if key == "package" and re.fullmatch(r"\d{3,4}", text):
+        padded = text.zfill(4) if len(text) == 3 else text
+        return padded, padded != text
+    return value, False
+
+
+# Through-hole is an umbrella over the concrete leaded packages. A filter for
+# the umbrella must expand to the observed package names for that category.
+_THROUGH_HOLE_UMBRELLA: Dict[Tuple[str, str], List[str]] = {
+    ("resistors", "package"): ["axial", "radial"],
+    ("capacitors", "package"): ["axial", "radial"],
+    ("inductors", "package"): ["axial", "radial"],
+    ("diodes", "package"): ["do-41", "do-15", "to-220"],
+    ("transistors", "package"): ["to-92", "to-220", "to-247", "dip"],
+    ("semiconductors", "package"): ["to-220", "to-247"],
+    ("leds", "package"): ["3mm", "5mm"],
+    ("crystals", "package"): ["hc-49"],
+}
+
+
+def expand_enum_umbrella(
+    key: str,
+    value: Any,
+    category: Optional[str],
+) -> Optional[List[str]]:
+    """Expands an advertised umbrella enum value into concrete stored values."""
+    if str(value).strip().lower() not in ("through-hole", "throughhole", "through hole"):
+        return None
+    if category is not None:
+        return _THROUGH_HOLE_UMBRELLA.get((str(category), key))
+    if key == "package":
+        values: List[str] = []
+        for concrete in _THROUGH_HOLE_UMBRELLA.values():
+            for item in concrete:
+                if item not in values:
+                    values.append(item)
+        return values
+    return None
+
+
+# Equivalent filter keys. `equivalent=True` groups are genuinely the same
+# property under different names; `equivalent=False` groups are discovery-only
+# (contact current is not motor current, but an agent should see the family).
+ALIAS_GROUPS: Dict[str, Dict[str, Any]] = {
+    "voltage": {
+        "equivalent": True,
+        "keys": ["voltage", "voltage_v"],
+        "description": "Supply/rated voltage; the two keys are interchangeable aliases.",
+    },
+    "current": {
+        "equivalent": False,
+        "keys": [
+            "current_a", "contact_current_a", "forward_current_a",
+            "id_a", "output_current_a", "ic_a",
+        ],
+        "description": "Current family; keep contact/forward/drain/output currents distinct.",
+    },
+}
+
+
+def alias_catalog_payload() -> Dict[str, Any]:
+    """Discovery payload for describe_catalog."""
+    return {
+        group: {
+            "keys": list(info["keys"]),
+            "equivalent": bool(info["equivalent"]),
+            "description": info["description"],
+        }
+        for group, info in ALIAS_GROUPS.items()
+    }
+
+
+def equivalent_alias_keys(key: str) -> List[str]:
+    info = ALIAS_GROUPS.get(str(key))
+    if info and info.get("equivalent"):
+        return list(info["keys"])
+    for info in ALIAS_GROUPS.values():
+        if info.get("equivalent") and key in info["keys"]:
+            return list(info["keys"])
+    return []
+
+
+def route_alias_key(
+    key: str,
+    category: Optional[str],
+    category_keys: Optional[List[str]],
+) -> Optional[str]:
+    """Returns the category-applicable equivalent key, if a route exists."""
+    keys = equivalent_alias_keys(key)
+    if not keys:
+        return None
+    if category and category_keys:
+        applicable = [k for k in keys if k in category_keys]
+        if key in applicable:
+            return key
+        if applicable:
+            return applicable[0]
+    return None
+
+
+def build_alias_expansion(
+    key: str,
+    value: Any,
+    advertised_specs: Dict[str, Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Expansion descriptor for an unscoped equivalent-key union."""
+    keys = [k for k in equivalent_alias_keys(key) if k in advertised_specs]
+    if len(keys) < 2:
+        return None
+    return {"group": key if key in ALIAS_GROUPS else "voltage", "keys": keys, "value": value}
 
 
 # ---------------------------------------------------------------------------
 # Value normalization
 # ---------------------------------------------------------------------------
 
-def normalize_scalar(key: str, val: Any, v_type: str = "string", unit: Optional[str] = None) -> Any:
+def normalize_scalar(
+    key: str,
+    val: Any,
+    v_type: str = "string",
+    unit: Optional[str] = None,
+    category: Optional[str] = None,
+) -> Any:
     """Normalizes units and aliases into standard canonical catalog forms."""
     if val is None:
         return None
+    if isinstance(val, bool):
+        return val
     s = str(val).strip()
 
-    # Cells (e.g. 4S, 4 s, 4s lipo)
+    # Cells (e.g. 4S, 4 s, 4s lipo, or a bare count 4 -> 4s)
     if key == "cells" or (isinstance(s, str) and re.search(r"^\d+\s*s(\s+lipo|\s+li-ion)?$", s, re.I)):
+        if re.fullmatch(r"\d+", s):
+            return f"{int(s)}s"
         m = re.search(r"^(\d+)\s*s", s, re.I)
         if m:
             return f"{m.group(1)}s".lower()
 
+    if key == "package":
+        coerced, changed = coerce_enum_value(key, s)
+        if changed:
+            s = str(coerced)
+        return canonical_enum_value(s)
+
     # Torque (2.5kg-cm / 2.5 kgcm)
     if "torque" in key or (isinstance(s, str) and re.search(r"kg[\s-]*cm", s, re.I)):
-        m_t = re.search(r"^([\d\.]+)\s*kg[\s-]*cm$", s, re.I)
+        m_t = re.search(r"^([\d\.]+)\s*kg[\s.·-]*cm$", s, re.I)
         if m_t:
             return float(m_t.group(1))
 
@@ -204,13 +649,20 @@ def normalize_scalar(key: str, val: Any, v_type: str = "string", unit: Optional[
         return re.sub(r"\s+", "", s).lower()
 
     if v_type in ("integer", "float"):
-        try:
-            number = float(s)
+        # An int/float argument is already in the key's declared unit. Only
+        # string input may carry a prefix that needs conversion (2200 uH vs
+        # "2.2mH").
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            number = float(val)
             return int(round(number)) if v_type == "integer" else number
-        except ValueError:
-            pass
+        number = parse_engineering_value(key, s, unit)
+        if number is not None:
+            return int(round(number)) if v_type == "integer" else number
+        return s.lower()
 
-    return s.lower()
+    # Remaining enums: canonical spelling, dashes and case.
+    text, _coerced = coerce_enum_value(key, s)
+    return canonical_enum_value(text, {"key": key})
 
 
 # ---------------------------------------------------------------------------
@@ -302,14 +754,21 @@ def _validate_numeric_value(
             "error_code": "invalid_filter_value",
             "message": (
                 f"Filter '{key}' expects a numeric value; got {value!r}. "
-                f"This key is {spec_meta.get('type', 'numeric')}."
+                f"This key is {spec_meta.get('type', 'numeric')}. "
+                f"Engineering suffixes are accepted (e.g. {_base_unit_example(key, spec_meta.get('unit'))})."
             ),
-            "suggestions": [{"key": key, "value": 1}],
+            "suggestions": [{
+                "key": key,
+                "value": 1,
+                "unit": spec_meta.get("unit"),
+                "example": _base_unit_example(key, spec_meta.get("unit")),
+            }],
             "details": {
                 "key": key,
                 "provided_value": value,
                 "expected_type": spec_meta.get("type") or "number",
                 "unit": spec_meta.get("unit"),
+                "expected": _base_unit_example(key, spec_meta.get("unit")),
             },
         }
     if not math.isfinite(number):
@@ -322,9 +781,36 @@ def _validate_numeric_value(
     return None
 
 
+def _normalize_enum_filter_value(
+    key: str,
+    raw_value: Any,
+    spec_meta: Dict[str, Any],
+    category: Optional[str],
+    coercions: Optional[List[Dict[str, Any]]] = None,
+) -> Any:
+    """Canonicalizes one enum value and expands umbrella values when needed."""
+    coerced, changed = coerce_enum_value(key, raw_value)
+    if changed and coercions is not None:
+        coercions.append({"key": key, "from": raw_value, "to": coerced})
+    # Reuse the key-specific normalizers (voltage "24V" -> "24", cells 3 -> "3s").
+    normalized = normalize_scalar(key, coerced, "enum", spec_meta.get("unit"), category)
+    canonical = canonical_enum_value(normalized, {**spec_meta, "key": key})
+    if canonical != str(coerced).strip().lower() and coercions is not None:
+        # A normalization such as "SOT-23(SMD)" -> "sot-23" is still worth
+        # disclosing; it tells the caller the stored vocabulary differs.
+        if canonical != str(raw_value).strip().lower():
+            coercions.append({"key": key, "from": raw_value, "to": canonical})
+    umbrella = expand_enum_umbrella(key, canonical, category)
+    if umbrella:
+        return {"in": list(dict.fromkeys([canonical] + umbrella))}
+    return canonical
+
+
 def parse_and_validate_filters(
     filters: Optional[Dict[str, Any]],
     advertised_specs: Dict[str, Dict[str, Any]],
+    category: Optional[str] = None,
+    coercions: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Validates filter keys and operators, rejecting deprecated string range forms.
@@ -334,10 +820,13 @@ def parse_and_validate_filters(
     `suggestions`, `details`) so any caller can render it in its own envelope.
     """
     clean_filters = filters or {}
+    if not isinstance(clean_filters, dict):
+        return None, {"error_code": "invalid_filter_value", "message": "filters must be an object."}
     all_valid_keys = sorted(advertised_specs.keys())
     normalized: Dict[str, Any] = {}
 
     for f_key, f_val in clean_filters.items():
+        f_key = str(f_key).strip().lower()
         if f_key not in advertised_specs:
             return None, {
                 "error_code": "unknown_filter_key",
@@ -350,6 +839,16 @@ def parse_and_validate_filters(
         spec_meta = advertised_specs[f_key]
         v_type = spec_meta["type"]
         unit = spec_meta["unit"]
+        if isinstance(f_val, (list, tuple)):
+            f_val = {"in": list(f_val)}
+        if f_val is None or isinstance(f_val, bool):
+            return None, {"error_code": "invalid_filter_value", "message": f"Filter '{f_key}' requires a non-null scalar or operator object."}
+        if isinstance(f_val, dict) and not f_val:
+            return None, {"error_code": "invalid_filter_value", "message": f"Filter '{f_key}' has an empty operator set."}
+        raw_scalars = list(f_val.values()) if isinstance(f_val, dict) else [f_val]
+        raw_scalars = [item for v in raw_scalars for item in (v if isinstance(v, (list, tuple)) else [v])]
+        if any(v is None or isinstance(v, (dict, list, tuple, bool)) for v in raw_scalars):
+            return None, {"error_code": "invalid_filter_value", "message": f"Filter '{f_key}' contains a non-scalar or null operand."}
 
         # Check for deprecated string range syntax e.g. "150-250"
         if isinstance(f_val, str) and "-" in f_val and not f_val.strip().startswith("-"):
@@ -437,7 +936,15 @@ def parse_and_validate_filters(
                     }
                 norm_op_dict["in"] = []
                 for raw_value in in_list:
-                    value = normalize_scalar(f_key, raw_value, v_type, unit)
+                    if v_type == "enum":
+                        value = _normalize_enum_filter_value(
+                            f_key, raw_value, spec_meta, category, coercions
+                        )
+                    else:
+                        value = normalize_scalar(f_key, raw_value, v_type, unit, category)
+                    if isinstance(value, dict) and "in" in value:
+                        norm_op_dict["in"].extend(value["in"])
+                        continue
                     invalid = _validate_numeric_value(f_key, value, spec_meta)
                     if invalid:
                         invalid["valid_keys"] = all_valid_keys
@@ -456,15 +963,25 @@ def parse_and_validate_filters(
                     norm_op_dict[bound] = value
 
             if "eq" in f_val:
-                value = normalize_scalar(f_key, f_val["eq"], v_type, unit)
-                invalid = _validate_numeric_value(f_key, value, spec_meta)
-                if invalid:
-                    invalid["valid_keys"] = all_valid_keys
-                    invalid["details"]["operator"] = "eq"
-                    return None, invalid
-                norm_op_dict["eq"] = value
+                if v_type == "enum":
+                    value = _normalize_enum_filter_value(
+                        f_key, f_val["eq"], spec_meta, category, coercions
+                    )
+                else:
+                    value = normalize_scalar(f_key, f_val["eq"], v_type, unit, category)
+                if isinstance(value, dict) and "in" in value:
+                    norm_op_dict["in"] = value["in"]
+                else:
+                    invalid = _validate_numeric_value(f_key, value, spec_meta)
+                    if invalid:
+                        invalid["valid_keys"] = all_valid_keys
+                        invalid["details"]["operator"] = "eq"
+                        return None, invalid
+                    norm_op_dict["eq"] = value
 
             if "tolerance" in f_val:
+                if not isinstance(f_val["tolerance"], (int, float)) or isinstance(f_val["tolerance"], bool):
+                    return None, {"error_code": "invalid_filter_value", "message": "tolerance must be a number, not a boolean or numeric string."}
                 if "eq" not in f_val:
                     return None, {
                         "error_code": "invalid_filter_value",
@@ -511,13 +1028,27 @@ def parse_and_validate_filters(
             normalized[f_key] = norm_op_dict
         else:
             # Primitive scalar equality
-            value = normalize_scalar(f_key, f_val, v_type, unit)
+            if v_type == "enum":
+                value = _normalize_enum_filter_value(
+                    f_key, f_val, spec_meta, category, coercions
+                )
+                normalized[f_key] = value
+                continue
+            value = normalize_scalar(f_key, f_val, v_type, unit, category)
             invalid = _validate_numeric_value(f_key, value, spec_meta)
             if invalid:
                 invalid["valid_keys"] = all_valid_keys
                 return None, invalid
             normalized[f_key] = value
 
+    if coercions is not None:
+        # Report the final applied expression, including type, case, unit and
+        # shorthand transformations. Comparing JSON avoids True == 1 surprises.
+        for raw_key, original in clean_filters.items():
+            key = str(raw_key).strip().lower()
+            applied = normalized.get(key)
+            if json.dumps(original, sort_keys=True) != json.dumps(applied, sort_keys=True):
+                coercions.append({"key": key, "from": original, "to": applied})
     return normalized, None
 
 
@@ -538,7 +1069,8 @@ def validate_filter_scope(
         return None
 
     applicable = list(dict.fromkeys(str(k) for k in (category_keys or [])))
-    bad_keys = [k for k in normalized_filters if k not in applicable]
+    bad_keys = [k for k in normalized_filters if k not in applicable
+                and not set(equivalent_alias_keys(k)).intersection(applicable)]
     if not bad_keys:
         return None
 
@@ -572,67 +1104,91 @@ def validate_filter_scope(
 # SQL generation
 # ---------------------------------------------------------------------------
 
+def _enum_match_values(value: Any, spec_meta: Dict[str, Any]) -> List[str]:
+    """Canonical value plus any pre-migration raw variants stored in the DB."""
+    canonical = str(value)
+    variants = (spec_meta.get("variant_map") or {}).get(canonical) or []
+    values = [canonical] + [str(v) for v in variants if str(v) != canonical]
+    return list(dict.fromkeys(str(canonical_enum_value(v, spec_meta)) for v in values))
+
+
+def _value_conditions(
+    alias: str,
+    f_val: Any,
+    spec_meta: Dict[str, Any],
+) -> Tuple[List[str], List[Any]]:
+    """SQL predicates for one filter value against an aliased spec table."""
+    col = filter_column(alias, spec_meta)
+    num_col = filter_column(alias, spec_meta, ordering=True)
+    conditions: List[str] = []
+    params: List[Any] = []
+
+    if isinstance(f_val, dict):
+        if "in" in f_val:
+            values: List[Any] = []
+            for value in f_val["in"]:
+                if spec_meta.get("type") == "enum":
+                    values.extend(_enum_match_values(value, spec_meta))
+                else:
+                    values.append(value)
+            placeholders = ", ".join(["?"] * len(values))
+            conditions.append(f"{col} IN ({placeholders})")
+            params.extend(values)
+        for op, sql_op in (("gte", ">="), ("gt", ">"), ("lte", "<="), ("lt", "<")):
+            if op in f_val:
+                conditions.append(f"{num_col} {sql_op} ?")
+                params.append(float(f_val[op]))
+        if "eq" in f_val:
+            if "tolerance" in f_val:
+                center = float(f_val["eq"])
+                tol = float(f_val["tolerance"])
+                conditions.append(f"{num_col} >= ? AND {num_col} <= ?")
+                params.extend([center * (1.0 - tol), center * (1.0 + tol)])
+            elif spec_meta.get("type") == "float":
+                conditions.append(f"ABS({col} - ?) <= 1e-9 * MAX(1.0, ABS(?))")
+                params.extend([f_val["eq"], f_val["eq"]])
+            else:
+                values = (
+                    _enum_match_values(f_val["eq"], spec_meta)
+                    if spec_meta.get("type") == "enum"
+                    else [f_val["eq"]]
+                )
+                placeholders = ", ".join(["?"] * len(values))
+                conditions.append(f"{col} IN ({placeholders})")
+                params.extend(values)
+    else:
+        values = (
+            _enum_match_values(f_val, spec_meta)
+            if spec_meta.get("type") == "enum"
+            else [f_val]
+        )
+        if spec_meta.get("type") == "float":
+            conditions.append(f"ABS({col} - ?) <= 1e-9 * MAX(1.0, ABS(?))")
+            params.extend([f_val, f_val])
+        else:
+            placeholders = ", ".join(["?"] * len(values))
+            conditions.append(f"{col} IN ({placeholders})")
+            params.extend(values)
+    return conditions, params
+
+
 def build_spec_clauses(
     normalized_filters: Dict[str, Any],
     advertised_specs: Dict[str, Dict[str, Any]],
     alias_prefix: str = "ps",
 ) -> Tuple[List[str], List[Any], List[str], List[Any]]:
+    """Legacy JOIN API retained for existing callers.
+
+    Active retrieval uses src.spec.constraints.compile_predicates, which also
+    enforces product ownership and evidence precedence. This adapter only
+    renders individual value comparisons and does not define eligibility.
     """
-    Builds the JOINs and WHERE clauses for a set of spec filters.
-
-    Returns `(joins, join_params, where_clauses, where_params)`. The two
-    parameter lists are kept apart on purpose: the generated SQL renders the
-    joins before the WHERE clause, so the join parameters have to be bound
-    first. Each filter key gets its own `product_specs` join so multiple keys
-    can be constrained independently.
-    """
-    joins: List[str] = []
-    join_params: List[Any] = []
-    where_clauses: List[str] = []
-    where_params: List[Any] = []
-
-    for i, (f_key, f_val) in enumerate(normalized_filters.items()):
-        alias = f"{alias_prefix}_{i}"
-        spec_meta = advertised_specs[f_key]
-
-        joins.append(
-            f"JOIN product_specs {alias} ON p.id = {alias}.product_id AND {alias}.key = ?"
-        )
-        join_params.append(f_key)
-
-        col = filter_column(alias, spec_meta)
-        num_col = filter_column(alias, spec_meta, ordering=True)
-
-        if isinstance(f_val, dict):
-            if "in" in f_val:
-                placeholders = ", ".join(["?"] * len(f_val["in"]))
-                where_clauses.append(f"{col} IN ({placeholders})")
-                where_params.extend(f_val["in"])
-
-            if "gte" in f_val:
-                where_clauses.append(f"{num_col} >= ?")
-                where_params.append(float(f_val["gte"]))
-            if "gt" in f_val:
-                where_clauses.append(f"{num_col} > ?")
-                where_params.append(float(f_val["gt"]))
-            if "lte" in f_val:
-                where_clauses.append(f"{num_col} <= ?")
-                where_params.append(float(f_val["lte"]))
-            if "lt" in f_val:
-                where_clauses.append(f"{num_col} < ?")
-                where_params.append(float(f_val["lt"]))
-
-            if "eq" in f_val:
-                if "tolerance" in f_val:
-                    center = float(f_val["eq"])
-                    tol = float(f_val["tolerance"])
-                    where_clauses.append(f"{num_col} >= ? AND {num_col} <= ?")
-                    where_params.extend([center * (1.0 - tol), center * (1.0 + tol)])
-                else:
-                    where_clauses.append(f"{col} = ?")
-                    where_params.append(f_val["eq"])
-        else:
-            where_clauses.append(f"{col} = ?")
-            where_params.append(f_val)
-
-    return joins, join_params, where_clauses, where_params
+    joins, join_params, clauses, params = [], [], [], []
+    for index, (key, value) in enumerate(normalized_filters.items()):
+        alias = f"{alias_prefix}_{index}"
+        joins.append(f"JOIN product_specs {alias} ON p.id = {alias}.product_id AND {alias}.key = ?")
+        join_params.append(key)
+        conditions, values = _value_conditions(alias, value, advertised_specs[key])
+        clauses.extend(conditions)
+        params.extend(values)
+    return joins, join_params, clauses, params

@@ -192,13 +192,27 @@ def _load_and_validate_extractors(extractors_path: Path) -> Dict[str, ExtractorD
 
     return extractors
 
-def _load_and_validate_taxonomy(taxonomy_path: Path, extractors: Dict[str, ExtractorDef]) -> Taxonomy:
+def _load_and_validate_taxonomy(
+    taxonomy_path: Path,
+    extractors: Dict[str, ExtractorDef],
+    extension_path: Optional[Path] = None,
+) -> Taxonomy:
     """Loads taxonomy.yaml and validates categories and attribute extractor linkages."""
     if not taxonomy_path.exists():
         raise FileNotFoundError(f"Taxonomy file not found: {taxonomy_path}")
 
     with open(taxonomy_path, "r", encoding="utf-8") as f:
         raw_data = yaml.safe_load(f)
+
+    # Optional filter extension. Kept separate from the curated taxonomy so the
+    # vendor-backed attributes added later do not churn the hand-written file.
+    extension_categories: Dict[str, Dict[str, Any]] = {}
+    if extension_path is not None and extension_path.exists():
+        with open(extension_path, "r", encoding="utf-8") as f:
+            extension = yaml.safe_load(f) or {}
+        for cat in extension.get("categories", []):
+            if cat.get("id"):
+                extension_categories[str(cat["id"])] = cat
 
     version = raw_data.get("version", 1)
     advertise_min_fill = float(raw_data.get("advertise_min_fill", 0.4))
@@ -209,7 +223,14 @@ def _load_and_validate_taxonomy(taxonomy_path: Path, extractors: Dict[str, Extra
         cat_id = cat_dict["id"]
         display = cat_dict.get("display", cat_id)
         detect_keywords = cat_dict.get("detect_keywords", [])
-        raw_attrs = cat_dict.get("attributes", [])
+        raw_attrs = list(cat_dict.get("attributes", []))
+        extra = extension_categories.get(cat_id)
+        if extra:
+            existing_keys = {str(a.get("key")) for a in raw_attrs}
+            for attr in extra.get("attributes", []):
+                if str(attr.get("key")) not in existing_keys:
+                    raw_attrs.append(attr)
+                    existing_keys.add(str(attr.get("key")))
         attributes: Dict[str, TaxonomyAttribute] = {}
 
         for attr_dict in raw_attrs:
@@ -272,8 +293,9 @@ def load_taxonomy(
     if extractors_path is None:
         extractors_path = base_dir / "config" / "extractors.yaml"
 
+    extension_path = base_dir / "config" / "filter_extension.yaml"
     extractors = _load_and_validate_extractors(extractors_path)
-    taxonomy = _load_and_validate_taxonomy(taxonomy_path, extractors)
+    taxonomy = _load_and_validate_taxonomy(taxonomy_path, extractors, extension_path)
 
     _CACHED_TAXONOMY = taxonomy
     _CACHED_EXTRACTORS = extractors

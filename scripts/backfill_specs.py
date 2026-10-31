@@ -2,7 +2,8 @@
 Taxonomy Backfill Script.
 1. Sync spec_definitions from taxonomy.yaml (upsert; delete removed attributes, log count).
 2. Classify every product in catalog (products.spec_category).
-3. Extract specs for classified products (DELETE-THEN-INSERT per product, preserving manual source).
+3. Extract specs for classified products (DELETE-THEN-INSERT per product, preserving manual
+   and promoted sources).
 4. Recompute spec_stats with fill rate denominator = products in category.
 Idempotent: running twice yields identical state.
 """
@@ -134,7 +135,12 @@ def extract_and_store_specs(conn: sqlite3.Connection, taxonomy, extractors) -> N
     batch_size = 5000
     for i in range(0, len(pids_to_clean), batch_size):
         batch = pids_to_clean[i:i + batch_size]
-        cur.executemany("DELETE FROM product_specs WHERE product_id = ? AND source != 'manual';", batch)
+        # Preserve manual rows and promoted vendor specs; rerunning the curated
+        # backfill must not wipe the extension layer.
+        cur.executemany(
+            "DELETE FROM product_specs WHERE product_id = ? AND source NOT IN ('manual', 'promoted');",
+            batch,
+        )
 
     # INSERT new specs
     for i in range(0, len(specs_to_insert), batch_size):
