@@ -2,9 +2,10 @@
 `aggregate` command launcher: start the web UI, the MCP server, or both.
 
 Examples:
-    aggregate                 # web on :8000 + MCP SSE on :8001
+    aggregate                 # web on :8000 + MCP SSE on :8001 + tunnel
     aggregate --web           # web only
-    aggregate --mcp           # MCP SSE only (http://127.0.0.1:8001/sse)
+    aggregate --mcp           # MCP SSE on :8001 + aggregate-local tunnel
+    aggregate --mcp --no-tunnel # local MCP SSE only
     aggregate --mcp --stdio   # MCP stdio (for MCP client configs)
 
 The command is installed as `aggregate.cmd` in C:\\Users\\nithi\\.local\\bin,
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -28,6 +30,9 @@ if str(BASE_DIR) not in sys.path:
 VENV_PYTHON = BASE_DIR / ".venv" / "Scripts" / "python.exe"
 PYTHON = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 RUN_MCP = str(BASE_DIR / "scripts" / "run_mcp.py")
+from scripts.managed_processes import ManagedProcesses
+
+DEFAULT_TUNNEL_PROFILE = "aggregate-local"
 
 
 def print_mcp_help() -> int:
@@ -70,8 +75,8 @@ def print_mcp_help() -> int:
     print("")
     print("AGENT WORKFLOW")
     print("-" * 72)
-    print("1. Call describe_catalog first to learn categories and spec keys.")
-    print("2. Then search_components(query=..., limit=10) or search_by_mpn(mpn=...).")
+    print("1. Discover unfamiliar categories/fields with describe_catalog/discover_specs.")
+    print("2. Prefer category + filters/vendor_filters; keep model/brand text in query.")
     print("3. Results are vendor listings, not de-duplicated parts. Compare by mpn.")
     print("4. Prices are INR and tax-inclusive.")
     print("5. Pass refresh=False for fast cached reads; refresh=True verifies live")
@@ -90,6 +95,8 @@ def print_mcp_help() -> int:
     print("  Import errors        -> run from the project root with the project Python")
     print("  Empty catalog        -> python main.py status")
     print("  Web UI too           -> aggregate            (web :8000 + MCP SSE :8001)")
+    print("  Tunnel               -> starts automatically with aggregate/--mcp")
+    print("  Local only           -> aggregate --mcp --no-tunnel")
     print("")
     return 0
 
@@ -108,25 +115,24 @@ def port_in_use(host: str, port: int) -> bool:
         return False
 
 
-def start(cmd: list[str], name: str) -> subprocess.Popen:
-    env = dict(os.environ)
-    env.setdefault("PYTHONPATH", str(BASE_DIR))
-    env.setdefault("PYTHONIOENCODING", "utf-8")
-    print(f"[{name}] starting...", flush=True)
-    return subprocess.Popen(cmd, cwd=str(BASE_DIR), env=env)
-
-
-def stop(proc: subprocess.Popen, name: str) -> None:
-    if proc.poll() is not None:
-        return
-    print(f"[{name}] stopping...", flush=True)
-    try:
-        proc.terminate()
-        proc.wait(timeout=4)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    except Exception:
-        pass
+def find_tunnel_client(explicit: str | None = None) -> Path:
+    """Use the local release and its bundled companions; do not copy credentials."""
+    if explicit:
+        candidate = Path(explicit).expanduser().resolve()
+        if candidate.is_file():
+            return candidate
+        raise FileNotFoundError(f"Tunnel client not found: {candidate}")
+    filename = "tunnel-client.exe" if os.name == "nt" else "tunnel-client"
+    candidates = [BASE_DIR / filename, BASE_DIR / "tunnel-client" / filename]
+    candidates += sorted(BASE_DIR.glob(f"tunnel-client-*/{filename}"), reverse=True)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    installed = shutil.which(filename)
+    if installed:
+        return Path(installed).resolve()
+    raise FileNotFoundError("Tunnel client not found. Put its release folder in the project root, "
+                            "pass --tunnel-client PATH, or use --no-tunnel for local-only operation.")
 
 
 def open_browser_later(url: str, delay: float = 1.6) -> None:
@@ -141,90 +147,68 @@ def run_foreground(cmd: list[str]) -> int:
 
 
 def run_web(host: str, port: int, open_page: bool) -> int:
-    url = f"http://{public_host(host)}:{port}"
-    if port_in_use(host, port):
-        print(f"Web UI is already running at {url}")
-        if open_page:
-            webbrowser.open(url)
-        return 0
-    if open_page:
-        open_browser_later(url)
-    return run_foreground(
-        [PYTHON, "-m", "uvicorn", "main:web_app", "--host", host, "--port", str(port)]
-    )
+    return run_services(host, web_port=port, open_page=open_page, tunnel=False)
 
 
-def run_mcp(host: str, port: int, stdio: bool) -> int:
+def run_mcp(host: str, port: int, stdio: bool, **tunnel_options) -> int:
     if stdio:
         # stdio is a protocol channel: do not print anything before handing over.
         return run_foreground([PYTHON, RUN_MCP, "--transport", "stdio"])
-    if port_in_use(host, port):
-        print(f"MCP SSE is already running at http://{public_host(host)}:{port}/sse")
-        return 0
-    print(f"Starting MCP SSE on http://{public_host(host)}:{port}/sse")
-    return run_foreground(
-        [PYTHON, RUN_MCP, "--transport", "sse", "--host", host, "--port", str(port)]
-    )
+    return run_services(host, mcp_port=port, **tunnel_options)
 
 
-def run_both(host: str, web_port: int, mcp_port: int, open_page: bool) -> int:
-    procs: list[tuple[str, subprocess.Popen]] = []
+def run_both(host: str, web_port: int, mcp_port: int, open_page: bool, **tunnel_options) -> int:
+    return run_services(host, web_port=web_port, mcp_port=mcp_port,
+                        open_page=open_page, **tunnel_options)
 
-    web_url = f"http://{public_host(host)}:{web_port}"
-    mcp_url = f"http://{public_host(host)}:{mcp_port}/sse"
-    if port_in_use(host, web_port):
-        print(f"[web] already running at {web_url}")
-        if open_page:
-            webbrowser.open(web_url)
-    else:
-        procs.append((
-            "web",
-            start(
-                [PYTHON, "-m", "uvicorn", "main:web_app", "--host", host, "--port", str(web_port)],
-                "web",
-            ),
-        ))
-        if open_page:
-            open_browser_later(web_url)
 
-    if port_in_use(host, mcp_port):
-        print(f"[mcp] already running at {mcp_url}")
-    else:
-        procs.append((
-            "mcp",
-            start(
-                [PYTHON, RUN_MCP, "--transport", "sse", "--host", host, "--port", str(mcp_port)],
-                "mcp",
-            ),
-        ))
-
-    if not procs:
-        print(f"Web: {web_url}")
-        print(f"MCP: {mcp_url}")
-        return 0
-
-    print("")
-    print(f"  Web UI   {web_url}")
-    print(f"  MCP SSE  {mcp_url}")
-    print("  Press Ctrl+C to stop everything.")
-    print("")
-
+def run_services(host: str, *, web_port: int | None = None, mcp_port: int | None = None,
+                 open_page: bool = False, tunnel: bool = True,
+                 tunnel_client: str | None = None,
+                 tunnel_profile: str = DEFAULT_TUNNEL_PROFILE) -> int:
     try:
-        while True:
-            for name, proc in procs:
-                code = proc.poll()
-                if code is not None:
-                    print(f"[{name}] exited with code {code}")
-                    for other_name, other in procs:
-                        if other is not proc:
-                            stop(other, other_name)
-                    return code
-            time.sleep(0.4)
+        client = find_tunnel_client(tunnel_client) if tunnel else None
+        reused_ports = []
+        with ManagedProcesses(BASE_DIR) as processes:
+            for name, port, command, suffix in [
+                ("web", web_port, [PYTHON, "-m", "uvicorn", "main:web_app"], ""),
+                ("mcp", mcp_port, [PYTHON, RUN_MCP, "--transport", "sse"], "/sse"),
+            ]:
+                if port is None:
+                    continue
+                url = f"http://{public_host(host)}:{port}{suffix}"
+                if port_in_use(host, port):
+                    print(f"[{name}] already running at {url}")
+                    reused_ports.append((name, port))
+                else:
+                    processes.start(command + ["--host", host, "--port", str(port)], name)
+                print(f"[{name}] {url}", flush=True)
+                if name == "web" and open_page:
+                    open_browser_later(url)
+            if client:
+                processes.start([str(client), "run", "--profile", tunnel_profile],
+                                "tunnel", cwd=client.parent)
+                print(f"[tunnel] profile {tunnel_profile}; stops with Aggregate", flush=True)
+            if not processes.children:
+                return 0
+            print("Press Ctrl+C to stop Aggregate and its tunnel.", flush=True)
+            while True:
+                for name, proc in processes.children:
+                    code = proc.poll()
+                    if code is not None:
+                        print(f"[{name}] exited with code {code}", flush=True)
+                        return code
+                for name, port in reused_ports:
+                    if not port_in_use(host, port):
+                        print(f"[{name}] existing server stopped; stopping Aggregate's processes.", flush=True)
+                        return 0
+                time.sleep(0.4)
     except KeyboardInterrupt:
         print("\nStopping Aggregate...", flush=True)
-        for name, proc in procs:
-            stop(proc, name)
         return 0
+    except OSError as exc:
+        print(f"Could not start Aggregate: {exc}", file=sys.stderr)
+        return 1
 
 
 def main() -> int:
@@ -236,20 +220,21 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(
         prog="aggregate",
-        description="Start the Aggregate web UI and/or MCP server.",
+        description="Start the Aggregate web UI and/or MCP server with its managed tunnel.",
         epilog=(
             "MCP connection guide:  aggregate --help --mcp   (or aggregate --mcp-help)\n"
             "Examples:\n"
-            "  aggregate                 web + MCP SSE, opens browser\n"
+            "  aggregate                 web + MCP SSE + tunnel, opens browser\n"
             "  aggregate --web           web only\n"
-            "  aggregate --mcp           MCP SSE only\n"
+            "  aggregate --mcp           MCP SSE + tunnel\n"
+            "  aggregate --mcp --no-tunnel local MCP SSE only\n"
             "  aggregate --mcp --stdio   MCP stdio for a client"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--web", action="store_true", help="Start the web UI only.")
-    target.add_argument("--mcp", action="store_true", help="Start the MCP server only.")
+    target.add_argument("--mcp", action="store_true", help="Start MCP SSE and its tunnel (stdio stays local).")
     parser.add_argument(
         "--stdio",
         action="store_true",
@@ -271,6 +256,12 @@ def main() -> int:
         action="store_true",
         help="Show MCP connection instructions and exit.",
     )
+    parser.add_argument("--no-tunnel", action="store_true",
+                        help="Run local servers without the automatic tunnel.")
+    parser.add_argument("--tunnel-profile", default=DEFAULT_TUNNEL_PROFILE,
+                        help="Tunnel client profile (default: aggregate-local).")
+    parser.add_argument("--tunnel-client", metavar="PATH",
+                        help="Override the automatically discovered tunnel-client executable.")
     args = parser.parse_args()
 
     if args.mcp_help:
@@ -280,11 +271,14 @@ def main() -> int:
     if args.list_tools:
         return run_foreground([PYTHON, RUN_MCP, "--list-tools"])
 
+    tunnel_options = dict(tunnel=not args.no_tunnel, tunnel_client=args.tunnel_client,
+                          tunnel_profile=args.tunnel_profile)
     if args.web:
         return run_web(args.host, args.port, open_page=not args.no_open)
     if args.mcp:
-        return run_mcp(args.host, args.mcp_port, stdio=args.stdio)
-    return run_both(args.host, args.port, args.mcp_port, open_page=not args.no_open)
+        return run_mcp(args.host, args.mcp_port, stdio=args.stdio, **tunnel_options)
+    return run_both(args.host, args.port, args.mcp_port, open_page=not args.no_open,
+                    **tunnel_options)
 
 
 if __name__ == "__main__":

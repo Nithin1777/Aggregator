@@ -14,6 +14,11 @@ env/
 node_modules/
 package-lock.json
 
+# Local tunnel-client releases (include bundled executables; profiles stay external).
+/tunnel-client-*/
+/tunnel-client/
+/tunnel-client.exe
+
 # Runtime logs and telemetry (large and regenerable; see logs/)
 logs/
 *.log

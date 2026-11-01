@@ -174,9 +174,10 @@ Flyrobo publishes its catalog through `https://www.flyrobo.in/sitemap.xml` (10 p
 The launcher is installed at `C:\Users\nithi\.local\bin\aggregate.cmd`, which is already on `PATH`:
 
 ```powershell
-aggregate                 # web on :8000 + MCP SSE on :8001, opens the browser
+aggregate                 # web on :8000 + MCP SSE on :8001 + tunnel, opens the browser
 aggregate --web           # web only
-aggregate --mcp           # MCP SSE only (http://127.0.0.1:8001/sse)
+aggregate --mcp           # MCP SSE (http://127.0.0.1:8001/sse) + tunnel
+aggregate --mcp --no-tunnel # local MCP SSE without a tunnel
 aggregate --mcp --stdio   # MCP stdio (for MCP client configs)
 aggregate --help --mcp    # full MCP connection guide (also --mcp-help)
 aggregate --list-tools    # print the exposed MCP tools and exit
@@ -184,6 +185,27 @@ aggregate --port 8010 --mcp-port 8011 --no-open   # custom ports, no browser
 ```
 
 `aggregate` detects ports that are already in use instead of starting a duplicate, and `Ctrl+C` stops the processes it started. `--mcp --stdio` keeps stdin/stdout clean for MCP clients. On a fresh checkout, recreate the launcher with `python scripts/install_aggregate.py`.
+
+Normal `aggregate` and `aggregate --mcp` also run `tunnel-client run --profile
+aggregate-local`. The launcher finds `tunnel-client.exe` in the project root or
+its extracted `tunnel-client-*` release folder, then falls back to PATH. It runs
+the client from its own folder so bundled companions keep working. Use
+`--tunnel-client PATH` or `--tunnel-profile NAME` to select another executable or
+profile. Profile credentials remain in the tunnel client's existing user config.
+
+The tunnel runs in the foreground session with Aggregate: Ctrl+C, an owned server
+exiting, or a tunnel failure stops the processes that session started. Windows
+Job Objects also remove tunnel-spawned stdio MCP/cloudflared children when the
+launcher is killed or its terminal closes. Reused servers are left running;
+their disappearance ends the session's tunnel. A manually started tunnel is not
+adopted or stopped; stop it before switching to automatic startup, or use
+`--no-tunnel`. Local-only `--web`, MCP `--stdio`, help and tool listing do not
+start tunnels. Missing tunnel binaries fail clearly before starting servers;
+`--no-tunnel` works without a tunnel client installed.
+
+The current `aggregate-local` profile launches its own stdio MCP server, rather
+than forwarding the SSE port. Its configuration is preserved, including when
+custom web/SSE ports are used.
 
 Launch the web application directly (alternative):
 ```powershell
