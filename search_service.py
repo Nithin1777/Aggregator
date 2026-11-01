@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import math
 import re
 import sqlite3
 import time
@@ -536,9 +537,11 @@ class AggregatorEngine:
 
     async def _search_vendors_for_refresh(
         self,
-        query: str,
+        query: Optional[str],
         limit_per_vendor: int,
         timeout: float,
+        products: Optional[List[UnifiedProduct]] = None,
+        direct_attempted: Optional[set] = None,
     ) -> Tuple[List[UnifiedProduct], set, set]:
         """
         One parallel federated lookup for the refresh pass.
@@ -552,7 +555,20 @@ class AggregatorEngine:
 
         tasks: Dict["asyncio.Task", str] = {}
         for vendor_id, adapter in self.adapters.items():
-            task = asyncio.create_task(adapter.search_live(query, limit=limit_per_vendor))
+            targets = [p for p in (products or []) if p.vendor == vendor_id]
+            if products is not None and not targets:
+                continue
+            direct = getattr(adapter, "refresh_price_stock", None)
+            if callable(direct) and products is not None:
+                if direct_attempted is not None and vendor_id in direct_attempted:
+                    continue
+                if direct_attempted is not None:
+                    direct_attempted.add(vendor_id)
+                task = asyncio.create_task(direct(targets, timeout=timeout))
+            elif query:
+                task = asyncio.create_task(adapter.search_live(query, limit=limit_per_vendor))
+            else:
+                continue
             # Consume exceptions in a callback so a late failure is never logged as
             # "exception was never retrieved" when the budget expires.
             task.add_done_callback(
@@ -560,12 +576,15 @@ class AggregatorEngine:
             )
             tasks[task] = vendor_id
 
+        if not tasks:
+            return [], set(), set()
         try:
             done, pending = await asyncio.wait(set(tasks.keys()), timeout=max(0.5, timeout))
         finally:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         products: List[UnifiedProduct] = []
         ok: set = set()
@@ -680,14 +699,17 @@ class AggregatorEngine:
         budget = float(getattr(settings, "price_stock_refresh_timeout_seconds", 8.0))
         limit_per_vendor = max(1, int(getattr(settings, "price_stock_live_limit_per_vendor", 15)))
 
-        # The user's own query is the best lookup key; products it misses fall back
-        # to their MPN (or leading title tokens), bounded by the query budget.
+        # Direct adapters use exact listing identities, independently of text.
+        # Keep bounded search fallback for vendors without a direct lookup.
+        direct_pending = [p for p in pending if callable(getattr(
+            self.adapters.get(p.vendor), "refresh_price_stock", None))]
+        search_pending = [p for p in pending if p not in direct_pending]
         text_query = (query or "").strip()
-        queries: List[str] = []
-        if text_query:
+        queries: List[Optional[str]] = []
+        if text_query and search_pending:
             queries.append(text_query)
         seen = {q.lower() for q in queries}
-        for p in pending:
+        for p in search_pending:
             if len(queries) >= max_queries:
                 break
             derived = self._derive_refresh_query(p)
@@ -695,6 +717,8 @@ class AggregatorEngine:
                 seen.add(derived.lower())
                 queries.append(derived)
 
+        if not queries and direct_pending:
+            queries = [None]
         if not queries:
             info.status = "cached"
             info.cached_products = len(products)
@@ -705,6 +729,7 @@ class AggregatorEngine:
         vendors_failed: set = set()
         matched: Dict[int, UnifiedProduct] = {}
         used_queries: List[str] = []
+        direct_attempted: set = set()
         deadline = time.monotonic() + budget
 
         for q in queries:
@@ -716,9 +741,13 @@ class AggregatorEngine:
                 break
 
             live_products, ok, failed = await self._search_vendors_for_refresh(
-                q, limit_per_vendor, remaining
+                q, limit_per_vendor, remaining, products=pending, direct_attempted=direct_attempted
             )
-            used_queries.append(q)
+            if q:
+                used_queries.append(q)
+            for vendor in ok | failed:
+                adapter = self.adapters[vendor]
+                info.lookup_methods[vendor] = getattr(adapter, 'price_stock_refresh_method', 'search')
             vendors_ok |= ok
             vendors_failed |= failed
 
@@ -749,7 +778,7 @@ class AggregatorEngine:
             except (TypeError, ValueError):
                 rejected_ids.append(p.id)
                 continue
-            if new_price <= 0:
+            if not math.isfinite(new_price) or new_price <= 0:
                 rejected_ids.append(p.id)
                 continue
             # Guard against a parser/page-layout regression silently replacing a

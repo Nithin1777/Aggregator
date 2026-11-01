@@ -282,9 +282,12 @@ The CLI and MCP tools stay synchronous on purpose (agents need the verified valu
   - MCP: `data.price_stock_refresh`, plus warning code `price_stock_cache_fallback` when cached values were served after a failed attempt.
 
 ### TTL, matching and budgets
-- Cached price/stock is re-verified only when older than the TTL (default **180s**). Fresh cache skips vendor calls entirely.
-- A refresh pass is bounded (default **8s**), uses at most **2** distinct queries (your query first, then derived MPN/title lookups), and requests at most **15** results per vendor.
-- Live results are matched to cached listings by `(vendor, external_id)`, then normalized product URL, then `(vendor, SKU)`.
+- Refresh attempts are throttled per listing by the TTL (default **180s**), including failed attempts. Check `price_updated_at`/`price_stock_updated_at` for the last successful verification; a recent attempt does not prove a fresh price. `force_refresh=True` bypasses this throttle.
+- A refresh pass is bounded (default **8s**) and contacts only vendors represented by stale displayed listings.
+- **Robu:** exact listing slugs are sent to `POST /api/proxy/graphql/` in ProductDetails batches of **10**, using the updated scraper's query builder. The lightweight query requests ID, price and stock, without downloading descriptions. Returned product IDs must match the cached listing. Missing/invalid prices or stock stay cached; unavailable products are not inferred from missing responses. There is no 15-search-result cap on this path, and no homepage warmup or `/api/search/` request.
+- Other vendors retain bounded text lookup: at most **2** distinct queries (the user's query, then derived MPN/title lookups), at most **15** results per vendor. These results are matched by `(vendor, external_id)`, then normalized product URL, then `(vendor, SKU)`.
+- `price_stock_refresh.lookup_methods` (MCP) or `price_refresh.lookup_methods` (HTTP) discloses the attempted mechanism, e.g. `{"robu":"graphql_productdetails"}`. Direct Robu-only lookups need no text query, so their `queries` list is empty.
+- Only displayed listings are verified. Counts and initial ranking use the cached catalog; this does not establish the cheapest live offer across the entire catalog.
 
 ### Refresh modes
 - `auto` (default) — refresh only listings whose cache is stale.

@@ -26,6 +26,23 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+GRAPHQL_HEADERS = {
+    "Content-Type": "application/json", "Accept": "application/json",
+    "Origin": ORIGIN, "Referer": REFERER, "User-Agent": USER_AGENT,
+}
+
+# Search-time refresh needs neither descriptions nor images. Keep aliases and
+# the same ProductDetails schema, without downloading catalog-enrichment data.
+PRICE_STOCK_FIELDS = """
+    status
+    data {
+      id
+      sku
+      url_key
+      price { regular final }
+      in_stock
+    }
+"""
 
 PRODUCT_FIELDS = """
     status
@@ -60,7 +77,7 @@ class RobuGraphQLSchemaError(RobuGraphQLError):
     """The GraphQL schema/query is wrong; retrying or splitting will not help."""
 
 
-def build_batch_query(slugs: List[str]) -> Dict[str, Any]:
+def build_batch_query(slugs: List[str], *, fields: str = PRODUCT_FIELDS) -> Dict[str, Any]:
     """Builds one aliased ProductDetails query for a list of slugs."""
     if not slugs:
         raise ValueError("slugs must not be empty")
@@ -69,7 +86,7 @@ def build_batch_query(slugs: List[str]) -> Dict[str, Any]:
     for index, slug in enumerate(slugs):
         variable = f"$s{index}"
         variables[f"s{index}"] = slug
-        parts.append(f"p{index}: productdetails(slug: {variable}) {{{PRODUCT_FIELDS}}}")
+        parts.append(f"p{index}: productdetails(slug: {variable}) {{{fields}}}")
     query = (
         "query ProductDetailsBatch("
         + ", ".join(f"$s{i}: String!" for i in range(len(slugs)))
@@ -106,13 +123,7 @@ class RobuGraphQLClient:
         self.failures: List[str] = []
         self.session = Session(
             impersonate="chrome120",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "Origin": ORIGIN,
-                "Referer": REFERER,
-                "User-Agent": USER_AGENT,
-            },
+            headers=GRAPHQL_HEADERS,
         )
 
     def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:

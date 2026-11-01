@@ -28,6 +28,8 @@ jobs:
         run: python -m pytest tests/test_backend_evaluation.py -q
       - name: Test launcher and tunnel lifecycle
         run: python -m pytest tests/test_aggregate_launcher.py -q
+      - name: Test Robu GraphQL and price refresh
+        run: python -m pytest tests/test_robu_graphql.py tests/test_robu_catalog.py tests/test_robu_price_refresh.py tests/test_price_stock_refresh.py -q
       - name: Test MCP field discovery and transactional enrichment
         run: python -m pytest tests/test_spec_discovery.py tests/test_spec_enrichment.py tests/test_mcp_guidance.py -q
       - name: Compare with versioned quality baseline

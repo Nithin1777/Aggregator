@@ -69,7 +69,7 @@ from mcp_server.guidance import (SERVER_INSTRUCTIONS, CatalogCategory, IdentityQ
 
 logger = logging.getLogger(__name__)
 
-SERVER_VERSION = "2.5.1"
+SERVER_VERSION = "2.5.2"
 SCHEMA_VERSION = "2.4.0"
 
 # Hard ceiling on page size. An agent asking for 1000 rows is almost always

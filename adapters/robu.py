@@ -1,15 +1,18 @@
 """
-Robu.in vendor adapter using direct JSON search microservice with Cloudflare bypass
-and ground-truth sitemap registry for 100% catalog coverage.
+Robu.in adapter for JSON search, sitemap registry and direct GraphQL price refresh.
 """
 import asyncio
 import logging
+import math
 import re
 from typing import List, Optional, Tuple
+from urllib.parse import unquote, urlsplit
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
 from adapters.base import BaseAdapter, VendorFetchError
+from adapters.robu_graphql import (GRAPHQL_HEADERS, GRAPHQL_URL, PRICE_STOCK_FIELDS,
+                                   build_batch_query, extract_detail)
 from config import settings
 import db
 from models import UnifiedProduct
@@ -43,13 +46,14 @@ ROBU_INGEST_SEEDS = [
 ]
 
 class RobuAdapter(BaseAdapter):
-    """Adapter for Robu.in headless Next.js search microservice with 100% catalog registry sync."""
+    """Robu search/catalog adapter with exact ProductDetails price/stock lookup."""
 
     def __init__(self):
         self._vendor_id = "robu"
         self._vendor_name = "Robu.in"
         self._base_url = settings.robu_base_url
         self._session: Optional[AsyncSession] = None
+        self._graphql_session: Optional[AsyncSession] = None
         self._warmed_up = False
         self._lock = asyncio.Lock()
 
@@ -64,6 +68,85 @@ class RobuAdapter(BaseAdapter):
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    price_stock_refresh_method = "graphql_productdetails"
+
+    async def refresh_price_stock(self, products: List[UnifiedProduct], *, timeout: float) -> List[UnifiedProduct]:
+        """Look up exact displayed listings, not the first page of text search.
+
+        Requests share the engine's deadline. Invalid/missing details stay cached;
+        a failed later batch does not discard successful earlier batches. Never
+        import GraphQL titles, descriptions or identity changes during refresh.
+        """
+        by_slug = {}
+        for product in products:
+            if product.vendor != self.vendor_id:
+                continue
+            path = urlsplit(product.product_url).path.strip('/').split('/')
+            slug = unquote(path[1]) if len(path) == 2 and path[0] == 'product' else None
+            if not slug:
+                slug = str(product.extra.get('slug') or '').strip()
+            if slug:
+                by_slug.setdefault(slug, []).append(product)
+        if not by_slug:
+            return []
+        async with self._lock:
+            if self._graphql_session is None:
+                self._graphql_session = AsyncSession(impersonate=settings.impersonate_target,
+                                                     headers=GRAPHQL_HEADERS)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0, timeout)
+        slugs = list(by_slug)
+        refreshed = []
+        for start in range(0, len(slugs), 10):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            chunk = slugs[start:start + 10]
+            try:
+                response = await self._graphql_session.post(
+                    GRAPHQL_URL, json=build_batch_query(chunk, fields=PRICE_STOCK_FIELDS), timeout=remaining)
+                if response.status_code != 200:
+                    raise VendorFetchError(f"Robu ProductDetails HTTP {response.status_code}")
+                body = response.json()
+                if not isinstance(body, dict) or body.get('errors'):
+                    raise VendorFetchError("Robu ProductDetails returned GraphQL errors")
+            except asyncio.CancelledError:
+                # The engine cancels outstanding lookups at the shared deadline.
+                # Return completed batches immediately; do not lose verified
+                # listings merely because the last request used up the budget.
+                if refreshed:
+                    return refreshed
+                raise
+            except Exception as exc:
+                logger.info("[Robu.in] Direct price refresh unavailable: %s", exc)
+                if not refreshed:
+                    raise VendorFetchError("Robu ProductDetails price refresh failed") from exc
+                break
+            for index, slug in enumerate(chunk):
+                detail = extract_detail(body, index)
+                if not detail:
+                    continue
+                price_block = detail.get('price')
+                if not isinstance(price_block, dict):
+                    continue
+                raw_price = price_block.get('final')
+                if raw_price is None:
+                    raw_price = price_block.get('regular')
+                try:
+                    price = float(raw_price)
+                except (TypeError, ValueError):
+                    continue
+                stock = detail.get('in_stock')
+                if not math.isfinite(price) or price <= 0 or not isinstance(stock, bool):
+                    continue
+                for product in by_slug[slug]:
+                    # A redirect/replaced slug must not change a different cached
+                    # listing's price. Missing identity is not confirmation.
+                    if str(detail.get('id')) != str(product.external_id):
+                        continue
+                    refreshed.append(product.model_copy(update={'price': price, 'available': stock}))
+        return refreshed
 
     async def _reset_session(self):
         """Discards existing session to clear challenged cookies and force fresh TLS handshake."""
@@ -349,3 +432,6 @@ class RobuAdapter(BaseAdapter):
                 await self._session.close()
                 self._session = None
                 self._warmed_up = False
+            if self._graphql_session:
+                await self._graphql_session.close()
+                self._graphql_session = None

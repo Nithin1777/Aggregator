@@ -106,6 +106,8 @@ class PriceStockRefreshInfo(BaseModel):
     vendors_ok: List[str] = Field(default_factory=list)
     vendors_failed: List[str] = Field(default_factory=list)
     queries: List[str] = Field(default_factory=list)
+    lookup_methods: Dict[str, str] = Field(default_factory=dict,
+        description="Price lookup method by attempted vendor, e.g. graphql_productdetails or search")
     fetched_at: Optional[str] = None
     message: str = ""
 
